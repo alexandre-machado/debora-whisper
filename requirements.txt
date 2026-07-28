@@ -27,14 +27,31 @@ optimum[openvino]>=1.23.0,<2.0.0
 # verification (see PR description). Bound kept at <4.54 anyway to match the
 # tightest constraint optimum-intel itself declares for this line.
 transformers>=4.36,<4.54
-# torch is a transitive dependency of optimum (unpinned upstream) but a
-# fresh install of the pins above still resolves torch==2.13.0, which breaks
-# optimum's ONNX exporter (`ImportError: cannot import name '_attention_scale'
-# from torch.onnx.symbolic_opset14`). The successful `optimum-cli export
-# openvino` run this PR reports used torch==2.4.1. Cap below the break so a
-# fresh install of the export path actually works; not used by the shipped
-# app at runtime (models arrive pre-exported via snapshot_download).
-torch>=2.0,<2.5
+# torch is a transitive dependency of optimum (unpinned upstream). It is
+# floored, not capped, on security grounds: torch <2.6.0 is vulnerable to
+# CVE-2025-32434 (critical, 9.8, RCE via torch.load even with
+# weights_only=True) and torch <2.10.0 is vulnerable to CVE-2026-24747
+# (high, 8.8, RCE via a corrupted-pickle bypass of the same weights_only
+# guard) -- both hit exactly the checkpoint-loading path that
+# `optimum-cli export openvino --model <name>` exercises against
+# arbitrary, possibly-untrusted HuggingFace repos. >=2.10 is the first
+# version patched against both.
+#
+# Known trade-off, deliberately accepted: optimum's ONNX exporter is
+# broken on every torch>=2.10 currently on PyPI (checked the full
+# [2.10.0, 2.13.0] range) because `optimum/exporters/onnx/model_patcher.py`
+# imports `_attention_scale` from `torch.onnx.symbolic_opset14`, and that
+# symbol was removed from torch before 2.10.0. So `optimum-cli export
+# openvino` will fail with
+# `ImportError: cannot import name '_attention_scale' from
+# torch.onnx.symbolic_opset14` until optimum ships a fix upstream. This is
+# accepted because torch is never imported by the shipped app (models
+# arrive pre-exported via snapshot_download) -- only someone manually
+# running a custom export hits this, and shipping every user a torch with
+# a critical RCE to keep that optional path working is the wrong trade.
+# Do not lower this floor to "fix" the exporter without re-opening both
+# CVEs.
+torch>=2.10
 
 # Parakeet TDT preprocessing
 onnxruntime>=1.18.1,<2.0.0
