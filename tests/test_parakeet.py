@@ -10,7 +10,8 @@ import pytest
 from dictation_engine import (
     MODEL_REGISTRY, DictationApp, DEFAULT_CONFIG,
     create_model, ParakeetNPU, WhisperNPU,
-    LANGUAGES, get_models_for_language, is_model_downloaded, MODEL_DIR,
+    LANGUAGES, PARAKEET_UPSTREAM_LANGUAGES,
+    get_models_for_language, is_model_downloaded, MODEL_DIR,
 )
 
 
@@ -114,26 +115,158 @@ class TestLanguageFiltering:
         assert len(models) == len(MODEL_REGISTRY)
         assert "parakeet" in models
 
-    def test_non_english_excludes_parakeet(self):
-        for lang in ("ru", "es", "fr", "de", "ja", "zh"):
+    def test_non_european_excludes_parakeet(self):
+        # Parakeet's upstream checkpoint covers 25 European languages; the
+        # app also exposes ja/zh/ko/tr/ar which the checkpoint does not
+        # support, so those must stay excluded.
+        for lang in ("ja", "zh", "ko", "tr", "ar"):
             models = get_models_for_language(lang)
             assert "parakeet" not in models, f"parakeet should not be in {lang} models"
             assert "base" in models
             assert "small" in models
+
+    def test_non_english_includes_parakeet_for_supported_languages(self):
+        # Regression test for issue #1: Parakeet must be offered for at
+        # least one non-English language it actually supports.
+        for lang in ("ru", "es", "fr", "de", "pt", "it", "nl", "pl", "uk"):
+            models = get_models_for_language(lang)
+            assert "parakeet" in models, f"parakeet should be offered for {lang}"
 
     def test_whisper_models_support_all_languages(self):
         for name, info in MODEL_REGISTRY.items():
             if info["backend"] == "whisper":
                 assert info["languages"] == "all", f"{name} should support all languages"
 
-    def test_parakeet_english_only(self):
+    def test_parakeet_is_multilingual(self):
         info = MODEL_REGISTRY["parakeet"]
-        assert info["languages"] == ["en"]
+        assert isinstance(info["languages"], list)
+        assert "en" in info["languages"]
+        assert len(info["languages"]) > 1, "parakeet should no longer be English-only"
+
+    def test_parakeet_languages_subset_of_upstream_checkpoint(self):
+        info = MODEL_REGISTRY["parakeet"]
+        for lang in info["languages"]:
+            assert lang in PARAKEET_UPSTREAM_LANGUAGES, (
+                f"{lang} is declared for parakeet but the upstream checkpoint "
+                f"does not support it"
+            )
+
+    def test_parakeet_languages_selectable_in_ui(self):
+        # Regression test for issue #1: the registry must never declare a
+        # language the UI's LANGUAGES map (and therefore the model picker)
+        # cannot select.
+        info = MODEL_REGISTRY["parakeet"]
+        for lang in info["languages"]:
+            assert lang in LANGUAGES, (
+                f"{lang} is declared for parakeet but is not in LANGUAGES "
+                f"(the UI cannot select it)"
+            )
 
     def test_languages_dict_has_entries(self):
         assert len(LANGUAGES) >= 10
         assert "en" in LANGUAGES
         assert LANGUAGES["en"] == "English"
+
+
+class TestParakeetTdtConstants:
+    """Verify BLANK_IDX / VOCAB_SIZE are derived from the loaded vocab
+    rather than trusted blindly (issue #1)."""
+
+    def _bare_parakeet(self, tmp_path):
+        # Bypass __init__ (which loads onnxruntime/OpenVINO models) to unit
+        # test _load_vocab() in isolation.
+        instance = ParakeetNPU.__new__(ParakeetNPU)
+        instance.model_path = tmp_path
+        instance.vocab = {}
+        return instance
+
+    def test_derives_constants_matching_current_checkpoint_vocab(self, tmp_path):
+        # 8192 tokens (indices 0-8191) matches the shipped
+        # goodsmileduck/parakeet-tdt-0.6b-v3-onnx vocab.txt.
+        lines = [f"tok{i} {i}" for i in range(8192)]
+        (tmp_path / "vocab.txt").write_text("\n".join(lines), encoding="utf-8")
+        instance = self._bare_parakeet(tmp_path)
+        instance._load_vocab()
+        assert instance.BLANK_IDX == 8192
+        assert instance.VOCAB_SIZE == 8193
+
+    def test_derives_constants_for_a_different_sized_vocab(self, tmp_path):
+        # A hypothetical re-export with a smaller vocab must not silently
+        # keep using the old checkpoint's hardcoded constants.
+        lines = [f"tok{i} {i}" for i in range(100)]
+        (tmp_path / "vocab.txt").write_text("\n".join(lines), encoding="utf-8")
+        instance = self._bare_parakeet(tmp_path)
+        instance._load_vocab()
+        assert instance.BLANK_IDX == 100
+        assert instance.VOCAB_SIZE == 101
+
+    def test_empty_vocab_raises_instead_of_silently_falling_back(self, tmp_path):
+        # An empty vocab.txt must not silently keep the hardcoded 8192/8193
+        # defaults paired with an empty self.vocab dict -- that would "load"
+        # successfully and then render every token as "?" at inference time.
+        (tmp_path / "vocab.txt").write_text("", encoding="utf-8")
+        instance = self._bare_parakeet(tmp_path)
+        with pytest.raises(ValueError, match="zero valid entries"):
+            instance._load_vocab()
+
+    def test_unparseable_vocab_raises_instead_of_silently_falling_back(self, tmp_path):
+        # Every line fails the "token index" pair format (e.g. a corrupted
+        # download truncated mid-line) -- self.vocab ends up empty exactly
+        # like the fully-empty-file case above.
+        (tmp_path / "vocab.txt").write_text(
+            "this is not a valid vocab line\nneither is this",
+            encoding="utf-8",
+        )
+        instance = self._bare_parakeet(tmp_path)
+        with pytest.raises(ValueError, match="zero valid entries"):
+            instance._load_vocab()
+
+
+class TestParakeetVocabDecoderValidation:
+    """Verify the vocab-derived VOCAB_SIZE is cross-checked against the
+    decoder's real compiled output width (fast follow-up to issue #1's
+    review: `@sec` medium finding)."""
+
+    def _bare_parakeet_with_decoder(self, tmp_path, decoder_output_width, vocab_size, blank_idx):
+        instance = ParakeetNPU.__new__(ParakeetNPU)
+        instance.model_path = tmp_path
+        instance.vocab = {i: str(i) for i in range(vocab_size - 1)}
+        instance.VOCAB_SIZE = vocab_size
+        instance.BLANK_IDX = blank_idx
+
+        mock_output = MagicMock()
+        mock_output.get_partial_shape.return_value = [MagicMock(get_length=lambda: decoder_output_width)]
+        instance.dec_compiled = MagicMock()
+        instance.dec_compiled.output.return_value = mock_output
+        return instance
+
+    def test_matching_decoder_output_width_passes(self, tmp_path):
+        # VOCAB_SIZE=8193 (8192 vocab tokens + blank) plus 5 duration bins
+        # matches decoder_joint-model.onnx's real output width for the
+        # shipped checkpoint.
+        instance = self._bare_parakeet_with_decoder(
+            tmp_path, decoder_output_width=8198, vocab_size=8193, blank_idx=8192,
+        )
+        instance._validate_vocab_against_decoder()  # should not raise
+
+    def test_vocab_larger_than_decoder_output_raises(self, tmp_path):
+        # A truncated/stale vocab.txt derives a VOCAB_SIZE that leaves no
+        # room for duration logits in the decoder's real output -- this must
+        # fail loudly at load time instead of crashing argmax() on an empty
+        # slice mid-transcription.
+        instance = self._bare_parakeet_with_decoder(
+            tmp_path, decoder_output_width=8198, vocab_size=8300, blank_idx=8299,
+        )
+        with pytest.raises(RuntimeError, match="inconsistent with decoder_joint-model.onnx"):
+            instance._validate_vocab_against_decoder()
+
+    def test_vocab_size_equal_to_decoder_output_raises(self, tmp_path):
+        # Leaves zero duration logits (empty slice) -- must also be rejected.
+        instance = self._bare_parakeet_with_decoder(
+            tmp_path, decoder_output_width=8193, vocab_size=8193, blank_idx=8192,
+        )
+        with pytest.raises(RuntimeError, match="inconsistent with decoder_joint-model.onnx"):
+            instance._validate_vocab_against_decoder()
 
 
 class TestModelDownloadStatus:

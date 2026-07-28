@@ -37,6 +37,34 @@ DEFAULT_CONFIG = {
     "show_balloon": True,      # Show text balloon under notch after transcription
 }
 
+# Supported languages (Whisper's top languages + display names)
+LANGUAGES = {
+    "en": "English",
+    "ru": "Russian",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "ja": "Japanese",
+    "zh": "Chinese",
+    "ko": "Korean",
+    "pt": "Portuguese",
+    "it": "Italian",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "tr": "Turkish",
+    "ar": "Arabic",
+    "uk": "Ukrainian",
+}
+
+# The 25 languages nvidia/parakeet-tdt-0.6b-v3 was trained on (automatic
+# language ID, no language token needed at inference). Source:
+# https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3 model card.
+PARAKEET_UPSTREAM_LANGUAGES = {
+    "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu",
+    "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru",
+    "uk",
+}
+
 # Model registry: pre-exported models from HuggingFace
 MODEL_REGISTRY = {
     "base": {
@@ -78,31 +106,19 @@ MODEL_REGISTRY = {
     "parakeet": {
         "repo": "nvidia/parakeet-tdt-0.6b-v3",
         "ov_repo": "goodsmileduck/parakeet-tdt-0.6b-v3-onnx",
-        "description": "600M params, 3.7% WER. Best accuracy, hybrid NPU+CPU.",
+        "description": (
+            "600M params, 3.7% WER (LibriSpeech test-clean, publisher-reported). "
+            "Best accuracy, hybrid NPU+CPU. Multilingual with automatic language ID."
+        ),
         "preferred_device": "NPU",
         "backend": "parakeet",
         "local_dir": "parakeet-tdt-openvino",
-        "languages": ["en"],
+        # Intersection of the upstream checkpoint's 25 supported languages with
+        # the languages this app exposes in the UI (LANGUAGES below). Do not
+        # hand-edit this list; it is derived so it can never drift ahead of
+        # what the model picker can actually offer.
+        "languages": sorted(PARAKEET_UPSTREAM_LANGUAGES & LANGUAGES.keys()),
     },
-}
-
-# Supported languages (Whisper's top languages + display names)
-LANGUAGES = {
-    "en": "English",
-    "ru": "Russian",
-    "es": "Spanish",
-    "fr": "French",
-    "de": "German",
-    "ja": "Japanese",
-    "zh": "Chinese",
-    "ko": "Korean",
-    "pt": "Portuguese",
-    "it": "Italian",
-    "nl": "Dutch",
-    "pl": "Polish",
-    "tr": "Turkish",
-    "ar": "Arabic",
-    "uk": "Ukrainian",
 }
 
 
@@ -364,7 +380,12 @@ class ParakeetNPU:
         decoder_joint-model.onnx (OpenVINO GPU) → TDT greedy decode
     """
 
-    # TDT constants
+    # TDT constants. These are the expected values for the multilingual
+    # nvidia/parakeet-tdt-0.6b-v3 checkpoint's 8192-entry vocab (indices
+    # 0-8191) plus one blank token at index 8192. They are treated as
+    # defaults only: _load_vocab() derives the real values from the loaded
+    # vocab.txt and overrides these instance attributes if the checkpoint's
+    # vocab size ever differs (e.g. a future re-export).
     BLANK_IDX = 8192
     VOCAB_SIZE = 8193  # 0-8192 are vocab tokens, 8193+ are duration tokens
     MAX_TOKENS_PER_STEP = 10
@@ -395,6 +416,82 @@ class ParakeetNPU:
                     token, idx = parts[0], int(parts[1])
                     self.vocab[idx] = token.replace("\u2581", " ")
         log(f"Parakeet vocab loaded: {len(self.vocab)} tokens")
+
+        # An empty or unparseable vocab.txt must fail loudly rather than
+        # silently falling back to the hardcoded class defaults: those
+        # defaults would then be paired with an empty self.vocab dict,
+        # letting the pipeline load "successfully" while every decoded
+        # token renders as "?" (via self.vocab.get(t, "?")) instead of
+        # surfacing the broken download/export immediately.
+        if not self.vocab:
+            raise ValueError(
+                f"Parakeet vocab.txt at {vocab_path} produced zero valid entries "
+                f"(expected '<token> <index>' pairs per line, e.g. '▁the 42'). "
+                f"The file is empty, truncated, or in an unexpected format. "
+                f"Re-run setup: python dictation_engine.py --model parakeet --setup"
+            )
+
+        # Derive BLANK_IDX / VOCAB_SIZE from the loaded vocab instead of
+        # trusting the hardcoded class defaults blindly. The joint network
+        # emits logits laid out as [vocab tokens..., blank, duration bins...],
+        # so blank sits immediately after the highest real vocab index.
+        max_idx = max(self.vocab)
+        derived_blank = max_idx + 1
+        derived_vocab_size = max_idx + 2
+        if derived_blank != self.BLANK_IDX or derived_vocab_size != self.VOCAB_SIZE:
+            log(
+                f"WARNING: TDT constants derived from vocab.txt (BLANK_IDX="
+                f"{derived_blank}, VOCAB_SIZE={derived_vocab_size}) differ from "
+                f"hardcoded defaults (BLANK_IDX={self.BLANK_IDX}, "
+                f"VOCAB_SIZE={self.VOCAB_SIZE}); using derived values."
+            )
+        self.BLANK_IDX = derived_blank
+        self.VOCAB_SIZE = derived_vocab_size
+
+    def _validate_vocab_against_decoder(self):
+        """Cross-check the vocab-derived VOCAB_SIZE against the decoder's
+        actual compiled output width.
+
+        _load_vocab() derives BLANK_IDX/VOCAB_SIZE purely from vocab.txt, with
+        no guarantee it agrees with decoder_joint-model.onnx's real logit
+        layout ([vocab tokens..., blank, duration bins...]). If VOCAB_SIZE is
+        too large, `duration_logits = output[self.VOCAB_SIZE:]` in
+        _tdt_greedy_decode becomes an empty array and `.argmax()` raises an
+        unhandled ValueError mid-transcription. If it's too small (but still
+        within bounds), decoding would silently misread real vocab logits as
+        duration logits, producing garbled output with no error at all.
+        Catching the "too large" / "no room left" case here, right after the
+        decoder is compiled, turns both failure modes into one loud, actionable
+        error at load time instead of a crash or silent corruption at
+        inference time.
+        """
+        try:
+            decoder_output_width = self.dec_compiled.output("outputs").get_partial_shape()[-1].get_length()
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not determine decoder_joint-model.onnx's output width to "
+                f"validate the vocab.txt-derived VOCAB_SIZE ({self.VOCAB_SIZE}): {e}. "
+                f"Re-run setup: python dictation_engine.py --model parakeet --setup"
+            ) from e
+
+        # At least one duration logit must remain after the vocab+blank
+        # slice, or _tdt_greedy_decode's duration_logits.argmax() crashes.
+        if self.VOCAB_SIZE >= decoder_output_width:
+            raise RuntimeError(
+                f"Parakeet vocab.txt is inconsistent with decoder_joint-model.onnx: "
+                f"the vocab-derived VOCAB_SIZE ({self.VOCAB_SIZE}, BLANK_IDX="
+                f"{self.BLANK_IDX}) leaves no room for duration logits in the "
+                f"decoder's output width of {decoder_output_width}. This usually "
+                f"means vocab.txt is truncated, stale, or paired with a decoder "
+                f"model from a different export. Refusing to start transcription "
+                f"with mismatched constants. Re-run setup: "
+                f"python dictation_engine.py --model parakeet --setup"
+            )
+        log(
+            f"  Vocab constants validated against decoder output width "
+            f"({self.VOCAB_SIZE} vocab+blank, "
+            f"{decoder_output_width - self.VOCAB_SIZE} duration bins)"
+        )
 
     def _load_pipeline(self):
         """Load preprocessor, encoder, and decoder."""
@@ -487,6 +584,15 @@ class ParakeetNPU:
                 self.dec_compiled = core.compile_model(decoder_model, "CPU")
                 log(f"  Decoder compiled on CPU")
 
+            # 5. Validate the vocab-derived constants against the decoder's
+            # real compiled output width. vocab.txt and decoder_joint-model.onnx
+            # are separate files shipped side by side; a partial download, a
+            # stale cached vocab.txt from a prior model version, or a tampered
+            # HF repo could leave them disagreeing. Fail loudly here rather
+            # than letting a bad VOCAB_SIZE crash (or silently corrupt) the
+            # first transcription in _tdt_greedy_decode.
+            self._validate_vocab_against_decoder()
+
         except Exception as e:
             log(f"Failed to load Parakeet pipeline: {e}")
             raise
@@ -558,7 +664,13 @@ class ParakeetNPU:
         """Transcribe audio numpy array to text.
 
         Same interface as WhisperNPU.transcribe() for drop-in compatibility.
-        Note: Parakeet is English-only; language parameter is accepted but ignored.
+        Note: Parakeet TDT performs automatic language identification and
+        does not take a language token at inference time (see the upstream
+        model card). The `language` parameter is accepted for interface
+        compatibility with WhisperNPU.transcribe() but is intentionally
+        unused here -- it is not silently dropped support, the model simply
+        has no language-conditioning input to plumb it into. Supported
+        languages are declared in MODEL_REGISTRY["parakeet"]["languages"].
         """
         import numpy as np
         start = time.time()
