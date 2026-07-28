@@ -144,6 +144,23 @@ The model runs **100% locally** on your Intel NPU. No internet required after in
 +---------------+     +----------------+     +----------------+
 ```
 
+NPU only supports static (fixed) input shapes, so the Parakeet encoder can't
+just size itself to each utterance. Instead it's **shape-bucketed**: several
+fixed-size graphs (`ParakeetNPU.MEL_BUCKETS` in `dictation_engine.py`) are
+compiled and cached up front, and each utterance runs on the smallest bucket
+it fits in, instead of always paying for the longest one. Audio longer than
+the largest bucket is truncated (never crashes), and this is logged, not
+silent. The current bucket sizes are chosen by reasoning about typical
+dictation lengths, not by measurement — see the comment above `MEL_BUCKETS`
+and `benchmarks/README.md`.
+
+## Benchmarking
+
+`benchmarks/bench_parakeet.py` measures Parakeet pipeline load/compile time
+and per-utterance latency by stage (mel / encoder / decoder), and reports
+which shape bucket was selected. See `benchmarks/README.md` for usage and
+for the exact commands to produce before/after numbers on real NPU hardware.
+
 ## Troubleshooting
 
 ### NPU device not found

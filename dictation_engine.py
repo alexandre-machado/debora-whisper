@@ -368,20 +368,73 @@ class ParakeetNPU:
     BLANK_IDX = 8192
     VOCAB_SIZE = 8193  # 0-8192 are vocab tokens, 8193+ are duration tokens
     MAX_TOKENS_PER_STEP = 10
-    MEL_FRAMES = 1600  # static shape for encoder — covers ~16s audio
-    ENC_DIM = 1024
-    LSTM_DIM = 640
-    DECODE_SPACE = re.compile(r"\A\s|\s\B|(\s)\b")
 
-    def __init__(self, model_path: Path, device: str = "NPU"):
+    # NeMo's mel preprocessor (nemo128.onnx) runs at a 10ms hop, i.e. 100
+    # mel frames per second of audio.
+    MEL_FRAME_RATE = 100
+
+    # --------------------------------------------------------------------
+    # MEL_BUCKETS — shape-bucketing for the NPU encoder (issue #3).
+    #
+    # NPU only supports static shapes (OpenVINO NPU docs: "Currently, only
+    # models with static shapes are supported on NPU"), so the encoder must
+    # be compiled ahead of time for a fixed audio_signal length. Before this
+    # change, every utterance ran through one shape sized for the worst
+    # case (1600 frames / ~16s), so a typical few-second dictation paid the
+    # full 16s graph cost.
+    #
+    # ⚠️ CALIBRATED BY REASONING, NOT MEASUREMENT. No before/after NPU
+    # numbers exist yet for this repo (see benchmarks/README.md and issue
+    # #3). These sizes are a plausible starting spread for a
+    # press-hotkey-to-talk dictation workflow (short commands through
+    # multi-sentence dictation, default max_record_seconds=60 in
+    # DEFAULT_CONFIG), not a tuned result. Expect to revisit this tuple
+    # once a user runs benchmarks/bench_parakeet.py on real NPU hardware.
+    # Edit freely — it's a flat tuple of frame counts, ascending, in frames
+    # (frames = seconds * MEL_FRAME_RATE). The last entry is also the
+    # fallback/max: longer audio is truncated to it (see transcribe()).
+    MEL_BUCKETS = (
+        200,   # ~2s  — short commands ("open terminal", "next line")
+        500,   # ~5s  — typical single-sentence dictation
+        900,   # ~9s  — longer dictated sentence / short paragraph
+        1600,  # ~16s — original static shape; kept as the ceiling/fallback
+    )
+
+    def __init__(self, model_path: Path, device: str = "NPU", latency_override: bool = None):
         self.model_path = model_path
         self.device = device
+        # Measurable, opt-in lever from issue #3: sets
+        # ov::intel_npu::compilation_mode_params with
+        # performance-hint-override="latency" (NPU's default for that
+        # sub-property is "efficiency"). Effect is UNMEASURED — do not
+        # infer anything from this flag existing. Off by default; toggle
+        # with the PARAKEET_LATENCY_OVERRIDE=1 env var (kept out of
+        # create_model()/DEFAULT_CONFIG so the existing factory call
+        # signature and its tests stay untouched — this is a measurement
+        # knob, not a shipped feature).
+        if latency_override is None:
+            latency_override = os.environ.get("PARAKEET_LATENCY_OVERRIDE", "") in ("1", "true", "yes")
+        self.latency_override = latency_override
         self.vocab: dict[int, str] = {}
         self.preproc = None  # onnxruntime session
-        self.enc_compiled = None  # OpenVINO compiled encoder
+        self.enc_compiled: dict[int, "object"] = {}  # bucket frame count -> compiled encoder
         self.dec_compiled = None  # OpenVINO compiled decoder
-        self.enc_time_dim = 0  # encoder output time dimension (computed at load)
+        self.enc_time_dim: dict[int, int] = {}  # bucket frame count -> encoder output time dim
         self._load_pipeline()
+
+    @classmethod
+    def select_bucket(cls, actual_frames: int) -> tuple[int, bool]:
+        """Pick the smallest bucket that fits `actual_frames`.
+
+        Returns (bucket_frames, was_truncated). was_truncated is True when
+        actual_frames exceeds every bucket, in which case the caller must
+        truncate to the largest bucket (see transcribe()) — this never
+        raises and never silently drops the fact that truncation happened.
+        """
+        for bucket in cls.MEL_BUCKETS:
+            if actual_frames <= bucket:
+                return bucket, False
+        return cls.MEL_BUCKETS[-1], True
 
     def _load_vocab(self):
         """Load vocab.txt from model directory."""
@@ -423,49 +476,70 @@ class ParakeetNPU:
             )
         log(f"  Preprocessor loaded from {preproc_path}")
 
-        # 3. Load encoder on NPU/GPU via OpenVINO
+        # 3. Load encoder on NPU/GPU via OpenVINO — one compiled graph per
+        # bucket in MEL_BUCKETS (NPU requires static shapes, so each bucket
+        # is its own compile). All compiles share CACHE_DIR, so only the
+        # first run per bucket pays the compile cost; see benchmarks/ for
+        # first-run cost measurement.
         try:
             import openvino as ov
+            import numpy as np
             core = ov.Core()
 
             encoder_path = self.model_path / "encoder-model.onnx"
-            encoder_model = core.read_model(str(encoder_path))
-            encoder_model.reshape({
-                "audio_signal": [1, 128, self.MEL_FRAMES],
-                "length": [1],
-            })
+
+            compile_config = {"CACHE_DIR": str(CACHE_DIR)}
+            if self.latency_override:
+                # UNMEASURED lever (issue #3): NPU's default for this
+                # sub-property is "efficiency". Opt-in only; do not assume
+                # this helps or hurts until the harness reports a number.
+                compile_config["NPU_COMPILATION_MODE_PARAMS"] = "performance-hint-override=latency"
 
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            try:
-                self.enc_compiled = core.compile_model(
-                    encoder_model, self.device, {"CACHE_DIR": str(CACHE_DIR)}
-                )
-                log(f"  Encoder compiled on {self.device}")
-            except Exception as e:
-                if self.device != "CPU":
-                    fallback = "GPU" if self.device == "NPU" else "CPU"
-                    log(f"  Encoder failed on {self.device}: {e}")
-                    log(f"  Falling back to {fallback}...")
-                    try:
-                        self.enc_compiled = core.compile_model(
-                            encoder_model, fallback, {"CACHE_DIR": str(CACHE_DIR)}
-                        )
-                        self.device = fallback
-                        log(f"  Encoder compiled on {fallback}")
-                    except Exception:
-                        log(f"  Falling back to CPU...")
-                        self.enc_compiled = core.compile_model(encoder_model, "CPU")
-                        self.device = "CPU"
-                else:
-                    raise
 
-            # Determine encoder output time dimension via dummy inference
-            import numpy as np
-            dummy_mel = np.zeros((1, 128, self.MEL_FRAMES), dtype=np.float32)
-            dummy_len = np.array([self.MEL_FRAMES], dtype=np.int64)
-            dummy_out = self.enc_compiled({"audio_signal": dummy_mel, "length": dummy_len})
-            self.enc_time_dim = dummy_out["outputs"].shape[2]
-            log(f"  Encoder output: [1, {self.ENC_DIM}, {self.enc_time_dim}]")
+            for bucket in self.MEL_BUCKETS:
+                encoder_model = core.read_model(str(encoder_path))
+                encoder_model.reshape({
+                    "audio_signal": [1, 128, bucket],
+                    "length": [1],
+                })
+                try:
+                    compiled = core.compile_model(encoder_model, self.device, compile_config)
+                    log(f"  Encoder bucket {bucket} frames compiled on {self.device}")
+                except Exception as e:
+                    if "NPU_COMPILATION_MODE_PARAMS" in compile_config and (
+                        "NPU_COMPILATION_MODE_PARAMS" in str(e) or "compilation_mode_params" in str(e).lower()
+                    ):
+                        # This OpenVINO/driver version rejects the latency
+                        # override property; drop it and retry rather than
+                        # crashing the whole pipeline load.
+                        log(f"  latency_override property rejected ({e}); disabling it")
+                        del compile_config["NPU_COMPILATION_MODE_PARAMS"]
+                        self.latency_override = False
+                        compiled = core.compile_model(encoder_model, self.device, compile_config)
+                        log(f"  Encoder bucket {bucket} frames compiled on {self.device} (no latency_override)")
+                    elif self.device != "CPU":
+                        fallback = "GPU" if self.device == "NPU" else "CPU"
+                        log(f"  Encoder bucket {bucket} failed on {self.device}: {e}")
+                        log(f"  Falling back to {fallback}...")
+                        try:
+                            compiled = core.compile_model(encoder_model, fallback, compile_config)
+                            self.device = fallback
+                            log(f"  Encoder bucket {bucket} compiled on {fallback}")
+                        except Exception:
+                            log(f"  Falling back to CPU...")
+                            compiled = core.compile_model(encoder_model, "CPU")
+                            self.device = "CPU"
+                    else:
+                        raise
+                self.enc_compiled[bucket] = compiled
+
+                # Determine encoder output time dimension via dummy inference
+                dummy_mel = np.zeros((1, 128, bucket), dtype=np.float32)
+                dummy_len = np.array([bucket], dtype=np.int64)
+                dummy_out = compiled({"audio_signal": dummy_mel, "length": dummy_len})
+                self.enc_time_dim[bucket] = dummy_out["outputs"].shape[2]
+                log(f"  Encoder bucket {bucket} output: [1, {self.ENC_DIM}, {self.enc_time_dim[bucket]}]")
 
             # 4. Load decoder on GPU (1.8x faster than CPU for sequential loop)
             decoder_path = self.model_path / "decoder_joint-model.onnx"
@@ -573,17 +647,27 @@ class ParakeetNPU:
         mel, mel_lens = self._preprocess(audio_data)
         actual_frames = mel.shape[2]
 
-        # Pad or truncate to MEL_FRAMES
-        if actual_frames < self.MEL_FRAMES:
-            mel_padded = np.zeros((1, 128, self.MEL_FRAMES), dtype=np.float32)
+        # Pick the smallest bucket that fits, and pad/truncate the mel
+        # features to exactly that bucket's frame count. Over-length audio
+        # (beyond the largest bucket) is truncated — same ceiling as the
+        # pre-bucketing static shape had — but, unlike before, it's now
+        # logged instead of silent, so dropped speech is visible to the user.
+        bucket, was_truncated = self.select_bucket(actual_frames)
+        if was_truncated:
+            log(f"  WARNING: {actual_frames / self.MEL_FRAME_RATE:.1f}s audio exceeds the "
+                f"largest bucket ({bucket / self.MEL_FRAME_RATE:.0f}s); truncating — "
+                f"trailing speech will be dropped from the transcript.")
+
+        if actual_frames < bucket:
+            mel_padded = np.zeros((1, 128, bucket), dtype=np.float32)
             mel_padded[:, :, :actual_frames] = mel
             mel = mel_padded
-        elif actual_frames > self.MEL_FRAMES:
-            mel = mel[:, :, :self.MEL_FRAMES]
-            actual_frames = self.MEL_FRAMES
+        elif actual_frames > bucket:
+            mel = mel[:, :, :bucket]
+            actual_frames = bucket
 
-        # 2. Encoder (NPU/GPU)
-        enc_result = self.enc_compiled({
+        # 2. Encoder (NPU/GPU) — dispatch to the compiled graph for this bucket
+        enc_result = self.enc_compiled[bucket]({
             "audio_signal": mel,
             "length": np.array([actual_frames], dtype=np.int64),
         })
@@ -597,7 +681,7 @@ class ParakeetNPU:
         audio_duration = len(audio_data) / sample_rate
         rtf = elapsed / audio_duration if audio_duration > 0 else 0
         log(f"Transcribed {audio_duration:.1f}s audio in {elapsed:.1f}s "
-            f"(RTF: {rtf:.2f}) on {self.device}+CPU [Parakeet]")
+            f"(RTF: {rtf:.2f}) on {self.device}+CPU [Parakeet, bucket={bucket}f]")
 
         return text
 
