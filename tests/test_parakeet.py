@@ -294,3 +294,89 @@ class TestModelDownloadStatus:
         model_dir.mkdir()
         (model_dir / "encoder-model.onnx").write_text("")
         assert is_model_downloaded("parakeet") is True
+
+
+class TestShapeBucketing:
+    """Regression tests for issue #3 shape-bucket selection (no NPU needed —
+    select_bucket() and the padding logic are pure/deterministic)."""
+
+    def test_bucket_set_is_ascending_and_nonempty(self):
+        buckets = ParakeetNPU.MEL_BUCKETS
+        assert len(buckets) >= 1
+        assert list(buckets) == sorted(buckets)
+        assert len(set(buckets)) == len(buckets)
+
+    def test_smallest_audio_gets_smallest_bucket(self):
+        bucket, truncated = ParakeetNPU.select_bucket(1)
+        assert bucket == ParakeetNPU.MEL_BUCKETS[0]
+        assert truncated is False
+
+    def test_exact_boundary_picks_that_bucket_not_the_next(self):
+        for bucket in ParakeetNPU.MEL_BUCKETS:
+            chosen, truncated = ParakeetNPU.select_bucket(bucket)
+            assert chosen == bucket, f"exact-length input {bucket} should pick bucket {bucket}, got {chosen}"
+            assert truncated is False
+
+    def test_one_frame_over_boundary_picks_next_bucket(self):
+        buckets = ParakeetNPU.MEL_BUCKETS
+        for smaller, larger in zip(buckets, buckets[1:]):
+            chosen, truncated = ParakeetNPU.select_bucket(smaller + 1)
+            assert chosen == larger, f"{smaller + 1} frames should round up to {larger}, got {chosen}"
+            assert truncated is False
+
+    def test_over_length_audio_falls_back_to_largest_bucket_and_flags_truncation(self):
+        largest = ParakeetNPU.MEL_BUCKETS[-1]
+        chosen, truncated = ParakeetNPU.select_bucket(largest + 1)
+        assert chosen == largest
+        assert truncated is True
+
+        chosen, truncated = ParakeetNPU.select_bucket(largest * 10)
+        assert chosen == largest
+        assert truncated is True
+
+    def test_zero_frames_picks_smallest_bucket(self):
+        chosen, truncated = ParakeetNPU.select_bucket(0)
+        assert chosen == ParakeetNPU.MEL_BUCKETS[0]
+        assert truncated is False
+
+
+class TestMelPaddingToBucket:
+    """Verify mel features end up padded to exactly the selected bucket's
+    frame count, via ParakeetNPU.pad_to_bucket() — the actual method
+    transcribe() and the benchmark harness call, not a reimplementation.
+    """
+
+    def test_short_audio_padded_to_exact_bucket_size(self):
+        actual_frames = 50
+        mel = np.ones((1, 128, actual_frames), dtype=np.float32)
+        bucket, truncated = ParakeetNPU.select_bucket(actual_frames)
+        assert truncated is False
+        padded = ParakeetNPU.pad_to_bucket(mel, bucket)
+        assert padded.shape == (1, 128, bucket)
+        # original content preserved
+        assert np.array_equal(padded[:, :, :actual_frames], mel)
+        # padding is zeros
+        assert np.all(padded[:, :, actual_frames:] == 0)
+
+    def test_exact_bucket_length_unchanged(self):
+        bucket = ParakeetNPU.MEL_BUCKETS[1]
+        mel = np.ones((1, 128, bucket), dtype=np.float32)
+        chosen, truncated = ParakeetNPU.select_bucket(bucket)
+        assert chosen == bucket
+        assert truncated is False
+        padded = ParakeetNPU.pad_to_bucket(mel, chosen)
+        assert padded.shape == (1, 128, bucket)
+        assert np.array_equal(padded, mel)
+
+    def test_over_length_audio_truncated_to_largest_bucket_not_dropped_silently(self):
+        largest = ParakeetNPU.MEL_BUCKETS[-1]
+        actual_frames = largest + 500
+        mel = np.arange(actual_frames, dtype=np.float32).reshape(1, 1, -1)
+        mel = np.broadcast_to(mel, (1, 128, actual_frames)).copy()
+        bucket, truncated = ParakeetNPU.select_bucket(actual_frames)
+        assert bucket == largest
+        assert truncated is True  # caller (transcribe()) must log this, not swallow it
+        result = ParakeetNPU.pad_to_bucket(mel, bucket)
+        assert result.shape == (1, 128, largest)
+        # the leading `largest` frames of real speech are kept, not zeroed/dropped
+        assert np.array_equal(result, mel[:, :, :largest])
