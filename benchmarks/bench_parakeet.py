@@ -60,6 +60,20 @@ def load_wav(path: Path, sample_rate: int = 16000) -> np.ndarray:
         return audio
 
 
+def _csv_safe(value: str) -> str:
+    """Prefix values that would be interpreted as formulas if this CSV is
+    opened in Excel/Sheets (transcript text starting with =, +, -, or @).
+
+    benchmarks/README.md tells the user to paste this CSV into a
+    spreadsheet, and the `text` field is untrusted ASR output (from
+    synthetic audio or a user-supplied --audio WAV), so this guards against
+    CSV/formula injection there.
+    """
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
 def bench_one(model: ParakeetNPU, audio: np.ndarray, sample_rate: int, label: str) -> dict:
     t0 = time.time()
     mel, _ = model._preprocess(audio)
@@ -68,12 +82,8 @@ def bench_one(model: ParakeetNPU, audio: np.ndarray, sample_rate: int, label: st
 
     bucket, was_truncated = model.select_bucket(actual_frames)
 
-    if actual_frames < bucket:
-        mel_padded = np.zeros((1, 128, bucket), dtype=np.float32)
-        mel_padded[:, :, :actual_frames] = mel
-        mel = mel_padded
-    elif actual_frames > bucket:
-        mel = mel[:, :, :bucket]
+    mel = model.pad_to_bucket(mel, bucket)
+    if was_truncated:
         actual_frames = bucket
 
     t2 = time.time()
@@ -177,7 +187,7 @@ def main():
             w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
             for r in rows:
-                w.writerow(r)
+                w.writerow({**r, "label": _csv_safe(r["label"]), "text": _csv_safe(r["text"])})
             w.writerow({})
             w.writerow({"label": "load_time_s", "audio_duration_s": round(load_time_s, 2)})
         print(f"Wrote {args.csv}")

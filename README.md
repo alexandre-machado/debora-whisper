@@ -169,7 +169,7 @@ for the exact commands to produce before/after numbers on real NPU hardware.
 - Minimum driver version: 32.0.100.3104
 
 ### Slow first run
-OpenVINO compiles the model graph for your specific NPU on first launch. This takes 1-15 minutes depending on model size and is cached for subsequent runs.
+OpenVINO compiles the model graph for your specific NPU on first launch. This takes 1-15 minutes depending on model size and is cached for subsequent runs. For Parakeet specifically, this means 4 sequential encoder-graph compiles (one per shape bucket), not 1 — see the architecture notes above and `benchmarks/README.md` for details — so first launch takes proportionally longer than a single-graph model.
 
 ### DEVICE_LOST error
 The NPU driver crashed. Reboot to reset it. The GUI auto-falls back to GPU when this happens.

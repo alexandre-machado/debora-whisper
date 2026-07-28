@@ -209,25 +209,16 @@ class TestShapeBucketing:
 
 class TestMelPaddingToBucket:
     """Verify mel features end up padded to exactly the selected bucket's
-    frame count, mirroring the padding logic in ParakeetNPU.transcribe()."""
-
-    @staticmethod
-    def pad_to_bucket(mel: np.ndarray, bucket: int) -> np.ndarray:
-        actual_frames = mel.shape[2]
-        if actual_frames < bucket:
-            padded = np.zeros((1, 128, bucket), dtype=np.float32)
-            padded[:, :, :actual_frames] = mel
-            return padded
-        elif actual_frames > bucket:
-            return mel[:, :, :bucket]
-        return mel
+    frame count, via ParakeetNPU.pad_to_bucket() — the actual method
+    transcribe() and the benchmark harness call, not a reimplementation.
+    """
 
     def test_short_audio_padded_to_exact_bucket_size(self):
         actual_frames = 50
         mel = np.ones((1, 128, actual_frames), dtype=np.float32)
         bucket, truncated = ParakeetNPU.select_bucket(actual_frames)
         assert truncated is False
-        padded = self.pad_to_bucket(mel, bucket)
+        padded = ParakeetNPU.pad_to_bucket(mel, bucket)
         assert padded.shape == (1, 128, bucket)
         # original content preserved
         assert np.array_equal(padded[:, :, :actual_frames], mel)
@@ -240,7 +231,7 @@ class TestMelPaddingToBucket:
         chosen, truncated = ParakeetNPU.select_bucket(bucket)
         assert chosen == bucket
         assert truncated is False
-        padded = self.pad_to_bucket(mel, chosen)
+        padded = ParakeetNPU.pad_to_bucket(mel, chosen)
         assert padded.shape == (1, 128, bucket)
         assert np.array_equal(padded, mel)
 
@@ -252,7 +243,7 @@ class TestMelPaddingToBucket:
         bucket, truncated = ParakeetNPU.select_bucket(actual_frames)
         assert bucket == largest
         assert truncated is True  # caller (transcribe()) must log this, not swallow it
-        result = self.pad_to_bucket(mel, bucket)
+        result = ParakeetNPU.pad_to_bucket(mel, bucket)
         assert result.shape == (1, 128, largest)
         # the leading `largest` frames of real speech are kept, not zeroed/dropped
         assert np.array_equal(result, mel[:, :, :largest])

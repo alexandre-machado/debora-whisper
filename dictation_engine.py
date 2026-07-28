@@ -436,6 +436,32 @@ class ParakeetNPU:
                 return bucket, False
         return cls.MEL_BUCKETS[-1], True
 
+    @staticmethod
+    def pad_to_bucket(mel, bucket: int):
+        """Zero-pad or truncate `mel` (shape [1, mel_bins, frames]) to
+        exactly `bucket` frames.
+
+        Padding is appended after the real content (zeros at the end, not
+        interleaved). Truncation keeps the leading `bucket` frames and drops
+        the trailing ones — callers that truncate must surface that fact to
+        the user themselves (see transcribe()'s truncation warning); this
+        method just does the array op.
+
+        Single source of truth for this logic — transcribe() and the
+        benchmark harness (benchmarks/bench_parakeet.py) both call this
+        instead of reimplementing it, so tests that exercise this method
+        exercise the real production code path.
+        """
+        import numpy as np
+        actual_frames = mel.shape[2]
+        if actual_frames < bucket:
+            padded = np.zeros((1, mel.shape[1], bucket), dtype=mel.dtype)
+            padded[:, :, :actual_frames] = mel
+            return padded
+        elif actual_frames > bucket:
+            return mel[:, :, :bucket]
+        return mel
+
     def _load_vocab(self):
         """Load vocab.txt from model directory."""
         vocab_path = self.model_path / "vocab.txt"
@@ -497,6 +523,27 @@ class ParakeetNPU:
 
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+            def _fallback_compile(bucket, model_to_compile, cfg, first_exc):
+                """NPU/GPU -> CPU device-fallback chain, shared by every
+                compile call site so the deep CPU fallback always gets
+                CACHE_DIR (uncached CPU compiles are otherwise paid on
+                every single startup that hits this path)."""
+                if self.device == "CPU":
+                    raise first_exc
+                fallback = "GPU" if self.device == "NPU" else "CPU"
+                log(f"  Encoder bucket {bucket} failed on {self.device}: {first_exc}")
+                log(f"  Falling back to {fallback}...")
+                try:
+                    c = core.compile_model(model_to_compile, fallback, cfg)
+                    self.device = fallback
+                    log(f"  Encoder bucket {bucket} compiled on {fallback}")
+                    return c
+                except Exception:
+                    log(f"  Falling back to CPU...")
+                    c = core.compile_model(model_to_compile, "CPU", {"CACHE_DIR": str(CACHE_DIR)})
+                    self.device = "CPU"
+                    return c
+
             for bucket in self.MEL_BUCKETS:
                 encoder_model = core.read_model(str(encoder_path))
                 encoder_model.reshape({
@@ -516,22 +563,18 @@ class ParakeetNPU:
                         log(f"  latency_override property rejected ({e}); disabling it")
                         del compile_config["NPU_COMPILATION_MODE_PARAMS"]
                         self.latency_override = False
-                        compiled = core.compile_model(encoder_model, self.device, compile_config)
-                        log(f"  Encoder bucket {bucket} frames compiled on {self.device} (no latency_override)")
-                    elif self.device != "CPU":
-                        fallback = "GPU" if self.device == "NPU" else "CPU"
-                        log(f"  Encoder bucket {bucket} failed on {self.device}: {e}")
-                        log(f"  Falling back to {fallback}...")
                         try:
-                            compiled = core.compile_model(encoder_model, fallback, compile_config)
-                            self.device = fallback
-                            log(f"  Encoder bucket {bucket} compiled on {fallback}")
-                        except Exception:
-                            log(f"  Falling back to CPU...")
-                            compiled = core.compile_model(encoder_model, "CPU")
-                            self.device = "CPU"
+                            compiled = core.compile_model(encoder_model, self.device, compile_config)
+                            log(f"  Encoder bucket {bucket} frames compiled on {self.device} (no latency_override)")
+                        except Exception as e2:
+                            # The retry can fail too (e.g. a driver edge
+                            # case unrelated to the rejected property) — run
+                            # it through the same device-fallback chain a
+                            # plain compile failure gets, instead of letting
+                            # it escape and abort pipeline load entirely.
+                            compiled = _fallback_compile(bucket, encoder_model, compile_config, e2)
                     else:
-                        raise
+                        compiled = _fallback_compile(bucket, encoder_model, compile_config, e)
                 self.enc_compiled[bucket] = compiled
 
                 # Determine encoder output time dimension via dummy inference
@@ -658,13 +701,13 @@ class ParakeetNPU:
                 f"largest bucket ({bucket / self.MEL_FRAME_RATE:.0f}s); truncating — "
                 f"trailing speech will be dropped from the transcript.")
 
-        if actual_frames < bucket:
-            mel_padded = np.zeros((1, 128, bucket), dtype=np.float32)
-            mel_padded[:, :, :actual_frames] = mel
-            mel = mel_padded
-        elif actual_frames > bucket:
-            mel = mel[:, :, :bucket]
+        mel = self.pad_to_bucket(mel, bucket)
+        if was_truncated:
+            # Truncation drops real frames, so the encoder's `length` input
+            # must shrink to match (see pad_to_bucket()'s docstring).
             actual_frames = bucket
+        # else: actual_frames stays the true (shorter) frame count so the
+        # encoder does not attend over the zero-padding pad_to_bucket() added.
 
         # 2. Encoder (NPU/GPU) — dispatch to the compiled graph for this bucket
         enc_result = self.enc_compiled[bucket]({
