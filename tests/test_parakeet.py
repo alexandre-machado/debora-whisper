@@ -200,6 +200,74 @@ class TestParakeetTdtConstants:
         assert instance.BLANK_IDX == 100
         assert instance.VOCAB_SIZE == 101
 
+    def test_empty_vocab_raises_instead_of_silently_falling_back(self, tmp_path):
+        # An empty vocab.txt must not silently keep the hardcoded 8192/8193
+        # defaults paired with an empty self.vocab dict -- that would "load"
+        # successfully and then render every token as "?" at inference time.
+        (tmp_path / "vocab.txt").write_text("", encoding="utf-8")
+        instance = self._bare_parakeet(tmp_path)
+        with pytest.raises(ValueError, match="zero valid entries"):
+            instance._load_vocab()
+
+    def test_unparseable_vocab_raises_instead_of_silently_falling_back(self, tmp_path):
+        # Every line fails the "token index" pair format (e.g. a corrupted
+        # download truncated mid-line) -- self.vocab ends up empty exactly
+        # like the fully-empty-file case above.
+        (tmp_path / "vocab.txt").write_text(
+            "this is not a valid vocab line\nneither is this",
+            encoding="utf-8",
+        )
+        instance = self._bare_parakeet(tmp_path)
+        with pytest.raises(ValueError, match="zero valid entries"):
+            instance._load_vocab()
+
+
+class TestParakeetVocabDecoderValidation:
+    """Verify the vocab-derived VOCAB_SIZE is cross-checked against the
+    decoder's real compiled output width (fast follow-up to issue #1's
+    review: `@sec` medium finding)."""
+
+    def _bare_parakeet_with_decoder(self, tmp_path, decoder_output_width, vocab_size, blank_idx):
+        instance = ParakeetNPU.__new__(ParakeetNPU)
+        instance.model_path = tmp_path
+        instance.vocab = {i: str(i) for i in range(vocab_size - 1)}
+        instance.VOCAB_SIZE = vocab_size
+        instance.BLANK_IDX = blank_idx
+
+        mock_output = MagicMock()
+        mock_output.get_partial_shape.return_value = [MagicMock(get_length=lambda: decoder_output_width)]
+        instance.dec_compiled = MagicMock()
+        instance.dec_compiled.output.return_value = mock_output
+        return instance
+
+    def test_matching_decoder_output_width_passes(self, tmp_path):
+        # VOCAB_SIZE=8193 (8192 vocab tokens + blank) plus 5 duration bins
+        # matches decoder_joint-model.onnx's real output width for the
+        # shipped checkpoint.
+        instance = self._bare_parakeet_with_decoder(
+            tmp_path, decoder_output_width=8198, vocab_size=8193, blank_idx=8192,
+        )
+        instance._validate_vocab_against_decoder()  # should not raise
+
+    def test_vocab_larger_than_decoder_output_raises(self, tmp_path):
+        # A truncated/stale vocab.txt derives a VOCAB_SIZE that leaves no
+        # room for duration logits in the decoder's real output -- this must
+        # fail loudly at load time instead of crashing argmax() on an empty
+        # slice mid-transcription.
+        instance = self._bare_parakeet_with_decoder(
+            tmp_path, decoder_output_width=8198, vocab_size=8300, blank_idx=8299,
+        )
+        with pytest.raises(RuntimeError, match="inconsistent with decoder_joint-model.onnx"):
+            instance._validate_vocab_against_decoder()
+
+    def test_vocab_size_equal_to_decoder_output_raises(self, tmp_path):
+        # Leaves zero duration logits (empty slice) -- must also be rejected.
+        instance = self._bare_parakeet_with_decoder(
+            tmp_path, decoder_output_width=8193, vocab_size=8193, blank_idx=8192,
+        )
+        with pytest.raises(RuntimeError, match="inconsistent with decoder_joint-model.onnx"):
+            instance._validate_vocab_against_decoder()
+
 
 class TestModelDownloadStatus:
     """Verify download status detection."""

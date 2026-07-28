@@ -417,23 +417,81 @@ class ParakeetNPU:
                     self.vocab[idx] = token.replace("\u2581", " ")
         log(f"Parakeet vocab loaded: {len(self.vocab)} tokens")
 
+        # An empty or unparseable vocab.txt must fail loudly rather than
+        # silently falling back to the hardcoded class defaults: those
+        # defaults would then be paired with an empty self.vocab dict,
+        # letting the pipeline load "successfully" while every decoded
+        # token renders as "?" (via self.vocab.get(t, "?")) instead of
+        # surfacing the broken download/export immediately.
+        if not self.vocab:
+            raise ValueError(
+                f"Parakeet vocab.txt at {vocab_path} produced zero valid entries "
+                f"(expected '<token> <index>' pairs per line, e.g. '▁the 42'). "
+                f"The file is empty, truncated, or in an unexpected format. "
+                f"Re-run setup: python dictation_engine.py --model parakeet --setup"
+            )
+
         # Derive BLANK_IDX / VOCAB_SIZE from the loaded vocab instead of
         # trusting the hardcoded class defaults blindly. The joint network
         # emits logits laid out as [vocab tokens..., blank, duration bins...],
         # so blank sits immediately after the highest real vocab index.
-        if self.vocab:
-            max_idx = max(self.vocab)
-            derived_blank = max_idx + 1
-            derived_vocab_size = max_idx + 2
-            if derived_blank != self.BLANK_IDX or derived_vocab_size != self.VOCAB_SIZE:
-                log(
-                    f"WARNING: TDT constants derived from vocab.txt (BLANK_IDX="
-                    f"{derived_blank}, VOCAB_SIZE={derived_vocab_size}) differ from "
-                    f"hardcoded defaults (BLANK_IDX={self.BLANK_IDX}, "
-                    f"VOCAB_SIZE={self.VOCAB_SIZE}); using derived values."
-                )
-            self.BLANK_IDX = derived_blank
-            self.VOCAB_SIZE = derived_vocab_size
+        max_idx = max(self.vocab)
+        derived_blank = max_idx + 1
+        derived_vocab_size = max_idx + 2
+        if derived_blank != self.BLANK_IDX or derived_vocab_size != self.VOCAB_SIZE:
+            log(
+                f"WARNING: TDT constants derived from vocab.txt (BLANK_IDX="
+                f"{derived_blank}, VOCAB_SIZE={derived_vocab_size}) differ from "
+                f"hardcoded defaults (BLANK_IDX={self.BLANK_IDX}, "
+                f"VOCAB_SIZE={self.VOCAB_SIZE}); using derived values."
+            )
+        self.BLANK_IDX = derived_blank
+        self.VOCAB_SIZE = derived_vocab_size
+
+    def _validate_vocab_against_decoder(self):
+        """Cross-check the vocab-derived VOCAB_SIZE against the decoder's
+        actual compiled output width.
+
+        _load_vocab() derives BLANK_IDX/VOCAB_SIZE purely from vocab.txt, with
+        no guarantee it agrees with decoder_joint-model.onnx's real logit
+        layout ([vocab tokens..., blank, duration bins...]). If VOCAB_SIZE is
+        too large, `duration_logits = output[self.VOCAB_SIZE:]` in
+        _tdt_greedy_decode becomes an empty array and `.argmax()` raises an
+        unhandled ValueError mid-transcription. If it's too small (but still
+        within bounds), decoding would silently misread real vocab logits as
+        duration logits, producing garbled output with no error at all.
+        Catching the "too large" / "no room left" case here, right after the
+        decoder is compiled, turns both failure modes into one loud, actionable
+        error at load time instead of a crash or silent corruption at
+        inference time.
+        """
+        try:
+            decoder_output_width = self.dec_compiled.output("outputs").get_partial_shape()[-1].get_length()
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not determine decoder_joint-model.onnx's output width to "
+                f"validate the vocab.txt-derived VOCAB_SIZE ({self.VOCAB_SIZE}): {e}. "
+                f"Re-run setup: python dictation_engine.py --model parakeet --setup"
+            ) from e
+
+        # At least one duration logit must remain after the vocab+blank
+        # slice, or _tdt_greedy_decode's duration_logits.argmax() crashes.
+        if self.VOCAB_SIZE >= decoder_output_width:
+            raise RuntimeError(
+                f"Parakeet vocab.txt is inconsistent with decoder_joint-model.onnx: "
+                f"the vocab-derived VOCAB_SIZE ({self.VOCAB_SIZE}, BLANK_IDX="
+                f"{self.BLANK_IDX}) leaves no room for duration logits in the "
+                f"decoder's output width of {decoder_output_width}. This usually "
+                f"means vocab.txt is truncated, stale, or paired with a decoder "
+                f"model from a different export. Refusing to start transcription "
+                f"with mismatched constants. Re-run setup: "
+                f"python dictation_engine.py --model parakeet --setup"
+            )
+        log(
+            f"  Vocab constants validated against decoder output width "
+            f"({self.VOCAB_SIZE} vocab+blank, "
+            f"{decoder_output_width - self.VOCAB_SIZE} duration bins)"
+        )
 
     def _load_pipeline(self):
         """Load preprocessor, encoder, and decoder."""
@@ -525,6 +583,15 @@ class ParakeetNPU:
                 log(f"  Decoder failed on GPU: {e}, falling back to CPU")
                 self.dec_compiled = core.compile_model(decoder_model, "CPU")
                 log(f"  Decoder compiled on CPU")
+
+            # 5. Validate the vocab-derived constants against the decoder's
+            # real compiled output width. vocab.txt and decoder_joint-model.onnx
+            # are separate files shipped side by side; a partial download, a
+            # stale cached vocab.txt from a prior model version, or a tampered
+            # HF repo could leave them disagreeing. Fail loudly here rather
+            # than letting a bad VOCAB_SIZE crash (or silently corrupt) the
+            # first transcription in _tdt_greedy_decode.
+            self._validate_vocab_against_decoder()
 
         except Exception as e:
             log(f"Failed to load Parakeet pipeline: {e}")
