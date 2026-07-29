@@ -421,6 +421,10 @@ class ParakeetNPU:
         1600,  # ~16s — original static shape; kept as the ceiling/fallback
     )
 
+    ENC_DIM = 1024
+    LSTM_DIM = 640
+    DECODE_SPACE = re.compile(r"\A\s|\s\B|(\s)\b")
+
     def __init__(self, model_path: Path, device: str = "NPU", latency_override: bool = None):
         self.model_path = model_path
         self.device = device

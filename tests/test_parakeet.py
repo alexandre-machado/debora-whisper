@@ -1,5 +1,8 @@
 """Tests for Parakeet TDT integration."""
 
+import ast
+import inspect
+import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch, PropertyMock
@@ -380,3 +383,187 @@ class TestMelPaddingToBucket:
         assert result.shape == (1, 128, largest)
         # the leading `largest` frames of real speech are kept, not zeroed/dropped
         assert np.array_equal(result, mel[:, :, :largest])
+
+
+class TestParakeetMissingConstantsRegression:
+    """Regression test for issue #9: commit 2dc9cd4 deleted ENC_DIM,
+    LSTM_DIM and DECODE_SPACE from ParakeetNPU's class body while their
+    uses in _load_pipeline() (encoder/decoder compile) and
+    _tdt_greedy_decode() survived, crashing real-hardware loads with
+    'ParakeetNPU' object has no attribute 'ENC_DIM'.
+
+    This exercises the real _load_pipeline (compile) and
+    _tdt_greedy_decode (decode) code paths with mocked OpenVINO /
+    onnxruntime handles -- not hasattr(ParakeetNPU, "ENC_DIM"), which
+    would pass against a wrong value and would never touch DECODE_SPACE.
+    """
+
+    def _fake_model_dir(self, tmp_path):
+        # ▁ (U+2581) is NeMo/SentencePiece's word-start marker; _load_vocab
+        # turns it into a literal leading space.
+        (tmp_path / "vocab.txt").write_text(
+            "▁hello 0\n▁world 1\n▁c 2\n", encoding="utf-8",
+        )
+        (tmp_path / "nemo128.onnx").write_bytes(b"")
+        (tmp_path / "encoder-model.onnx").write_bytes(b"")
+        (tmp_path / "decoder_joint-model.onnx").write_bytes(b"")
+        return tmp_path
+
+    def test_load_pipeline_and_decode_use_real_enc_lstm_decode_space_constants(
+        self, tmp_path, monkeypatch,
+    ):
+        model_dir = self._fake_model_dir(tmp_path)
+        # One bucket is enough to exercise the compile path; MEL_BUCKETS
+        # itself is unrelated to this regression.
+        monkeypatch.setattr(ParakeetNPU, "MEL_BUCKETS", (10,))
+
+        fake_encoder_model = MagicMock(name="encoder_model")
+        fake_decoder_model = MagicMock(name="decoder_model")
+
+        def fake_read_model(path):
+            return fake_decoder_model if "decoder_joint" in str(path) else fake_encoder_model
+
+        fake_enc_compiled = MagicMock(name="enc_compiled")
+        fake_enc_compiled.side_effect = lambda inputs: {
+            "outputs": np.zeros((1, 1024, 3), dtype=np.float32)
+        }
+
+        fake_dec_compiled = MagicMock(name="dec_compiled")
+        vocab_size = 4  # 3 real tokens (indices 0-2) + derived blank at 3
+        duration_bins = 2
+        mock_output = MagicMock()
+        mock_output.get_partial_shape.return_value = [
+            MagicMock(get_length=lambda: vocab_size + duration_bins)
+        ]
+        fake_dec_compiled.output.return_value = mock_output
+
+        def fake_compile_model(model, device, cfg=None):
+            return fake_dec_compiled if model is fake_decoder_model else fake_enc_compiled
+
+        fake_core = MagicMock(name="core")
+        fake_core.read_model.side_effect = fake_read_model
+        fake_core.compile_model.side_effect = fake_compile_model
+
+        fake_ov = MagicMock(name="openvino_module")
+        fake_ov.Core.return_value = fake_core
+
+        with patch.dict(sys.modules, {"openvino": fake_ov}), \
+             patch("onnxruntime.InferenceSession", return_value=MagicMock()):
+            instance = ParakeetNPU(model_dir, device="CPU")
+
+        # --- compile path: ENC_DIM / LSTM_DIM must have been used with
+        # their real pre-2dc9cd4 values, not raised AttributeError. ---
+        fake_decoder_model.reshape.assert_called_once_with({
+            "encoder_outputs": [1, 1024, 1],
+            "targets": [1, 1],
+            "target_length": [1],
+            "input_states_1": [2, 1, 640],
+            "input_states_2": [2, 1, 640],
+        })
+
+        # --- decode path: LSTM_DIM (state shape) and DECODE_SPACE (final
+        # text cleanup) must both be exercised through the real method. ---
+        step_outputs = [
+            {  # t=0: emit token 0 ("▁hello"), duration=1
+                "outputs": np.array([[10, 0, 0, 0, 0, 10]], dtype=np.float32),
+                "output_states_1": np.zeros((2, 1, 640), dtype=np.float32),
+                "output_states_2": np.zeros((2, 1, 640), dtype=np.float32),
+            },
+            {  # t=1: emit token 1 ("▁world"), duration=1
+                "outputs": np.array([[0, 10, 0, 0, 0, 10]], dtype=np.float32),
+                "output_states_1": np.zeros((2, 1, 640), dtype=np.float32),
+                "output_states_2": np.zeros((2, 1, 640), dtype=np.float32),
+            },
+        ]
+        instance.dec_compiled = MagicMock(side_effect=step_outputs)
+
+        enc_out = np.zeros((1, 1024, 2), dtype=np.float32)
+        text = instance._tdt_greedy_decode(enc_out, enc_len=2)
+
+        # A missing/wrong DECODE_SPACE would leave the leading/duplicated
+        # sentencepiece-marker spaces in the output instead of "hello world".
+        assert text == "hello world"
+
+    def test_mutation_delete_enc_dim_breaks_the_regression_test(self, tmp_path, monkeypatch):
+        """Companion assertion proving the test above is load-bearing: with
+        ENC_DIM removed from the class (simulating the 2dc9cd4 regression),
+        constructing ParakeetNPU raises AttributeError instead of silently
+        passing."""
+        model_dir = self._fake_model_dir(tmp_path)
+        monkeypatch.setattr(ParakeetNPU, "MEL_BUCKETS", (10,))
+        monkeypatch.delattr(ParakeetNPU, "ENC_DIM")
+
+        fake_ov = MagicMock(name="openvino_module")
+        fake_core = MagicMock(name="core")
+        fake_core.read_model.return_value = MagicMock()
+        fake_enc_compiled = MagicMock()
+        fake_enc_compiled.side_effect = lambda inputs: {
+            "outputs": np.zeros((1, 1024, 3), dtype=np.float32)
+        }
+        fake_core.compile_model.return_value = fake_enc_compiled
+        fake_ov.Core.return_value = fake_core
+
+        with patch.dict(sys.modules, {"openvino": fake_ov}), \
+             patch("onnxruntime.InferenceSession", return_value=MagicMock()):
+            with pytest.raises(AttributeError, match="ENC_DIM"):
+                ParakeetNPU(model_dir, device="CPU")
+
+
+class TestParakeetClassAttributeGuard:
+    """Cheap static guard for issue #9's defect class: a class attribute
+    (self.X / cls.X) that is loaded somewhere in ParakeetNPU but never
+    defined at class level nor assigned on the instance anywhere in the
+    class. Walks the class body with `ast` so this stays true even as the
+    class grows, without needing OpenVINO/onnxruntime installed."""
+
+    def _undefined_self_cls_attributes(self):
+        source = inspect.getsource(ParakeetNPU)
+        tree = ast.parse(source)
+        class_node = tree.body[0]
+        assert isinstance(class_node, ast.ClassDef)
+
+        def _targets(node):
+            if isinstance(node, ast.Assign):
+                return node.targets
+            if isinstance(node, ast.AnnAssign):
+                return [node.target]
+            if isinstance(node, ast.AugAssign):
+                return [node.target]
+            return []
+
+        class_level_names = set()
+        for stmt in class_node.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                class_level_names.add(stmt.name)
+                continue
+            for target in _targets(stmt):
+                if isinstance(target, ast.Name):
+                    class_level_names.add(target.id)
+                elif isinstance(target, ast.Tuple):
+                    class_level_names.update(
+                        elt.id for elt in target.elts if isinstance(elt, ast.Name)
+                    )
+
+        instance_assigned_names = set()
+        loaded_names = set()
+        for node in ast.walk(class_node):
+            for target in _targets(node):
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) \
+                        and target.value.id in ("self", "cls"):
+                    instance_assigned_names.add(target.attr)
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) \
+                    and isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
+                loaded_names.add(node.attr)
+
+        known_names = class_level_names | instance_assigned_names
+        return loaded_names - known_names
+
+    def test_no_undefined_self_or_cls_attribute_loads(self):
+        undefined = self._undefined_self_cls_attributes()
+        assert not undefined, (
+            f"ParakeetNPU reads self./cls. attribute(s) never defined at "
+            f"class level or assigned on the instance: {sorted(undefined)} "
+            f"-- this is exactly the class of bug that made ENC_DIM/"
+            f"LSTM_DIM/DECODE_SPACE disappear in 2dc9cd4 while their uses "
+            f"survived."
+        )
