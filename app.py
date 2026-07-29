@@ -64,6 +64,7 @@ class GUIApp:
         self._settings_win: SettingsWindow | None = None
         self._history_win: HistoryWindow | None = None
         self._audio_poll_id = None
+        self._torn_down = False
 
     def run(self):
         """Start the application."""
@@ -87,7 +88,26 @@ class GUIApp:
         self._tray.start()
 
         # Run mainloop on main thread
-        self._root.mainloop()
+        self._mainloop()
+
+    def _mainloop(self):
+        """Run the Tk mainloop, shutting down cleanly on Ctrl+C.
+
+        Ctrl+C surfaces here as a bare KeyboardInterrupt out of Tk. Without
+        this, it escapes as an uncaught traceback and `_quit` never runs, so
+        the global keyboard hook and the tray icon stay alive until the
+        process dies.
+        """
+        try:
+            self._root.mainloop()
+        except KeyboardInterrupt:
+            log("Interrupted — shutting down.")
+        finally:
+            self._teardown()
+            try:
+                self._root.destroy()
+            except Exception:
+                pass  # already destroyed via _quit
 
     def _start_engine(self):
         """Start the engine in non-blocking mode."""
@@ -234,9 +254,25 @@ class GUIApp:
     # -- Quit --------------------------------------------------------------
 
     def _quit(self):
-        self._engine.stop()
-        self._tray.stop()
-        self._root.after(0, self._root.destroy)
+        """Quit requested from the tray — mainloop is still running, so the
+        window teardown is scheduled back onto the main thread."""
+        self._teardown()
+        try:
+            self._root.after(0, self._root.destroy)
+        except Exception:
+            pass  # root already gone; the mainloop's finally covers teardown
+
+    def _teardown(self):
+        """Stop background workers. Idempotent: both the tray Quit and the
+        Ctrl+C path call it, and one may follow the other."""
+        if self._torn_down:
+            return
+        self._torn_down = True
+        for name, stop in (("engine", self._engine.stop), ("tray", self._tray.stop)):
+            try:
+                stop()
+            except Exception as exc:
+                log(f"Error stopping {name} during shutdown: {exc}")
 
 
 def main():
