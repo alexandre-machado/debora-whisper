@@ -23,19 +23,38 @@ _GUI_STACK = (
 # The stubs are then removed again: leaving them in sys.modules would let a
 # later test module import a mock instead of the real dependency and pass
 # against it, which is how a suite starts lying about what it covers.
-try:
-    from app import GUIApp
-except Exception:
-    for _name in [n for n in sys.modules if n == "app" or n.startswith("ui.")]:
-        del sys.modules[_name]
-    _injected = [n for n in _GUI_STACK if n not in sys.modules]
-    for _name in _injected:
-        sys.modules[_name] = MagicMock()
+#
+# The fallback is scoped to ImportError specifically: a broader catch would let
+# a genuine bug in app.py on a working GUI box get silently retried against full
+# mocks and pass.
+def _drop(names):
+    for _n in list(names):
+        sys.modules.pop(_n, None)
+
+
+def _under_test():
+    """Import app.py, falling back to stubs only for a real missing dependency."""
     try:
         from app import GUIApp
+        return GUIApp
+    except ImportError:
+        pass
+
+    _drop([n for n in sys.modules if n == "app" or n.startswith("ui.")])
+    injected = [n for n in _GUI_STACK if n not in sys.modules]
+    for _n in injected:
+        sys.modules[_n] = MagicMock()
+    try:
+        from app import GUIApp
+        return GUIApp
     finally:
-        for _name in _injected:
-            sys.modules.pop(_name, None)
+        # Drop the stubs AND the mock-tainted modules they were imported into,
+        # so nothing downstream can resolve to a mock.
+        _drop(injected)
+        _drop([n for n in sys.modules if n == "app" or n.startswith("ui.")])
+
+
+GUIApp = _under_test()
 
 
 class _Stop:
@@ -54,13 +73,21 @@ class _Stop:
 class _Root:
     """Minimal Tk root: mainloop can be told to raise, destroy is recorded."""
 
-    def __init__(self, mainloop_raises: Exception | None = None):
+    def __init__(self, mainloop_raises: Exception | None = None,
+                 after_raises: Exception | None = None):
         self.destroyed = 0
+        self.scheduled = []
         self._raises = mainloop_raises
+        self._after_raises = after_raises
 
     def mainloop(self):
         if self._raises is not None:
             raise self._raises
+
+    def after(self, delay, fn):
+        if self._after_raises is not None:
+            raise self._after_raises
+        self.scheduled.append(fn)
 
     def destroy(self):
         self.destroyed += 1
@@ -99,6 +126,49 @@ class TestTeardown:
         engine, tray = _Stop(raises=RuntimeError("hook already gone")), _Stop()
         _bare_app(engine, tray)._teardown()
         assert tray.calls == 1
+
+
+class TestQuit:
+    """The tray's Quit path. Untested at first review, which meant a regression
+    dropping `_teardown()` out of `_quit` passed the whole suite."""
+
+    def test_stops_engine_and_tray(self):
+        engine, tray = _Stop(), _Stop()
+        _bare_app(engine, tray)._quit()
+        assert (engine.calls, tray.calls) == (1, 1)
+
+    def test_schedules_destroy_on_the_main_thread(self):
+        """_quit runs on the tray thread, so destroy must be queued, not called."""
+        root = _Root()
+        app = _bare_app(_Stop(), _Stop(), root)
+
+        app._quit()
+
+        assert root.destroyed == 0, "destroy must not run inline on the tray thread"
+        assert len(root.scheduled) == 1
+        root.scheduled[0]()  # what the mainloop would run
+        assert root.destroyed == 1
+
+    def test_teardown_survives_a_dead_root(self):
+        """Ctrl+C may have already torn the root down when Quit arrives."""
+        engine, tray = _Stop(), _Stop()
+        root = _Root(after_raises=RuntimeError("application has been destroyed"))
+        app = _bare_app(engine, tray, root)
+
+        app._quit()  # must not propagate
+
+        assert (engine.calls, tray.calls) == (1, 1)
+
+    def test_quit_then_interrupt_does_not_double_stop(self):
+        """Both shutdown paths can fire in one exit; the second is a no-op."""
+        engine, tray = _Stop(), _Stop()
+        root = _Root(mainloop_raises=KeyboardInterrupt())
+        app = _bare_app(engine, tray, root)
+
+        app._quit()
+        app._mainloop()
+
+        assert (engine.calls, tray.calls) == (1, 1)
 
 
 class TestMainloopInterrupt:

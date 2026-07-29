@@ -257,7 +257,10 @@ class GUIApp:
         """Quit requested from the tray — mainloop is still running, so the
         window teardown is scheduled back onto the main thread."""
         self._teardown()
-        self._root.after(0, self._root.destroy)
+        try:
+            self._root.after(0, self._root.destroy)
+        except Exception:
+            pass  # root already gone; the mainloop's finally covers teardown
 
     def _teardown(self):
         """Stop background workers. Idempotent: both the tray Quit and the
