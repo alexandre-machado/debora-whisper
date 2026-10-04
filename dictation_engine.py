@@ -1250,24 +1250,63 @@ class DictationApp:
     # -- Recording -------------------------------------------------------
 
     def toggle_recording(self):
-        """Toggle recording on/off."""
+        """Toggle recording on/off (Supports Tap-to-Toggle and Push-To-Talk)."""
         import time
         import threading
-        now = time.time()
         
-        # Prevent Windows auto-repeat from rapidly toggling when holding the hotkey
-        if hasattr(self, "_last_toggle_time") and now - self._last_toggle_time < 0.3:
-            try:
-                import keyboard
-                # If still physically pressed, it's auto-repeat. Update time and ignore.
-                if keyboard.is_pressed(self.config["hotkey"]):
-                    self._last_toggle_time = now
-                    return
-            except Exception:
-                pass
-        self._last_toggle_time = now
+        if getattr(self, "_hotkey_held", False):
+            # Ignore auto-repeat while the key is physically held
+            return
+            
+        self._hotkey_held = True
+        press_time = time.time()
 
-        def _do_toggle():
+        def _do_stop():
+            if not self.is_recording:
+                return
+            if self.config["beep_on_start"]:
+                threading.Thread(target=chime_stop, daemon=True).start()
+
+            audio = self.recorder.stop()
+            self.is_recording = False
+
+            if len(audio) < self.config["sample_rate"] * 0.3:
+                log("Recording too short, ignoring.")
+                self._set_state(AppState.READY)
+                return
+
+            self._set_state(AppState.PROCESSING)
+
+            try:
+                self.ensure_model()
+                text = self.whisper.transcribe(
+                    audio,
+                    sample_rate=self.config["sample_rate"],
+                    language=self.config["language"],
+                )
+                if text:
+                    type_text(text, auto_enter=self.config["auto_enter"])
+                    # Store in history
+                    self._history.append({
+                        "timestamp": datetime.now().isoformat(),
+                        "text": text,
+                        "duration": len(audio) / self.config["sample_rate"],
+                    })
+                    if len(self._history) > self.MAX_HISTORY:
+                        self._history = self._history[-self.MAX_HISTORY:]
+                    self._set_state(AppState.READY, {"text": text})
+                else:
+                    log("No speech detected.")
+                    self._set_state(AppState.READY)
+            except RuntimeError as e:
+                if "DEVICE_LOST" in str(e) or "device hung" in str(e):
+                    self._set_state(AppState.ERROR, {"error": str(e), "device_lost": True})
+                else:
+                    self._set_state(AppState.ERROR, {"error": str(e)})
+            except Exception as e:
+                self._set_state(AppState.ERROR, {"error": str(e)})
+
+        def _do_start():
             if not self._model_ready.is_set():
                 log("Model still loading, please wait...")
                 chime_warning()
@@ -1277,62 +1316,35 @@ class DictationApp:
                 log(f"Cannot record — model failed to load: {self._load_error}")
                 return
 
-            if self.is_recording:
-                # Stop recording and transcribe
-                if self.config["beep_on_start"]:
-                    threading.Thread(target=chime_stop, daemon=True).start()
+            self.is_recording = True
+            if self.config["beep_on_start"]:
+                threading.Thread(target=chime_start, daemon=True).start()
 
-                audio = self.recorder.stop()
-                self.is_recording = False
+            self.recorder.start()
+            self._set_state(AppState.RECORDING)
 
-                if len(audio) < self.config["sample_rate"] * 0.3:
-                    log("Recording too short, ignoring.")
-                    self._set_state(AppState.READY)
-                    return
+        def _watch_key(started_recording):
+            import keyboard
+            # Wait until the hotkey is physically released
+            while keyboard.is_pressed(self.config["hotkey"]):
+                time.sleep(0.05)
+            
+            self._hotkey_held = False
+            
+            # If we started recording and the user held the key for > 0.4s,
+            # treat it as Push-To-Talk and stop recording upon release.
+            duration = time.time() - press_time
+            if started_recording and duration > 0.4:
+                _do_stop()
 
-                self._set_state(AppState.PROCESSING)
-
-                try:
-                    self.ensure_model()
-                    text = self.whisper.transcribe(
-                        audio,
-                        sample_rate=self.config["sample_rate"],
-                        language=self.config["language"],
-                    )
-                    if text:
-                        type_text(text, auto_enter=self.config["auto_enter"])
-                        # Store in history
-                        self._history.append({
-                            "timestamp": datetime.now().isoformat(),
-                            "text": text,
-                            "duration": len(audio) / self.config["sample_rate"],
-                        })
-                        if len(self._history) > self.MAX_HISTORY:
-                            self._history = self._history[-self.MAX_HISTORY:]
-                        self._set_state(AppState.READY, {"text": text})
-                    else:
-                        log("No speech detected.")
-                        self._set_state(AppState.READY)
-                except RuntimeError as e:
-                    if "DEVICE_LOST" in str(e) or "device hung" in str(e):
-                        self._set_state(AppState.ERROR, {"error": str(e), "device_lost": True})
-                    else:
-                        self._set_state(AppState.ERROR, {"error": str(e)})
-                except Exception as e:
-                    self._set_state(AppState.ERROR, {"error": str(e)})
-
-            else:
-                # Start recording
-                self.is_recording = True
-                if self.config["beep_on_start"]:
-                    threading.Thread(target=chime_start, daemon=True).start()
-
-                self.recorder.start()
-                self._set_state(AppState.RECORDING)
-
-        # Offload all logic to a thread to return instantly and prevent the
-        # Windows keyboard hook from timing out (which causes the hotkey to leak)
-        threading.Thread(target=_do_toggle, daemon=True).start()
+        if self.is_recording:
+            # Stop recording immediately in a thread
+            threading.Thread(target=_do_stop, daemon=True).start()
+            threading.Thread(target=_watch_key, args=(False,), daemon=True).start()
+        else:
+            # Start recording immediately in a thread
+            threading.Thread(target=_do_start, daemon=True).start()
+            threading.Thread(target=_watch_key, args=(True,), daemon=True).start()
 
     # -- Lifecycle -------------------------------------------------------
 
