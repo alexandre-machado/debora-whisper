@@ -28,9 +28,13 @@ class TestTranscriptionThreading:
         # Simulate: start recording, then stop
         app.is_recording = True
 
-        start = time.time()
-        app.toggle_recording()
-        elapsed = time.time() - start
+        finished = threading.Event()
+        app.add_callback(lambda s, d: finished.set() if s.value == 'ready' else None)
+        with patch('keyboard.is_pressed', return_value=False), patch('dictation_engine.type_text'):
+            start = time.time()
+            app.toggle_recording()
+            elapsed = time.time() - start
+            assert finished.wait(2), 'Transcription worker did not finish'
 
         # toggle_recording should return quickly (< 200ms), not wait for transcription
         assert elapsed < 0.3, f"toggle_recording blocked for {elapsed:.2f}s — transcription must run in background"

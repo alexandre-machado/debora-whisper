@@ -9,6 +9,13 @@ import pytest
 from dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
 
 
+@pytest.fixture(autouse=True)
+def isolate_desktop():
+    """Tests must not inspect real keys or paste into the user's desktop."""
+    with patch('keyboard.is_pressed', return_value=False), patch('dictation_engine.type_text'):
+        yield
+
+
 class TestAppState:
     """Verify AppState enum values."""
 
@@ -74,11 +81,15 @@ class TestStateTransitions:
         config = {**DEFAULT_CONFIG, "beep_on_start": False}
         app = DictationApp(config)
         app.whisper = MagicMock()  # Skip real model loading
+        app.recorder = MagicMock()
+        app.recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+        app.recorder.telemetry = {'live_frames': 16000}
 
         states = []
         app.add_callback(lambda s, d: states.append(s))
 
-        app._load_model_background()
+        with patch.object(app._stopping, 'wait', return_value=False):
+            app._load_model_background()
 
         assert AppState.LOADING in states
         assert states[-1] == AppState.READY
@@ -86,6 +97,7 @@ class TestStateTransitions:
     def test_load_model_error_transitions_to_error(self):
         config = {**DEFAULT_CONFIG, "beep_on_start": False}
         app = DictationApp(config)
+        app.recorder = MagicMock()
 
         states = []
         app.add_callback(lambda s, d: states.append(s))
@@ -103,14 +115,21 @@ class TestStateTransitions:
         app.whisper = MagicMock()
         app.whisper.transcribe = MagicMock(return_value="hello world")
         app._model_ready.set()
+        app.recorder = MagicMock()
 
         states = []
         app.add_callback(lambda s, d: states.append(s))
 
-        # Start recording
-        with patch("dictation_engine.AudioRecorder.start"):
-            app.toggle_recording()
+        # Wait for the worker rather than assuming thread scheduling order.
+        recording = threading.Event()
+        app.add_callback(lambda s, d: recording.set() if s == AppState.RECORDING else None)
+        app.toggle_recording()
+        assert recording.wait(1)
         assert AppState.RECORDING in states
+        deadline = time.monotonic() + 1
+        while app._hotkey_held and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert not app._hotkey_held
 
         # Stop recording — should go to PROCESSING then READY
         app.recorder = MagicMock()

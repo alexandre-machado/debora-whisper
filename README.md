@@ -196,9 +196,16 @@ The NPU driver crashed. Reboot to reset it. The GUI auto-falls back to GPU when 
 
 ## Development
 
+The [Tests workflow](.github/workflows/tests.yml) runs the full unit-test suite
+on Windows with Python 3.10, 3.12 and 3.14 for pushes, pull requests and manual
+runs. Each job uploads a JUnit report, including when tests fail. Tests use
+simulated audio devices and inference backends; hardware latency still requires
+the [manual audio checks](docs/AUDIO_LATENCY.md).
+
 ```powershell
-# Run tests (82 tests)
-~\.npu-dictation\venv\Scripts\python.exe -m pytest tests/ -v
+# Install and run the same test dependencies as CI (no model downloads)
+python -m pip install -r requirements-test.txt
+python -m pytest tests/ -q
 
 # Auto-reload during development
 pip install watchfiles

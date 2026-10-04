@@ -12,6 +12,7 @@ import json
 import re
 import argparse
 import threading
+from collections import deque
 from enum import Enum
 from pathlib import Path
 from datetime import datetime
@@ -878,6 +879,15 @@ def create_model(model_path: Path, device: str, backend: str):
 # ---------------------------------------------------------------------------
 # Audio recording
 # ---------------------------------------------------------------------------
+def _log_audio_stream(sd, stream, direction):
+    """Report the actual backend instead of assuming Windows uses WASAPI."""
+    device = sd.query_devices(stream.device)
+    host = sd.query_hostapis(device['hostapi'])['name']
+    log(f"Audio {direction}: device={device['name']}, hostapi={host}, "
+        f"sample_rate={stream.samplerate}, latency={stream.latency:.3f}s, "
+        f"blocksize={stream.blocksize}")
+
+
 class AudioRecorder:
     """Record audio from microphone using sounddevice."""
 
@@ -888,35 +898,109 @@ class AudioRecorder:
         self.max_record_seconds = max_record_seconds
         self.recording = False
         self._frames = []
+
+        import numpy as np
+        # A sample-based ring works with PortAudio's variable callback sizes.
+        self._lookback = np.zeros((int(sample_rate * 1.5), channels), dtype=np.float32)
+        self._lookback_position = 0
+        self._lookback_count = 0
+
         self._stream = None
         self._lock = threading.Lock()
         self._timer = None
+        self.telemetry = {}
+        self._audio_ready = threading.Event()
+        self._last_callback = None
+        self._expected_adc_time = None
+        self._stable_callbacks = 0
 
+    def warmup(self, timeout=3.0):
+        """Open the stream continuously in the background."""
+        import sounddevice as sd
+        if self._stream is not None:
+            self.wait_ready(timeout)
+            return
+
+        def callback(indata, frames, time_info, status):
+            now = time.perf_counter()
+            adc_time = time_info.inputBufferAdcTime
+            delivery_delay = max(0.0, time_info.currentTime - adc_time) if adc_time > 0 else 0.0
+            with self._lock:
+                gap = now - self._last_callback if self._last_callback is not None else 0.0
+                adc_gap = (max(0.0, adc_time - self._expected_adc_time)
+                           if adc_time > 0 and self._expected_adc_time is not None else 0.0)
+                self._last_callback = now
+                self._expected_adc_time = adc_time + frames / self.sample_rate if adc_time > 0 else None
+                self._stable_callbacks = self._stable_callbacks + 1 if gap < 0.5 and not status else 0
+                if self._stable_callbacks >= 3:
+                    self._audio_ready.set()
+                else:
+                    self._audio_ready.clear()
+                if self.recording:
+                    self.telemetry.setdefault('first_frame', now)
+                    self.telemetry['live_frames'] += frames
+                    self.telemetry['input_overflows'] += int(status.input_overflow)
+                    self.telemetry['max_callback_gap'] = max(self.telemetry['max_callback_gap'], gap)
+                    self.telemetry['max_adc_gap'] = max(self.telemetry['max_adc_gap'], adc_gap)
+                    self.telemetry['max_delivery_delay'] = max(self.telemetry['max_delivery_delay'], delivery_delay)
+                    self._frames.append(indata.copy())
+                else:
+                    capacity = len(self._lookback)
+                    count = min(frames, capacity)
+                    data = indata[-count:]
+                    first = min(count, capacity - self._lookback_position)
+                    self._lookback[self._lookback_position:self._lookback_position + first] = data[:first]
+                    self._lookback[:count - first] = data[first:]
+                    self._lookback_position = (self._lookback_position + count) % capacity
+                    self._lookback_count = min(capacity, self._lookback_count + count)
+
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="float32",
+                blocksize=0,
+                latency="low",
+                callback=callback,
+            )
+            self._stream.start()
+            _log_audio_stream(sd, self._stream, "input")
+            self.wait_ready(timeout)
+        except Exception:
+            self.close()
+            raise
+
+    def wait_ready(self, timeout=3.0):
+        """Require recent callbacks, including when the microphone is silent."""
+        if not self._audio_ready.wait(timeout):
+            raise RuntimeError("Microphone did not deliver stable audio callbacks during warmup")
+        with self._lock:
+            if (self._stream is None or not self._stream.active or
+                    self._last_callback is None or time.perf_counter() - self._last_callback > 0.5):
+                raise RuntimeError("Microphone audio stream is inactive or stalled")
 
     def start(self):
         """Start recording."""
-        import sounddevice as sd
-
         with self._lock:
+            if self.recording:
+                return
+            self.telemetry = dict(start_called=time.perf_counter(), live_frames=0,
+                                  input_overflows=0, max_callback_gap=0.0,
+                                  max_adc_gap=0.0, max_delivery_delay=0.0)
+            # Snapshot in chronological order; never duplicate the live blocks.
+            count = self._lookback_count
+            begin = (self._lookback_position - count) % len(self._lookback)
+            first = min(count, len(self._lookback) - begin)
             self._frames = []
+            if first:
+                self._frames.append(self._lookback[begin:begin + first].copy())
+            if count > first:
+                self._frames.append(self._lookback[:count - first].copy())
+            self._lookback_count = 0
             self.recording = True
 
-        def callback(indata, frames, time_info, status):
-            with self._lock:
-                if self.recording:
-                    self._frames.append(indata.copy())
-
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype="float32",
-            blocksize=1024,
-            callback=callback,
-        )
-        self._stream.start()
         log("Recording started...")
 
-        # Enforce max recording duration
         if self.max_record_seconds:
             self._timer = threading.Timer(self.max_record_seconds, self._timeout_stop)
             self._timer.daemon = True
@@ -934,17 +1018,26 @@ class AudioRecorder:
 
         with self._lock:
             self.recording = False
-            frames = list(self._frames)
+            frames = self._frames
             self._frames = []
+            telemetry = dict(self.telemetry)
 
         if self._timer:
             self._timer.cancel()
             self._timer = None
 
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        t_first = telemetry.get('first_frame')
+        t_start = telemetry.get('start_called')
+        if t_first is not None and t_start is not None:
+            log(f"[Telemetry] First audio block arrived {t_first - t_start:.3f}s after recorder.start() was called")
+        elif t_start is not None:
+            log("[Telemetry] No frames captured from callback! Relied entirely on lookback buffer.")
+        if t_start is not None:
+            log(f"[Telemetry] Capture: live_frames={telemetry['live_frames']}, "
+                f"overflows={telemetry['input_overflows']}, "
+                f"max_callback_gap={telemetry['max_callback_gap']:.3f}s, "
+                f"max_adc_gap={telemetry['max_adc_gap']:.3f}s, "
+                f"max_delivery_delay={telemetry['max_delivery_delay']:.3f}s")
 
         if not frames:
             return np.array([], dtype=np.float32)
@@ -956,10 +1049,25 @@ class AudioRecorder:
 
     def close(self):
         """Close the stream permanently."""
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+        stream, self._stream = self._stream, None
+        try:
+            if stream is not None:
+                try:
+                    stream.stop()
+                finally:
+                    stream.close()
+        finally:
+            with self._lock:
+                self.recording = False
+                self._frames = []
+                self._lookback_count = 0
+                self._last_callback = None
+                self._expected_adc_time = None
+                self._stable_callbacks = 0
+                self._audio_ready.clear()
 
     @property
     def audio_level(self) -> float:
@@ -1084,81 +1192,110 @@ def _type_text_ctypes(text: str):
 # ---------------------------------------------------------------------------
 # Audio feedback (chimes)
 # ---------------------------------------------------------------------------
-def _generate_tone(frequencies: list[float], duration_ms: int = 120,
-                   sample_rate: int = 44100, volume: float = 0.3) -> bytes:
-    """Generate a smooth WAV tone in memory.
-
-    Args:
-        frequencies: List of Hz values. Multiple = chord; sequential list of
-            single-element lists for arpeggiated notes.
-        duration_ms: Total duration in milliseconds.
-        sample_rate: Audio sample rate.
-        volume: Peak amplitude 0.0-1.0.
-    """
-    import struct, io, wave
+def _generate_tone_array(frequencies: list[float], duration_ms: int = 120,
+                         sample_rate: int = 44100, volume: float = 0.1):
+    """Generate a smooth audio array in memory for playback."""
     import numpy as np
 
     n_samples = int(sample_rate * duration_ms / 1000)
     t = np.linspace(0, duration_ms / 1000, n_samples, endpoint=False)
 
-    # Sum sine waves for chord
-    signal = np.zeros(n_samples, dtype=np.float64)
+    signal = np.zeros(n_samples, dtype=np.float32)
     for freq in frequencies:
         signal += np.sin(2 * np.pi * freq * t)
     if frequencies:
         signal /= len(frequencies)
 
-    # Smooth envelope: 10ms attack, 40ms decay at end
-    attack = min(int(0.010 * sample_rate), n_samples)
-    decay = min(int(0.040 * sample_rate), n_samples)
-    envelope = np.ones(n_samples)
-    envelope[:attack] = np.linspace(0, 1, attack)
-    envelope[-decay:] = np.linspace(1, 0, decay)
+    # A raised-cosine envelope fades smoothly throughout the short blip,
+    # with zero amplitude and slope at both ends to avoid sharp clicks.
+    envelope = np.hanning(n_samples).astype(np.float32)
 
-    signal = (signal * envelope * volume * 32767).astype(np.int16)
-
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(signal.tobytes())
-    return buf.getvalue()
+    signal = signal * envelope * volume
+    return signal
 
 
-def chime_start():
-    """Pleasant ascending two-note chime for recording start."""
-    try:
-        import winsound
-        # C5 (523 Hz) then E5 (659 Hz) — major third, bright and short
-        tone1 = _generate_tone([523.25], duration_ms=80, volume=0.25)
-        tone2 = _generate_tone([659.25], duration_ms=120, volume=0.3)
-        winsound.PlaySound(tone1, winsound.SND_MEMORY)
-        winsound.PlaySound(tone2, winsound.SND_MEMORY)
-    except Exception:
-        pass
+class ChimePlayer:
+    """Keep one output stream running; hotkeys only submit precomputed tones."""
 
+    def __init__(self):
+        self._control_lock = threading.Lock()
+        self._stream = None
+        self._tones = {}
+        self._pending = deque(maxlen=1)
+        self._tone = None
+        self._position = 0
+        self._ready = threading.Event()
+        self.output_underflows = 0
 
-def chime_stop():
-    """Warm C-major chord that gently fades out — confirmation chime."""
-    try:
-        import winsound
-        # C5 + E5 + G5 played together as a soft major chord
-        chord = _generate_tone([523.25, 659.25, 783.99], duration_ms=250, volume=0.2)
-        winsound.PlaySound(chord, winsound.SND_MEMORY)
-    except Exception:
-        pass
+    def warmup(self, timeout=3.0):
+        import sounddevice as sd
+        import numpy as np
+        if self._stream is not None:
+            return
+        try:
+            device = sd.query_devices(kind="output")
+            sample_rate = device['default_samplerate']
+            def tone(frequencies, duration, volume):
+                return _generate_tone_array(frequencies, duration, sample_rate, volume)
+            warning = tone([277.18], 90, 0.07)
+            self._tones = {
+                'start': tone([440.0], 130, 0.10),
+                'stop': tone([330.0], 160, 0.08),
+                'warning': np.concatenate([warning, np.zeros(int(sample_rate * 0.05), dtype=np.float32), warning]),
+            }
+            self._stream = sd.OutputStream(
+                samplerate=sample_rate, channels=min(2, device['max_output_channels']),
+                dtype="float32", blocksize=0, latency="low", callback=self._callback,
+            )
+            self._stream.start()
+            _log_audio_stream(sd, self._stream, "output")
+            if not self._ready.wait(timeout):
+                raise RuntimeError("Output stream did not deliver audio callbacks during warmup")
+        except Exception as exc:
+            log(f"Audio feedback unavailable; continuing without chimes: {exc}")
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                log(f"Error closing unavailable audio output: {cleanup_error}")
 
+    def _callback(self, outdata, frames, time_info, status):
+        outdata.fill(0)
+        self.output_underflows += int(status.output_underflow)
+        self._ready.set()
+        try:
+            # deque append/popleft are thread-safe; keep only the newest request.
+            self._tone = self._pending.popleft()
+            self._position = 0
+        except IndexError:
+            pass
+        if self._tone is not None:
+            count = min(frames, len(self._tone) - self._position)
+            outdata[:count] = self._tone[self._position:self._position + count, None]
+            self._position += count
+            if self._position == len(self._tone):
+                self._tone = None
 
-def chime_warning():
-    """Low double-tap warning when model isn't ready."""
-    try:
-        import winsound
-        tone = _generate_tone([330.0], duration_ms=100, volume=0.2)
-        winsound.PlaySound(tone, winsound.SND_MEMORY)
-        winsound.PlaySound(tone, winsound.SND_MEMORY)
-    except Exception:
-        pass
+    def play(self, name):
+        with self._control_lock:
+            if self._ready.is_set() and self._stream is not None and self._stream.active:
+                self._pending.append(self._tones[name])
+
+    def close(self):
+        with self._control_lock:
+            self._ready.clear()
+            stream, self._stream = self._stream, None
+            try:
+                if stream is not None:
+                    try:
+                        stream.stop()
+                    finally:
+                        stream.close()
+                    log(f"[Telemetry] Output underflows: {self.output_underflows}")
+            finally:
+                self._ready.clear()
+                self._pending.clear()
+                self._tone = None
+                self._tones = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1175,6 +1312,9 @@ class DictationApp:
             sample_rate=config["sample_rate"],
             max_record_seconds=config.get("max_record_seconds"),
         )
+        self.chimes = ChimePlayer()
+        self._audio_lifecycle_lock = threading.Lock()
+        self._stopping = threading.Event()
         self.whisper = None  # Lazy-loaded
         self.is_recording = False
         self._model_ready = threading.Event()
@@ -1223,12 +1363,19 @@ class DictationApp:
 
     def _load_model_background(self):
         """Load model in background thread, setting _model_ready when done."""
+        if self._stopping.is_set():
+            return
         self._set_state(AppState.LOADING)
         try:
-            # Pre-warm audio subsystem (PortAudio initialization can be slow)
             log("Initializing audio subsystem...")
-            import sounddevice as sd
-            sd.query_devices()
+            with self._audio_lifecycle_lock:
+                if self._stopping.is_set():
+                    return
+                # Open output first so device initialization finishes before
+                # capture readiness is checked. Neither stream reopens on a hotkey.
+                if self.config["beep_on_start"]:
+                    self.chimes.warmup()
+                self.recorder.warmup()
 
             self.ensure_model()
 
@@ -1237,11 +1384,20 @@ class DictationApp:
             # Real audio capture to force Windows Audio Engine, drivers, and Whisper
             # to fully initialize and flush any initial delays/buffers.
             # ------------------------------------------------------------------
-            log("Performing real 2-second microphone capture to warm up hardware...")
-            self.recorder.start()
-            import time
-            time.sleep(2.0)
-            warmup_audio = self.recorder.stop()
+            with self._audio_lifecycle_lock:
+                if self._stopping.is_set():
+                    return
+                self.recorder.wait_ready()
+                log("Performing real 2-second microphone capture to warm up hardware...")
+                self.recorder.start()
+            if self._stopping.wait(2.0):
+                return
+            with self._audio_lifecycle_lock:
+                if self._stopping.is_set():
+                    return
+                warmup_audio = self.recorder.stop()
+                if not self.recorder.telemetry.get('live_frames', 0):
+                    raise RuntimeError("Microphone warmup captured no new audio frames")
             
             if len(warmup_audio) > 0:
                 log("Hardware warmup capture successful. Pre-warming Whisper inference...")
@@ -1252,13 +1408,19 @@ class DictationApp:
                 )
                 log("End-to-end warmup complete.")
             else:
-                log("Hardware warmup capture failed (empty buffer).")
+                raise RuntimeError("Hardware warmup capture failed (empty buffer)")
             # ------------------------------------------------------------------
 
-            self._model_ready.set()
-            self._set_state(AppState.READY)
+            with self._audio_lifecycle_lock:
+                if self._stopping.is_set():
+                    return
+                self.recorder.wait_ready()
+                self._model_ready.set()
+                self._set_state(AppState.READY)
             log("Ready! Waiting for hotkey...")
         except Exception as e:
+            if self._stopping.is_set():
+                return
             self._load_error = str(e)
             self._model_ready.set()  # Unblock waiters so they can see the error
             self._set_state(AppState.ERROR, {"error": str(e)})
@@ -1296,6 +1458,9 @@ class DictationApp:
         import time
         import threading
         
+        if self._stopping.is_set():
+            return
+
         if getattr(self, "_hotkey_held", False):
             # Ignore auto-repeat while the key is physically held
             return
@@ -1306,11 +1471,10 @@ class DictationApp:
         def _do_stop():
             if not self.is_recording:
                 return
-            if self.config["beep_on_start"]:
-                threading.Thread(target=chime_stop, daemon=True).start()
-
             audio = self.recorder.stop()
             self.is_recording = False
+            if self.config["beep_on_start"]:
+                self.chimes.play('stop')
 
             if len(audio) < self.config["sample_rate"] * 0.3:
                 log("Recording too short, ignoring.")
@@ -1360,21 +1524,41 @@ class DictationApp:
                 log(traceback.format_exc())
                 self._set_state(AppState.ERROR, {"error": str(e)})
 
+        press_perf = time.perf_counter()
+
         def _do_start():
+            t_thread_start = time.perf_counter()
+            log(f"[Telemetry] Thread _do_start spawned in {t_thread_start - press_perf:.3f}s after key press")
+
             if not self._model_ready.is_set():
                 log("Model still loading, please wait...")
-                chime_warning()
+                if self.config["beep_on_start"]:
+                    self.chimes.play('warning')
                 return
 
             if self._load_error:
                 log(f"Cannot record — model failed to load: {self._load_error}")
                 return
 
-            self.is_recording = True
-            if self.config["beep_on_start"]:
-                threading.Thread(target=chime_start, daemon=True).start()
+            t_before_rec = time.perf_counter()
+            try:
+                with self._audio_lifecycle_lock:
+                    if self._stopping.is_set():
+                        return
+                    self.recorder.wait_ready(timeout=0)
+                    self.recorder.start()
+                    self.is_recording = True
+            except Exception as exc:
+                log(f"Cannot start recording: {exc}")
+                self._set_state(AppState.ERROR, {"error": str(exc)})
+                return
+            t_after_rec = time.perf_counter()
+            log(f"[Telemetry] recorder.start() completed in {t_after_rec - t_before_rec:.3f}s")
 
-            self.recorder.start()
+            if self.config["beep_on_start"]:
+                self.chimes.play('start')
+                log("[Telemetry] Start chime submitted to persistent output stream")
+
             self._set_state(AppState.RECORDING)
 
         def _watch_key(started_recording):
@@ -1419,14 +1603,19 @@ class DictationApp:
 
     def stop(self):
         """Clean shutdown — unhook keyboard and stop recording if active."""
+        self._stopping.set()
         try:
             import keyboard
             keyboard.unhook_all()
         except Exception:
             pass
-        if self.is_recording:
-            self.recorder.stop()
+        with self._audio_lifecycle_lock:
             self.is_recording = False
+            try:
+                self.recorder.close()
+            finally:
+                self.chimes.close()
+
         log("Engine stopped.")
 
     def run(self):
