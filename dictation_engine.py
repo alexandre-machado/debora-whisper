@@ -27,7 +27,7 @@ CACHE_DIR = CONFIG_DIR / "ov-cache"
 
 DEFAULT_CONFIG = {
     "device": "NPU",           # NPU, GPU, CPU
-    "model_size": "base",      # base, small, medium (large not supported on NPU)
+    "model_size": "base",      # tiny, base, small, medium (large not supported on NPU)
     "language": "en",          # Language code or "auto"
     "hotkey": "ctrl+space",    # Global hotkey to toggle recording
     "auto_enter": False,       # Press Enter after pasting (useful for Claude Code)
@@ -67,6 +67,15 @@ PARAKEET_UPSTREAM_LANGUAGES = {
 
 # Model registry: pre-exported models from HuggingFace
 MODEL_REGISTRY = {
+    "tiny": {
+        "repo": "openai/whisper-tiny",
+        "ov_repo": "OpenVINO/whisper-tiny-int8-ov",
+        "description": "39M params. Lowest resource usage for quick commands.",
+        "preferred_device": "NPU",
+        "backend": "whisper",
+        "local_dir": "whisper-tiny-openvino",
+        "languages": "all",
+    },
     "base": {
         "repo": "openai/whisper-base",
         "ov_repo": "OpenVINO/whisper-base-int8-ov",

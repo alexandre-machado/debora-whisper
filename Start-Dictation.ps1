@@ -42,6 +42,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $EnginePath = Join-Path $ScriptDir "dictation_engine.py"
 $AppPath = Join-Path $ScriptDir "app.py"
+$RequirementsPath = Join-Path $ScriptDir "requirements.txt"
 $VenvDir = Join-Path (Join-Path $env:USERPROFILE ".npu-dictation") "venv"
 
 # ---------------------------------------------------------------------------
@@ -152,14 +153,33 @@ function Invoke-Setup {
     
     $venvPython = Join-Path (Join-Path $VenvDir "Scripts") "python.exe"
 
-    # 3. Check NPU
+    # 3. Install project dependencies
     Write-Host ""
-    Write-Host "Step 3: Checking Intel NPU..." -ForegroundColor Yellow
+    Write-Host "Step 3: Installing Python dependencies..." -ForegroundColor Yellow
+    if (-not (Test-Path $RequirementsPath)) {
+        Write-Host "  ERROR: requirements.txt not found at $RequirementsPath" -ForegroundColor Red
+        exit 1
+    }
+    & $venvPython -m pip install --upgrade pip
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  ERROR: Failed to upgrade pip." -ForegroundColor Red
+        exit 1
+    }
+    & $venvPython -m pip install -r $RequirementsPath
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  ERROR: Failed to install Python dependencies." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "  Dependencies installed." -ForegroundColor Green
+
+    # 4. Check NPU
+    Write-Host ""
+    Write-Host "Step 4: Checking Intel NPU..." -ForegroundColor Yellow
     $hasNPU = Test-NPUDriver
 
-    # 4. Run Python setup
+    # 5. Run Python setup
     Write-Host ""
-    Write-Host 'Step 4: Installing Python dependencies and exporting model...' -ForegroundColor Yellow
+    Write-Host 'Step 5: Exporting model and warming the OpenVINO cache...' -ForegroundColor Yellow
     Write-Host "  This will take several minutes on first run." -ForegroundColor Yellow
     Write-Host ""
     

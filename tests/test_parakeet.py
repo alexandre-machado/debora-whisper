@@ -109,6 +109,14 @@ class TestParakeetConfig:
 class TestLanguageFiltering:
     """Verify language-based model filtering."""
 
+    def test_whisper_tiny_is_registered_for_all_languages(self):
+        info = MODEL_REGISTRY["tiny"]
+        assert info["repo"] == "openai/whisper-tiny"
+        assert info["ov_repo"] == "OpenVINO/whisper-tiny-int8-ov"
+        assert info["backend"] == "whisper"
+        assert info["preferred_device"] == "NPU"
+        assert info["languages"] == "all"
+
     def test_all_models_have_languages_field(self):
         for name, info in MODEL_REGISTRY.items():
             assert "languages" in info, f"{name} missing languages field"
