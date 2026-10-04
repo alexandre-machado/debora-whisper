@@ -675,7 +675,7 @@ class ParakeetNPU:
                         self.latency_override = False
                         try:
                             compiled = core.compile_model(encoder_model, self.device, compile_config)
-                        log(f"  Encoder bucket {bucket} frames compiled on {self.device} (no latency_override)")
+                            log(f"  Encoder bucket {bucket} frames compiled on {self.device} (no latency_override)")
                         except Exception as e2:
                             # The retry can fail too (e.g. a driver edge
                             # case unrelated to the rejected property) — run
@@ -1284,19 +1284,6 @@ class DictationApp:
                     sample_rate=self.config["sample_rate"],
                     language=self.config["language"],
                 )
-                
-                if text:
-                    t_lower = text.strip().lower()
-                    hallucinations = {
-                        "obrigado.", "obrigada.", "obrigado", "obrigada",
-                        "obrigado!", "obrigada!", "obrigado por assistir.",
-                            "obrigada por assistir.", "thank you.", "thank you",
-                        "thanks for watching.", "obrigado por assistir"
-                    }
-                    if t_lower in hallucinations:
-                        log(f"Ignoring hallucination: '{text}'")
-                        text = ""
-
                 t_lower = text.strip().lower()
                 hallucinations = {"obrigado.", "obrigada.", "obrigado", "obrigada", "obrigado!", "obrigada!", "obrigado por assistir.", "obrigada por assistir.", "thank you.", "thank you", "thanks for watching.", "obrigado por assistir"}
                 if t_lower in hallucinations:
@@ -1304,7 +1291,7 @@ class DictationApp:
                     text = ""
 
                 if text:
-                        type_text(text, auto_enter=self.config["auto_enter"])
+                    type_text(text, auto_enter=self.config["auto_enter"])
                     # Store in history
                     self._history.append({
                         "timestamp": datetime.now().isoformat(),
