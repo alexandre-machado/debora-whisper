@@ -31,8 +31,8 @@ class OverlayWindow:
     EXPANDED_W = 300
     EXPANDED_H = 38
     RADIUS = 19  # half compact height -> perfect capsule ends
-    MARGIN = 14  # left/right padding for button and waveform
-    BTN_CX = 26  # button center x (MARGIN + button radius approx)
+    MARGIN = 19  # right padding for waveform to avoid curve intersection
+    BTN_CX = 19  # perfectly centered in the left semicircle (margin matches top/bottom)
     BORDER = 2   # border thickness
 
     # --- iOS-inspired dark palette ---
