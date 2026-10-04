@@ -352,8 +352,10 @@ class OverlayWindow:
         c.create_image(0, 0, image=photo, anchor="nw")
 
         # Draw text on top (ClearType AA handled by tkinter)
+        # Apply a 1-pixel optical correction upwards when scaled to keep it centered
+        optical_offset = 1 if s > 1.0 else 0
         for tx, ty, text, fill, font, anchor in text_items:
-            c.create_text(tx, ty, text=text, fill=fill, font=font,
+            c.create_text(tx, ty - optical_offset, text=text, fill=fill, font=font,
                           anchor=anchor)
 
     # --- Drag to reposition -----------------------------------------------
