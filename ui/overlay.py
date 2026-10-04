@@ -74,10 +74,13 @@ class OverlayWindow:
         self._canvas: tk.Canvas | None = None
 
         # Animated size
-        self._cur_w = float(self.COMPACT_W)
-        self._cur_h = float(self.COMPACT_H)
-        self._tgt_w = float(self.COMPACT_W)
-        self._tgt_h = float(self.COMPACT_H)
+        self._tgt_base_w = float(self.COMPACT_W)
+        self._tgt_base_h = float(self.COMPACT_H)
+        s = self._get_scale()
+        self._cur_w = self._tgt_base_w * s
+        self._cur_h = self._tgt_base_h * s
+        self._tgt_w = self._tgt_base_w * s
+        self._tgt_h = self._tgt_base_h * s
 
         # Position (None = auto-center, set on first drag)
         self._pos_x: int | None = pos_x
@@ -109,21 +112,45 @@ class OverlayWindow:
         self._photo_refs: list = []  # prevent GC of PhotoImages
         self._mic_button_photo = None
         self._stop_button_photo = None
-        self._pre_render_buttons()
+        
 
         self._build()
 
-    def _pre_render_buttons(self):
-        """Pre-render mic and stop button images."""
-        # Green mic button: ring + dark bg + mic icon
-        mic_icon = render_icon_mic(12, self.GREEN)
-        mic_btn = render_button(24, self.GREEN, "#1B3A20", mic_icon)
-        self._mic_button_img = mic_btn
 
-        # Red stop button: ring + dark bg + stop icon
-        stop_icon = render_icon_stop(10, self.RED)
-        stop_btn = render_button(24, self.RED, "#3A1B1B", stop_icon)
-        self._stop_button_img = stop_btn
+    def _get_scale(self) -> float:
+        try:
+            import ctypes
+            x = int(self._pos_x) if self._pos_x is not None else 0
+            y = int(self._pos_y) if self._pos_y is not None else 0
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+            pt = POINT(x, y)
+            hMon = ctypes.windll.user32.MonitorFromPoint(pt, 2)
+            dpiX = ctypes.c_uint()
+            dpiY = ctypes.c_uint()
+            ctypes.windll.shcore.GetDpiForMonitor(hMon, 0, ctypes.byref(dpiX), ctypes.byref(dpiY))
+            return dpiX.value / 96.0
+        except Exception:
+            return 1.0
+
+    def _get_mic_btn(self):
+        s = self._get_scale()
+        if s not in getattr(self, "_btn_cache", {}):
+            if not hasattr(self, "_btn_cache"): self._btn_cache = {}
+            from ui.glass import render_icon_mic, render_button
+            icon = render_icon_mic(max(1, int(12 * s)), self.GREEN)
+            self._btn_cache[s] = render_button(max(1, int(24 * s)), self.GREEN, "#1B3A20", icon)
+        return self._btn_cache[s]
+
+    def _get_stop_btn(self):
+        s = self._get_scale()
+        k = f"stop_{s}"
+        if k not in getattr(self, "_btn_cache", {}):
+            if not hasattr(self, "_btn_cache"): self._btn_cache = {}
+            from ui.glass import render_icon_stop, render_button
+            icon = render_icon_stop(max(1, int(10 * s)), self.RED)
+            self._btn_cache[k] = render_button(max(1, int(24 * s)), self.RED, "#3A1B1B", icon)
+        return self._btn_cache[k]
 
     # --- Window setup -----------------------------------------------------
 
@@ -245,76 +272,77 @@ class OverlayWindow:
         c = self._canvas
         c.delete("all")
         self._photo_refs.clear()
+        s = self._get_scale()
         w, h = int(self._cur_w), int(self._cur_h)
-        r = min(self.RADIUS, h // 2)
+        r = min(int(self.RADIUS * s), h // 2)
         mid = h // 2
 
         # Start with glass pill as the base image
         border_rgba = _hex_to_rgba(self.BORDER_COLOR)
         pill = self._pill_cache.get(
             w, h, radius=r, border_color_rgba=border_rgba,
-            border_width=self.BORDER)
+            border_width=max(1, int(self.BORDER * s)))
         # Work on a copy so the cache stays clean
         frame = pill.copy()
 
-        bx = self.BTN_CX
-        margin = self.MARGIN
+        bx = int(self.BTN_CX * s)
+        margin = int(self.MARGIN * s)
         text_items = []  # (x, y, text, fill, font, anchor) — drawn after image
 
         if self._state == "loading":
-            dot = render_dot(10, _hex_to_rgba(self.GRAY))
+            dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.GRAY))
             self._paste_centered(frame, dot, bx, mid)
-            text_items.append((w // 2 + 6, mid, "Loading...",
-                               self.TEXT_DIM, ("Segoe UI", 10), "center"))
+            text_items.append((w // 2 + int(6 * s), mid, "Loading...",
+                               self.TEXT_DIM, ("Segoe UI", max(1, int(10 * s))), "center"))
 
         elif self._state == "ready":
-            if self._hover and w > self.COMPACT_W + 20:
-                self._paste_centered(frame, self._mic_button_img, bx, mid)
-                text_items.append((w // 2 + 10, mid, "Start recording",
-                                   self.TEXT_DIM, ("Segoe UI", 10), "center"))
+            if self._hover and w > int(self.COMPACT_W * s) + int(20 * s):
+                self._paste_centered(frame, self._get_mic_btn(), bx, mid)
+                text_items.append((w // 2 + int(10 * s), mid, "Start recording",
+                                   self.TEXT_DIM, ("Segoe UI", max(1, int(10 * s))), "center"))
             else:
-                dot = render_dot(10, _hex_to_rgba(self.GREEN))
+                dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.GREEN))
                 self._paste_centered(frame, dot, bx, mid)
-                text_items.append((w // 2 + 6, mid, "Ready",
-                                   self.TEXT, ("Segoe UI", 10, "bold"), "center"))
+                text_items.append((w // 2 + int(6 * s), mid, "Ready",
+                                   self.TEXT, ("Segoe UI", max(1, int(10 * s)), "bold"), "center"))
 
         elif self._state == "recording":
-            self._paste_centered(frame, self._stop_button_img, bx, mid)
+            self._paste_centered(frame, self._get_stop_btn(), bx, mid)
             # Waveform
-            wave_start = 114
+            wave_start = int(114 * s)
             wave_end = w - margin
             levels = list(self._wave)
             if levels:
                 wave_w = wave_end - wave_start
-                wave_h = h - 8
+                wave_h = h - int(8 * s)
                 if wave_w > 0 and wave_h > 0:
                     wave_img = render_waveform(wave_w, wave_h, levels,
-                                               bar_width=3, gap=3,
+                                               bar_width=max(1, int(3 * s)), gap=max(1, int(3 * s)),
                                                color=self.WAVE_COLOR)
                     frame.alpha_composite(wave_img,
                                           (wave_start, mid - wave_h // 2))
             # Timer text
             elapsed = time.time() - self._rec_start
-            text_items.append((50, mid, f"{elapsed:.1f}s",
-                               self.TEXT, ("Segoe UI", 14, "bold"), "w"))
+            text_items.append((int(50 * s), mid, f"{elapsed:.1f}s",
+                               self.TEXT, ("Segoe UI", max(1, int(14 * s)), "bold"), "w"))
 
         elif self._state == "processing":
-            dot = render_dot(10, _hex_to_rgba(self.AMBER))
+            dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.AMBER))
             self._paste_centered(frame, dot, bx, mid)
-            text_items.append((w // 2 + 6, mid, "Transcribing...",
-                               self.TEXT, ("Segoe UI", 10, "bold"), "center"))
+            text_items.append((w // 2 + int(6 * s), mid, "Transcribing...",
+                               self.TEXT, ("Segoe UI", max(1, int(10 * s)), "bold"), "center"))
 
         elif self._state == "result":
-            dot = render_dot(10, _hex_to_rgba(self.GREEN))
+            dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.GREEN))
             self._paste_centered(frame, dot, bx, mid)
-            text_items.append((w // 2 + 6, mid, "Done",
-                               self.TEXT, ("Segoe UI", 10, "bold"), "center"))
+            text_items.append((w // 2 + int(6 * s), mid, "Done",
+                               self.TEXT, ("Segoe UI", max(1, int(10 * s)), "bold"), "center"))
 
         elif self._state == "error":
-            dot = render_dot(10, _hex_to_rgba(self.RED))
+            dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.RED))
             self._paste_centered(frame, dot, bx, mid)
-            text_items.append((w // 2 + 6, mid, "Error",
-                               self.RED, ("Segoe UI", 10, "bold"), "center"))
+            text_items.append((w // 2 + int(6 * s), mid, "Error",
+                               self.RED, ("Segoe UI", max(1, int(10 * s)), "bold"), "center"))
 
         # Flatten to RGB on transparent background and place as one image
         composited = composite_on_transparent(frame)
@@ -385,13 +413,16 @@ class OverlayWindow:
     # --- Animation --------------------------------------------------------
 
     def _animate(self, tw, th):
-        self._tgt_w = float(tw)
-        self._tgt_h = float(th)
+        self._tgt_base_w = float(tw)
+        self._tgt_base_h = float(th)
         if self._anim_id:
             self._root.after_cancel(self._anim_id)
         self._anim_tick()
 
     def _anim_tick(self):
+        s = self._get_scale()
+        self._tgt_w = self._tgt_base_w * s
+        self._tgt_h = self._tgt_base_h * s
         dw = self._tgt_w - self._cur_w
         dh = self._tgt_h - self._cur_h
         if abs(dw) < 1.5 and abs(dh) < 1.5:
@@ -499,16 +530,18 @@ class OverlayWindow:
         except Exception:
             pass
 
-        pad = self.BALLOON_PAD
-        r = self.BALLOON_RADIUS
-        max_w = self.BALLOON_MAX_W
+        s = self._get_scale()
+        pad = int(self.BALLOON_PAD * s)
+        r = int(self.BALLOON_RADIUS * s)
+        max_w = int(self.BALLOON_MAX_W * s)
+        fsize = max(1, int(self.BALLOON_FONT_SIZE * s))
 
         canvas = tk.Canvas(bw, bg=_TRANSPARENT, highlightthickness=0)
         canvas.pack(fill="both", expand=True)
 
         # Measure text to determine balloon size
         tmp_id = canvas.create_text(
-            0, 0, text=text, font=("Segoe UI", self.BALLOON_FONT_SIZE),
+            0, 0, text=text, font=("Segoe UI", fsize),
             width=max_w - 2 * pad, anchor="nw",
         )
         bbox = canvas.bbox(tmp_id)
@@ -519,7 +552,7 @@ class OverlayWindow:
         bw_w = text_w + 2 * pad
         bw_h = text_h + 2 * pad
         # Clamp minimum width
-        bw_w = max(bw_w, 120)
+        bw_w = max(bw_w, int(120 * s))
 
         canvas.configure(width=bw_w, height=bw_h)
 
@@ -530,7 +563,7 @@ class OverlayWindow:
             bw_w, bw_h, radius=r,
             border_color_rgba=border_rgba,
             bg_top=bg_rgba[:3], bg_bottom=bg_rgba[:3],
-            border_width=self.BORDER)
+            border_width=max(1, int(self.BORDER * s)))
         composited = composite_on_transparent(balloon_pill)
         photo = pil_to_photo(composited)
         # Store reference to prevent GC
@@ -539,7 +572,7 @@ class OverlayWindow:
 
         # Draw text
         canvas.create_text(
-            pad, pad, text=text, font=("Segoe UI", self.BALLOON_FONT_SIZE),
+            pad, pad, text=text, font=("Segoe UI", fsize),
             fill=self.TEXT, width=max_w - 2 * pad, anchor="nw",
         )
 
@@ -552,7 +585,7 @@ class OverlayWindow:
         pill_w = int(self._cur_w)
         pill_h = int(self._cur_h)
         bx = pill_x + (pill_w - bw_w) // 2
-        by = pill_y + pill_h + self.BALLOON_GAP
+        by = pill_y + pill_h + int(self.BALLOON_GAP * s)
         bw.geometry(f"{bw_w}x{bw_h}+{bx}+{by}")
 
         # Apply no-focus flags
