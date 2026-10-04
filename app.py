@@ -163,16 +163,20 @@ class GUIApp:
             self._settings_status(f"Error: {error_msg[:40]}", "#FF453A")
             self._settings_set_apply(True)
 
-            # Auto-fallback on DEVICE_LOST
-            if data.get("device_lost") and self._config["device"] == "NPU":
-                log("DEVICE_LOST detected — auto-falling back to GPU")
-                self._config["device"] = "GPU"
-                self._tray.update_info(
-                    device="GPU",
-                    model=self._config["model_size"],
-                    hotkey=self._config["hotkey"],
-                )
-                self._engine.fallback_device("GPU")
+            # Auto-fallback on DEVICE_LOST or driver crash
+            if data.get("device_lost"):
+                if self._config["device"] == "NPU":
+                    log("NPU DEVICE_LOST detected — auto-falling back to GPU")
+                    self._config["device"] = "GPU"
+                    self._tray.update_info(
+                        device="GPU",
+                        model=self._config["model_size"],
+                        hotkey=self._config["hotkey"],
+                    )
+                    self._engine.fallback_device("GPU")
+                elif self._config["device"] == "GPU":
+                    log("GPU driver crashed or out of resources — reloading on GPU for next transcription")
+                    self._engine.fallback_device("GPU")
 
     # -- Audio level polling -----------------------------------------------
 

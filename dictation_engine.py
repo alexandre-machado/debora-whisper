@@ -366,6 +366,11 @@ class WhisperNPU:
                     f"NPU device lost. Reboot to reset the NPU, "
                     f"or use --device GPU."
                 ) from e
+            elif "CL_OUT_OF_RESOURCES" in str(e):
+                log(f"GPU CL_OUT_OF_RESOURCES — the GPU ran out of memory or its driver crashed.")
+                raise RuntimeError(
+                    f"GPU out of resources or driver crash."
+                ) from e
             raise
         text = str(result).strip()
 
@@ -1305,11 +1310,17 @@ class DictationApp:
                     log("No speech detected.")
                     self._set_state(AppState.READY)
             except RuntimeError as e:
-                if "DEVICE_LOST" in str(e) or "device hung" in str(e):
+                import traceback
+                log(f"RuntimeError during transcription: {e}")
+                log(traceback.format_exc())
+                if "DEVICE_LOST" in str(e) or "device hung" in str(e) or "GPU out of resources" in str(e) or "CL_OUT_OF_RESOURCES" in str(e):
                     self._set_state(AppState.ERROR, {"error": str(e), "device_lost": True})
                 else:
                     self._set_state(AppState.ERROR, {"error": str(e)})
             except Exception as e:
+                import traceback
+                log(f"Error during transcription: {e}")
+                log(traceback.format_exc())
                 self._set_state(AppState.ERROR, {"error": str(e)})
 
         def _do_start():
