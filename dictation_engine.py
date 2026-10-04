@@ -1297,6 +1297,12 @@ class DictationApp:
                         log(f"Ignoring hallucination: '{text}'")
                         text = ""
 
+                t_lower = text.strip().lower()
+                hallucinations = {"obrigado.", "obrigada.", "obrigado", "obrigada", "obrigado!", "obrigada!", "obrigado por assistir.", "obrigada por assistir.", "thank you.", "thank you", "thanks for watching.", "obrigado por assistir"}
+                if t_lower in hallucinations:
+                    log(f"Ignoring hallucination: '{text}'")
+                    text = ""
+
                 if text:
                         type_text(text, auto_enter=self.config["auto_enter"])
                     # Store in history
