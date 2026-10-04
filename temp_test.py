@@ -366,11 +366,6 @@ class WhisperNPU:
                     f"NPU device lost. Reboot to reset the NPU, "
                     f"or use --device GPU."
                 ) from e
-            elif "CL_OUT_OF_RESOURCES" in str(e):
-                log(f"GPU CL_OUT_OF_RESOURCES — the GPU ran out of memory or its driver crashed.")
-                raise RuntimeError(
-                    f"GPU out of resources or driver crash."
-                ) from e
             raise
         text = str(result).strip()
 
@@ -892,7 +887,6 @@ class AudioRecorder:
         self._lock = threading.Lock()
         self._timer = None
 
-
     def start(self):
         """Start recording."""
         import sounddevice as sd
@@ -953,13 +947,6 @@ class AudioRecorder:
         duration = len(audio) / self.sample_rate
         log(f"Recording stopped. Duration: {duration:.1f}s")
         return audio
-
-    def close(self):
-        """Close the stream permanently."""
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
 
     @property
     def audio_level(self) -> float:
@@ -1225,36 +1212,7 @@ class DictationApp:
         """Load model in background thread, setting _model_ready when done."""
         self._set_state(AppState.LOADING)
         try:
-            # Pre-warm audio subsystem (PortAudio initialization can be slow)
-            log("Initializing audio subsystem...")
-            import sounddevice as sd
-            sd.query_devices()
-
             self.ensure_model()
-
-            # ------------------------------------------------------------------
-            # END-TO-END WARMUP (As suggested by the user)
-            # Real audio capture to force Windows Audio Engine, drivers, and Whisper
-            # to fully initialize and flush any initial delays/buffers.
-            # ------------------------------------------------------------------
-            log("Performing real 2-second microphone capture to warm up hardware...")
-            self.recorder.start()
-            import time
-            time.sleep(2.0)
-            warmup_audio = self.recorder.stop()
-            
-            if len(warmup_audio) > 0:
-                log("Hardware warmup capture successful. Pre-warming Whisper inference...")
-                _ = self.whisper.transcribe(
-                    warmup_audio,
-                    sample_rate=self.config["sample_rate"],
-                    language=self.config["language"]
-                )
-                log("End-to-end warmup complete.")
-            else:
-                log("Hardware warmup capture failed (empty buffer).")
-            # ------------------------------------------------------------------
-
             self._model_ready.set()
             self._set_state(AppState.READY)
             log("Ready! Waiting for hotkey...")
@@ -1326,12 +1284,6 @@ class DictationApp:
                     sample_rate=self.config["sample_rate"],
                     language=self.config["language"],
                 )
-                t_lower = text.strip().lower()
-                hallucinations = {"obrigado.", "obrigada.", "obrigado", "obrigada", "obrigado!", "obrigada!", "obrigado por assistir.", "obrigada por assistir.", "thank you.", "thank you", "thanks for watching.", "obrigado por assistir"}
-                if t_lower in hallucinations:
-                    log(f"Ignoring hallucination: '{text}'")
-                    text = ""
-
                 if text:
                     type_text(text, auto_enter=self.config["auto_enter"])
                     # Store in history
@@ -1347,17 +1299,11 @@ class DictationApp:
                     log("No speech detected.")
                     self._set_state(AppState.READY)
             except RuntimeError as e:
-                import traceback
-                log(f"RuntimeError during transcription: {e}")
-                log(traceback.format_exc())
-                if "DEVICE_LOST" in str(e) or "device hung" in str(e) or "GPU out of resources" in str(e) or "CL_OUT_OF_RESOURCES" in str(e):
+                if "DEVICE_LOST" in str(e) or "device hung" in str(e):
                     self._set_state(AppState.ERROR, {"error": str(e), "device_lost": True})
                 else:
                     self._set_state(AppState.ERROR, {"error": str(e)})
             except Exception as e:
-                import traceback
-                log(f"Error during transcription: {e}")
-                log(traceback.format_exc())
                 self._set_state(AppState.ERROR, {"error": str(e)})
 
         def _do_start():
