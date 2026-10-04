@@ -191,9 +191,10 @@ class OverlayWindow:
             WS_EX_NOACTIVATE = 0x08000000
             WS_EX_TOOLWINDOW = 0x00000080
             WS_EX_APPWINDOW = 0x00040000
+            WS_EX_TOPMOST = 0x00000008
             hwnd = ctypes.windll.user32.GetParent(self._win.winfo_id())
             style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            style = (style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+            style = (style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST) & ~WS_EX_APPWINDOW
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
         except Exception:
             pass
@@ -238,7 +239,7 @@ class OverlayWindow:
             mi = MONITORINFO()
             mi.cbSize = ctypes.sizeof(MONITORINFO)
             if user32.GetMonitorInfoW(hMonitor, ctypes.byref(mi)):
-                wl, wt, wr, wb = mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom
+                wl, wt, wr, wb = mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom
                 if x < wl: x = wl
                 if x + w > wr: x = wr - w
                 if y < wt: y = wt
