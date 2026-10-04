@@ -14,7 +14,7 @@ import customtkinter as ctk
 from dictation_engine import (
     AppState, DictationApp, MODEL_REGISTRY, MODEL_DIR,
     load_config, save_config, validate_config, log, create_model,
-    is_model_downloaded,
+    is_model_downloaded, device_failure,
 )
 from ui.tray import TrayManager
 from ui.overlay import OverlayWindow
@@ -158,25 +158,50 @@ class GUIApp:
         elif state == AppState.ERROR:
             self._stop_audio_polling()
             error_msg = data.get("error", "Unknown error")
-            self._tray.update_state(state_name, f"NPU Dictation — Error: {error_msg[:60]}")
             self._overlay.show_error()
-            self._settings_status(f"Error: {error_msg[:40]}", "#FF453A")
             self._settings_set_apply(True)
 
-            # Auto-fallback on DEVICE_LOST or driver crash
-            if data.get("device_lost"):
-                if self._config["device"] == "NPU":
-                    log("NPU DEVICE_LOST detected — auto-falling back to GPU")
-                    self._config["device"] = "GPU"
-                    self._tray.update_info(
-                        device="GPU",
-                        model=self._config["model_size"],
-                        hotkey=self._config["hotkey"],
-                    )
-                    self._engine.fallback_device("GPU")
-                elif self._config["device"] == "GPU":
-                    log("GPU driver crashed or out of resources — reloading on GPU for next transcription")
-                    self._engine.fallback_device("GPU")
+            if data.get("restart_required") or device_failure():
+                # Fail closed: no reload of any kind in this process.
+                self._show_restart_required(data)
+                return
+
+            self._tray.update_state(state_name, f"NPU Dictation — Error: {error_msg[:60]}")
+            self._settings_status(f"Error: {error_msg[:40]}", "#FF453A")
+
+            # An NPU-only device loss may move to the GPU, which has not failed.
+            if data.get("device_lost") and data.get("device_failure") == "NPU":
+                log("NPU DEVICE_LOST detected — falling back to GPU")
+                self._config["device"] = "GPU"
+                self._tray.update_info(
+                    device="GPU",
+                    model=self._config["model_size"],
+                    hotkey=self._config["hotkey"],
+                )
+                self._engine.fallback_device("GPU")
+
+    def _show_restart_required(self, data: dict):
+        """Tell the user, once, that only an app restart recovers the device."""
+        failure = device_failure() or {}
+        device = data.get("device_failure") or failure.get("device") or "accelerator"
+        message = failure.get("message") or data.get("error", "Restart the app.")
+        self._tray.update_state(
+            AppState.ERROR.value,
+            f"NPU Dictation — {device} failed. Quit and restart the app.",
+        )
+        self._settings_status(f"{device} failed: restart NPU Dictation.", "#FF453A")
+        if getattr(self, "_restart_alert_shown", False):
+            return
+        self._restart_alert_shown = True
+        log(f"Restart required: {message}")
+        self._alert_error("NPU Dictation: restart required", message)
+
+    def _alert_error(self, title: str, message: str):
+        try:
+            from tkinter import messagebox
+            messagebox.showerror(title, message, parent=self._root)
+        except Exception as exc:
+            log(f"Could not show error dialog: {exc}")
 
     # -- Audio level polling -----------------------------------------------
 
@@ -214,6 +239,10 @@ class GUIApp:
         model_changed = new_config["model_size"] != self._config["model_size"]
         device_changed = new_config["device"] != self._config["device"]
         hotkey_changed = new_config["hotkey"] != self._config["hotkey"]
+        audio_changed = any(
+            new_config.get(key, self._config.get(key)) != self._config.get(key)
+            for key in ("beep_on_start", "sample_rate", "max_record_seconds")
+        )
 
         self._config.update(new_config)
         save_config(self._config)
@@ -228,7 +257,15 @@ class GUIApp:
             hotkey=self._config["hotkey"],
         )
 
-        if model_changed or device_changed or hotkey_changed:
+        failure = device_failure()
+        if failure and (model_changed or device_changed or hotkey_changed or audio_changed):
+            # A rebuilt engine would load models in a process whose device
+            # context may hang. Keep the saved settings for the next start.
+            log(f"Settings saved; not reloading after {failure['device']} failure.")
+            self._settings_status("Saved. Restart NPU Dictation to apply.", "#FF9F0A")
+            return
+
+        if model_changed or device_changed or hotkey_changed or audio_changed:
             log("Settings changed — reloading engine...")
             self._engine.stop()
             self._settings_status("Loading model...", "#FF9F0A")

@@ -240,3 +240,43 @@ def test_shutdown_during_model_load_never_reopens_audio(audio_backend, monkeypat
     assert not app._model_ready.is_set()
     audio_backend.sd.InputStream.assert_called_once()
     audio_backend.sd.OutputStream.assert_called_once()
+
+
+def test_timeout_transcribes_captured_audio_once(audio_backend, monkeypatch):
+    monkeypatch.setattr(engine.threading, 'Timer', MagicMock())
+    paste = MagicMock()
+    monkeypatch.setattr(engine, 'type_text', paste)
+    app = engine.DictationApp({**engine.DEFAULT_CONFIG, 'beep_on_start': False})
+    app.whisper = MagicMock()
+    app.whisper.transcribe.return_value = 'captured speech'
+    app.recorder.warmup()
+    app.recorder.start()
+    app.is_recording = True
+    speech = np.linspace(-0.1, 0.1, 8000, dtype=np.float32)
+    app.recorder._stream.feed(speech)
+    generation = app.recorder._recording_generation
+    app.recorder._timeout_stop(generation)
+    app.recorder._timeout_stop(generation)
+    app._finish_recording()
+    app.whisper.transcribe.assert_called_once()
+    np.testing.assert_array_equal(app.whisper.transcribe.call_args.args[0][-8000:], speech)
+    paste.assert_called_once_with('captured speech', auto_enter=False)
+    assert app.state == engine.AppState.READY
+    assert not app.is_recording
+    assert not app._transcribing
+    app.stop()
+
+
+def test_previous_timer_cannot_stop_new_recording(audio_backend, monkeypatch):
+    monkeypatch.setattr(engine.threading, 'Timer', MagicMock())
+    recorder = engine.AudioRecorder(max_record_seconds=1)
+    recorder.warmup()
+    recorder.start()
+    old_generation = recorder._recording_generation
+    recorder.stop()
+    recorder.start()
+    recorder._stream.feed([1, 2, 3])
+    recorder._timeout_stop(old_generation)
+    assert recorder.recording
+    np.testing.assert_array_equal(recorder.stop(), [1, 2, 3])
+    recorder.close()

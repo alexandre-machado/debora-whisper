@@ -16,7 +16,7 @@ Local voice-to-text dictation for Windows, powered by Intel NPU via OpenVINO. Pr
 - **One-click settings** — language-first model picker with download status badges
 - **Claude Code mode** — auto-paste + Enter for hands-free prompt submission
 - **Audio chimes** — pleasant start/stop feedback
-- **Auto-fallback** — NPU -> GPU -> CPU, DEVICE_LOST auto-recovery
+- **Device fallback** — NPU -> GPU -> CPU when a model fails to load; an NPU DEVICE_LOST moves to the GPU, while a GPU failure stops dictation until the app is restarted
 
 ## Requirements
 
@@ -182,7 +182,10 @@ for the exact commands to produce before/after numbers on real NPU hardware.
 OpenVINO compiles the model graph for your specific NPU on first launch. This takes 1-15 minutes depending on model size and is cached for subsequent runs. For Parakeet specifically, this means 4 sequential encoder-graph compiles (one per shape bucket), not 1 — see the architecture notes above and `benchmarks/README.md` for details — so first launch takes proportionally longer than a single-graph model.
 
 ### DEVICE_LOST error
-The NPU driver crashed. Reboot to reset it. The GUI auto-falls back to GPU when this happens.
+When the error is attributed to the NPU alone, the GUI falls back to the GPU for the rest of the session. Reboot to reset the NPU.
+
+### GPU failed: restart required
+OpenVINO GPU errors such as `CL_OUT_OF_RESOURCES`, or a device loss that cannot be pinned on the NPU (Parakeet runs its decoder on the GPU), can leave the OpenCL context in a state where further calls hang. The app does not retry or reload after that, on the GPU or on any other device. Recording and transcription stay disabled, and Settings changes are saved but not applied, until you quit and restart the app. The original OpenVINO error is written to `~/.npu-dictation/dictation.log`. If the failure repeats, select NPU or CPU in Settings, then restart. Disabling the retry only prevents a hang; it does not fix the driver or memory problem behind the error.
 
 ### Hotkey doesn't work
 - PowerShell must run as **Administrator** (the `keyboard` library requires elevated privileges)

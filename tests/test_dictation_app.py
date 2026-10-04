@@ -4,7 +4,7 @@ import time
 from unittest.mock import MagicMock, patch
 import pytest
 
-from dictation_engine import DictationApp, DEFAULT_CONFIG
+from dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
 
 
 class TestTranscriptionThreading:
@@ -38,3 +38,48 @@ class TestTranscriptionThreading:
 
         # toggle_recording should return quickly (< 200ms), not wait for transcription
         assert elapsed < 0.3, f"toggle_recording blocked for {elapsed:.2f}s — transcription must run in background"
+
+    @pytest.mark.parametrize('shutdown', [False, True])
+    def test_inflight_transcription_is_serialized_and_respects_shutdown(self, shutdown):
+        import numpy as np
+        app = DictationApp({**DEFAULT_CONFIG, 'beep_on_start': False})
+        app.recorder = MagicMock()
+        app.recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+        app.is_recording = True
+        app._model_ready.set()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def transcribe(*args, **kwargs):
+            entered.set()
+            assert release.wait(2), 'Test did not release transcription'
+            return 'completed speech'
+
+        app.whisper = MagicMock()
+        app.whisper.transcribe.side_effect = transcribe
+        states = []
+        app.add_callback(lambda state, data: states.append(state))
+        with patch('dictation_engine.type_text') as paste, patch('keyboard.unhook_all'):
+            worker = threading.Thread(target=app._finish_recording)
+            worker.start()
+            try:
+                assert entered.wait(2)
+                # Neither another stop nor another hotkey may start parallel work.
+                app._finish_recording()
+                app.toggle_recording()
+                app.recorder.stop.assert_called_once()
+                app.recorder.start.assert_not_called()
+                if shutdown:
+                    app.stop()
+            finally:
+                release.set()
+                worker.join(2)
+            assert not worker.is_alive()
+            assert not app._transcribing
+            if shutdown:
+                paste.assert_not_called()
+                assert not app.history
+                assert states == [AppState.PROCESSING]
+            else:
+                paste.assert_called_once_with('completed speech', auto_enter=False)
+                assert states == [AppState.PROCESSING, AppState.READY]

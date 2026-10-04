@@ -5,7 +5,7 @@ when that happened, `_quit` never ran, so the global keyboard hook and the
 tray icon were left running until the process died.
 """
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -55,6 +55,37 @@ def _under_test():
 
 
 GUIApp = _under_test()
+
+
+@pytest.mark.parametrize('key,value', [
+    ('beep_on_start', True),
+    ('beep_on_start', False),
+    ('sample_rate', 48000),
+    ('max_record_seconds', 30),
+])
+def test_audio_settings_restart_engine(key, value):
+    from dictation_engine import DEFAULT_CONFIG
+    app = GUIApp.__new__(GUIApp)
+    app._config = dict(DEFAULT_CONFIG)
+    if key == 'beep_on_start':
+        app._config[key] = not value
+    old_engine = MagicMock()
+    app._engine = old_engine
+    app._overlay = MagicMock()
+    app._tray = MagicMock()
+    app._settings_status = MagicMock()
+    app._settings_set_apply = MagicMock()
+    # Use the function's globals, including on headless hosts where the
+    # import helper removes app from sys.modules after installing GUI stubs.
+    new_engine = MagicMock()
+    engine_factory = MagicMock(return_value=new_engine)
+    with patch.dict(GUIApp._on_settings_apply.__globals__, {
+        'DictationApp': engine_factory, 'save_config': MagicMock(),
+    }):
+        app._on_settings_apply({**app._config, key: value})
+    old_engine.stop.assert_called_once()
+    engine_factory.assert_called_once_with(app._config)
+    new_engine.start_background.assert_called_once()
 
 
 class _Stop:
