@@ -165,6 +165,14 @@ class OverlayWindow:
         except Exception:
             pass  # Non-Windows fallback: square corners
 
+        # Re-assert topmost periodically so the Windows 11 taskbar doesn't cover it
+        def _force_topmost():
+            if self._win and self._win.winfo_exists():
+                self._win.attributes("-topmost", True)
+                self._win.lift()
+                self._root.after(500, _force_topmost)
+        _force_topmost()
+
         self._canvas = tk.Canvas(
             self._win, bg=_TRANSPARENT, highlightthickness=0,
             width=self.COMPACT_W, height=self.COMPACT_H,

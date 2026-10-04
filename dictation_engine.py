@@ -1252,6 +1252,7 @@ class DictationApp:
     def toggle_recording(self):
         """Toggle recording on/off."""
         import time
+        import threading
         now = time.time()
         
         # Prevent Windows auto-repeat from rapidly toggling when holding the hotkey
@@ -1266,32 +1267,31 @@ class DictationApp:
                 pass
         self._last_toggle_time = now
 
-        if not self._model_ready.is_set():
-            log("Model still loading, please wait...")
-            threading.Thread(target=chime_warning, daemon=True).start()
-            return
-
-        if self._load_error:
-            log(f"Cannot record — model failed to load: {self._load_error}")
-            return
-
-        if self.is_recording:
-            # Stop recording and transcribe
-            if self.config["beep_on_start"]:
-                threading.Thread(target=chime_stop, daemon=True).start()
-
-            audio = self.recorder.stop()
-            self.is_recording = False
-
-            if len(audio) < self.config["sample_rate"] * 0.3:
-                log("Recording too short, ignoring.")
-                self._set_state(AppState.READY)
+        def _do_toggle():
+            if not self._model_ready.is_set():
+                log("Model still loading, please wait...")
+                chime_warning()
                 return
 
-            self._set_state(AppState.PROCESSING)
+            if self._load_error:
+                log(f"Cannot record — model failed to load: {self._load_error}")
+                return
 
-            # Transcribe in background to keep hotkey listener responsive
-            def _transcribe_and_type():
+            if self.is_recording:
+                # Stop recording and transcribe
+                if self.config["beep_on_start"]:
+                    threading.Thread(target=chime_stop, daemon=True).start()
+
+                audio = self.recorder.stop()
+                self.is_recording = False
+
+                if len(audio) < self.config["sample_rate"] * 0.3:
+                    log("Recording too short, ignoring.")
+                    self._set_state(AppState.READY)
+                    return
+
+                self._set_state(AppState.PROCESSING)
+
                 try:
                     self.ensure_model()
                     text = self.whisper.transcribe(
@@ -1321,15 +1321,18 @@ class DictationApp:
                 except Exception as e:
                     self._set_state(AppState.ERROR, {"error": str(e)})
 
-            threading.Thread(target=_transcribe_and_type, daemon=True).start()
-        else:
-            # Start recording
-            if self.config["beep_on_start"]:
-                threading.Thread(target=chime_start, daemon=True).start()
+            else:
+                # Start recording
+                self.is_recording = True
+                if self.config["beep_on_start"]:
+                    threading.Thread(target=chime_start, daemon=True).start()
 
-            self.is_recording = True
-            self.recorder.start()
-            self._set_state(AppState.RECORDING)
+                self.recorder.start()
+                self._set_state(AppState.RECORDING)
+
+        # Offload all logic to a thread to return instantly and prevent the
+        # Windows keyboard hook from timing out (which causes the hotkey to leak)
+        threading.Thread(target=_do_toggle, daemon=True).start()
 
     # -- Lifecycle -------------------------------------------------------
 
