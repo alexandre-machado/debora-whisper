@@ -1251,6 +1251,21 @@ class DictationApp:
 
     def toggle_recording(self):
         """Toggle recording on/off."""
+        import time
+        now = time.time()
+        
+        # Prevent Windows auto-repeat from rapidly toggling when holding the hotkey
+        if hasattr(self, "_last_toggle_time") and now - self._last_toggle_time < 0.3:
+            try:
+                import keyboard
+                # If still physically pressed, it's auto-repeat. Update time and ignore.
+                if keyboard.is_pressed(self.config["hotkey"]):
+                    self._last_toggle_time = now
+                    return
+            except Exception:
+                pass
+        self._last_toggle_time = now
+
         if not self._model_ready.is_set():
             log("Model still loading, please wait...")
             threading.Thread(target=chime_warning, daemon=True).start()
