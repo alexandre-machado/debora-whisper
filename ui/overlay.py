@@ -190,6 +190,39 @@ class OverlayWindow:
             # Keep centered on the user's chosen position
             x = self._pos_x - w // 2
         y = self._pos_y
+
+        # Clamp to the working area of the monitor where the window currently belongs
+        try:
+            import ctypes
+            from ctypes import wintypes
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                            ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT),
+                            ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
+            
+            user32 = ctypes.windll.user32
+            pt = POINT(x + w // 2, y + h // 2)
+            hMonitor = user32.MonitorFromPoint(pt, 2) # MONITOR_DEFAULTTONEAREST
+            
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(hMonitor, ctypes.byref(mi)):
+                wl, wt, wr, wb = mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom
+                if x < wl: x = wl
+                if x + w > wr: x = wr - w
+                if y < wt: y = wt
+                if y + h > wb: y = wb - h
+                
+                # Update logical position so it doesn't try to escape on next resize
+                self._pos_x = x + w // 2
+                self._pos_y = y
+        except Exception:
+            pass
+
         self._win.geometry(f"{w}x{h}+{x}+{y}")
         self._canvas.configure(width=w, height=h)
 
