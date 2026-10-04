@@ -27,9 +27,9 @@ class OverlayWindow:
     # --- Dimensions ---
     COMPACT_W = 150
     COMPACT_H = 38
-    HOVER_H = 54
+    HOVER_H = 38
     EXPANDED_W = 300
-    EXPANDED_H = 70
+    EXPANDED_H = 38
     RADIUS = 19  # half compact height -> perfect capsule ends
     MARGIN = 14  # left/right padding for button and waveform
     BTN_CX = 26  # button center x (MARGIN + button radius approx)
@@ -58,14 +58,18 @@ class OverlayWindow:
     BALLOON_FONT_SIZE = 16
     BALLOON_DURATION = 6000  # ms before auto-dismiss
 
-    def __init__(self, root, on_toggle=None):
+    def __init__(self, root, on_toggle=None, pos_x=None, pos_y=10, on_pos_changed=None):
         """
         Args:
             root: Parent Tk/CTk window.
             on_toggle: Callback() to toggle recording on dot click.
+            pos_x: Initial logical center X position.
+            pos_y: Initial top Y position.
+            on_pos_changed: Callback(x, y) when dragged to a new position.
         """
         self._root = root
         self._on_toggle = on_toggle
+        self._on_pos_changed = on_pos_changed
         self._win: tk.Toplevel | None = None
         self._canvas: tk.Canvas | None = None
 
@@ -76,8 +80,8 @@ class OverlayWindow:
         self._tgt_h = float(self.COMPACT_H)
 
         # Position (None = auto-center, set on first drag)
-        self._pos_x: int | None = None
-        self._pos_y: int = 10
+        self._pos_x: int | None = pos_x
+        self._pos_y: int = pos_y
 
         # Drag state
         self._drag_offset_x = 0
@@ -117,8 +121,8 @@ class OverlayWindow:
         self._mic_button_img = mic_btn
 
         # Red stop button: ring + dark bg + stop icon
-        stop_icon = render_icon_stop(12, self.RED)
-        stop_btn = render_button(26, self.RED, "#3A1B1B", stop_icon)
+        stop_icon = render_icon_stop(10, self.RED)
+        stop_btn = render_button(24, self.RED, "#3A1B1B", stop_icon)
         self._stop_button_img = stop_btn
 
     # --- Window setup -----------------------------------------------------
@@ -145,6 +149,7 @@ class OverlayWindow:
         self._canvas.bind("<Motion>", self._on_mouse_move)
         self._canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self._canvas.bind("<B1-Motion>", self._on_drag_move)
+        self._canvas.bind("<ButtonRelease-1>", self._on_drag_end)
 
         self._win.update_idletasks()
         self._position()
@@ -314,6 +319,13 @@ class OverlayWindow:
         self._pos_x = x + w // 2
         self._pos_y = y
         self._win.geometry(f"+{x}+{y}")
+
+    def _on_drag_end(self, event):
+        """Called when mouse drag finishes."""
+        if getattr(self, "_drag_is_click", False):
+            return
+        if self._on_pos_changed:
+            self._on_pos_changed(self._pos_x, self._pos_y)
 
     # --- Hover & cursor ---------------------------------------------------
 

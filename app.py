@@ -45,7 +45,13 @@ class GUIApp:
         self._engine.add_callback(self._on_state_change)
 
         # Overlay
-        self._overlay = OverlayWindow(self._root, on_toggle=self._engine.toggle_recording)
+        self._overlay = OverlayWindow(
+            self._root, 
+            on_toggle=self._engine.toggle_recording,
+            pos_x=config.get("pos_x"),
+            pos_y=config.get("pos_y", 10),
+            on_pos_changed=self._on_pos_changed
+        )
         self._overlay.set_show_balloon(config.get("show_balloon", True))
         self._overlay.set_balloon_font_size(config.get("balloon_font_size", 16))
 
@@ -184,6 +190,12 @@ class GUIApp:
         if self._audio_poll_id:
             self._root.after_cancel(self._audio_poll_id)
             self._audio_poll_id = None
+
+    def _on_pos_changed(self, pos_x: int, pos_y: int):
+        """Save the new window position to config."""
+        self._config["pos_x"] = pos_x
+        self._config["pos_y"] = pos_y
+        save_config(self._config)
 
     # -- Settings ----------------------------------------------------------
 
