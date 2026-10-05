@@ -49,7 +49,10 @@ Inference failures are separate from audio capture. After an OpenVINO GPU
 error such as `CL_OUT_OF_RESOURCES`, the app disables recording and inference
 for the rest of the process and asks for a restart instead of reloading the
 model (see README, "GPU failed: restart required"). A recording that hits
-`max_record_seconds` is kept and transcribed once.
+`max_record_seconds` is kept and transcribed once. Text is never pasted after
+the engine has stopped (Quit or a Settings rebuild), and a Settings change
+that rebuilds the engine is refused, with a message, while a recording,
+transcription or model load is in flight.
 
 Automated tests use simulated streams to check sample continuity, variable block
 sizes, chime reuse, readiness failures, telemetry, and cleanup. They do not

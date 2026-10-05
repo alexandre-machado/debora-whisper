@@ -116,6 +116,8 @@ Stored at `~/.npu-dictation/config.json`:
 
 Or change settings from the GUI: right-click the system tray icon and select **Settings**.
 
+Changing the model, device, hotkey, chime, sample rate or maximum recording length rebuilds the engine. That is refused while a recording, transcription or model load is in progress: the Settings window says what is busy, nothing is saved, and you click **Apply** again once it finishes. This keeps two models from running on the same device at once and keeps an in-flight dictation from being dropped. If a load or transcription never finishes (for example a hung driver), quit and restart the app instead.
+
 ## File Paths
 
 | Path | Purpose |
@@ -185,7 +187,7 @@ OpenVINO compiles the model graph for your specific NPU on first launch. This ta
 When the error is attributed to the NPU alone, the GUI falls back to the GPU for the rest of the session. Reboot to reset the NPU.
 
 ### GPU failed: restart required
-OpenVINO GPU errors such as `CL_OUT_OF_RESOURCES`, or a device loss that cannot be pinned on the NPU (Parakeet runs its decoder on the GPU), can leave the OpenCL context in a state where further calls hang. The app does not retry or reload after that, on the GPU or on any other device. Recording and transcription stay disabled, and Settings changes are saved but not applied, until you quit and restart the app. The original OpenVINO error is written to `~/.npu-dictation/dictation.log`. If the failure repeats, select NPU or CPU in Settings, then restart. Disabling the retry only prevents a hang; it does not fix the driver or memory problem behind the error.
+OpenVINO GPU errors such as `CL_OUT_OF_RESOURCES`, or a device loss that cannot be pinned on the NPU (Parakeet runs its decoder on the GPU), can leave the OpenCL context in a state where further calls hang. The app does not retry or reload after that, on the GPU or on any other device. Recording and transcription stay disabled, and Settings changes are saved but not applied (the tray menu marks them "after restart"), until you quit and restart the app. The original OpenVINO error is written to `~/.npu-dictation/dictation.log`. If the failure repeats, select NPU or CPU in Settings, then restart. Disabling the retry only prevents a hang; it does not fix the driver or memory problem behind the error.
 
 ### Hotkey doesn't work
 - PowerShell must run as **Administrator** (the `keyboard` library requires elevated privileges)

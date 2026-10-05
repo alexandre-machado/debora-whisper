@@ -36,6 +36,7 @@ class FakeGenAI:
         self.load_errors = dict(load_errors or {})
         self.loads = []
         self.generate_calls = 0
+        self.on_generate = None  # test hook to pause inside inference
         fake = self
 
         class WhisperPipeline:
@@ -49,6 +50,8 @@ class FakeGenAI:
 
             def generate(self, audio, config):
                 fake.generate_calls += 1
+                if fake.on_generate:
+                    fake.on_generate()
                 if fake.generate_error:
                     raise RuntimeError(fake.generate_error)
                 return "hello"
@@ -227,6 +230,255 @@ def test_settings_apply_after_gpu_failure_saves_without_reload(genai):
     assert gui._config["device"] == "CPU"  # persisted for the next start
     assert "Restart" in gui._settings_status.call_args.args[0]
     assert genai.loads == ["GPU"]
+    # The tray must not claim CPU is the active device in this process.
+    gui._tray.update_info.assert_called_once()
+    shown = gui._tray.update_info.call_args.kwargs["device"]
+    assert shown != "CPU" and "CPU" in shown and "after restart" in shown
+
+
+def _install_fake_parakeet_runtime(monkeypatch, tmp_path, compile_model):
+    """OpenVINO/onnxruntime boundary for a real ParakeetNPU._load_pipeline."""
+    class Model:
+        def reshape(self, shapes):
+            pass
+
+    class Core:
+        def read_model(self, path):
+            return Model()
+
+        def compile_model(self, model, device, cfg=None):
+            return compile_model(device)
+
+    ov = types.ModuleType("openvino")
+    ov.Core = Core
+    ort = types.ModuleType("onnxruntime")
+    ort.InferenceSession = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "openvino", ov)
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort)
+    (tmp_path / "nemo128.onnx").write_bytes(b"")
+    monkeypatch.setattr(de.ParakeetNPU, "_load_vocab", lambda self: None)
+    monkeypatch.setattr(de, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(de, "setup_model", lambda config: tmp_path)
+    monkeypatch.delenv("PARAKEET_LATENCY_OVERRIDE", raising=False)
+
+
+def test_parakeet_gpu_fallback_failure_latches_before_any_further_compile(
+        monkeypatch, tmp_path):
+    """NPU encoder compile fails for an ordinary reason, the GPU fallback then
+    raises CL_OUT_OF_RESOURCES. Nothing may compile afterwards (no CPU
+    encoder, no GPU decoder) and the process must be latched."""
+    compiles = []
+
+    def compile_model(device):
+        compiles.append(device)
+        if device == "NPU":
+            raise RuntimeError("[NPU] unsupported layer Foo")
+        if device == "GPU":
+            raise RuntimeError(CL_ERROR)
+        raise AssertionError(f"compiled on {device} after the GPU failed")
+
+    _install_fake_parakeet_runtime(monkeypatch, tmp_path, compile_model)
+    app = _engine({"model_size": "parakeet", "device": "NPU"})
+    states = []
+    app.add_callback(lambda state, data: states.append((state, data)))
+
+    with patch.object(app._stopping, "wait", return_value=False):
+        app._load_model_background()
+
+    assert compiles == ["NPU", "GPU"]  # decoder/GPU never retried
+    state, data = states[-1]
+    assert state == AppState.ERROR
+    assert data["restart_required"] is True and data["device_failure"] == "GPU"
+    latched = de.device_failure()
+    exc = latched["exception"]
+    assert isinstance(exc, de.DeviceFailureError) and exc.device == "GPU"
+    # Original causality: GPU error is the cause, the NPU error its context.
+    assert CL_ERROR in str(exc.__cause__)
+    assert "unsupported layer Foo" in str(exc.__cause__.__context__)
+    assert "Quit and restart" in latched["message"]
+    with pytest.raises(de.RestartRequiredError):
+        de.ensure_devices_usable()
+    assert app.busy_reason() is None
+
+
+def test_parakeet_benign_gpu_fallback_failure_still_reaches_cpu(monkeypatch, tmp_path):
+    compiles = []
+
+    def compile_model(device):
+        compiles.append(device)
+        if device in ("NPU", "GPU"):
+            raise RuntimeError(f"[{device}] unsupported layer Foo")
+        raise RuntimeError("stop here: CPU reached")
+
+    _install_fake_parakeet_runtime(monkeypatch, tmp_path, compile_model)
+    with pytest.raises(RuntimeError, match="CPU reached"):
+        de.ParakeetNPU(tmp_path, device="NPU")
+    assert compiles == ["NPU", "GPU", "CPU"]
+    assert de.device_failure() is None
+
+
+def _join_daemons():
+    for t in threading.enumerate():
+        if t is not threading.current_thread() and t.daemon:
+            t.join(5)
+
+
+def test_stop_waits_for_paste_in_progress(genai, isolate_desktop):
+    """stop() during the final paste returns only after it finished, so
+    nothing can be pasted after stop() has returned."""
+    genai.generate_error = None
+    app = _engine()
+    app.ensure_model()
+    app._model_ready.set()
+    events, entered, release = [], threading.Event(), threading.Event()
+
+    def paste(text, auto_enter=False):
+        events.append("paste_start")
+        entered.set()
+        assert release.wait(5)
+        events.append("paste_end")
+
+    isolate_desktop.side_effect = paste
+    worker = threading.Thread(target=_transcribe_once, args=(app,), daemon=True)
+    worker.start()
+    assert entered.wait(5)
+
+    def stopper():
+        app.stop()
+        events.append("stop_returned")
+
+    stop_thread = threading.Thread(target=stopper, daemon=True)
+    stop_thread.start()
+    stop_thread.join(0.3)
+    assert stop_thread.is_alive(), "stop() returned while a paste was in progress"
+    release.set()
+    stop_thread.join(5)
+    worker.join(5)
+    assert events == ["paste_start", "paste_end", "stop_returned"]
+    assert len(app.history) == 1
+
+
+def test_stop_at_output_boundary_discards_text(genai, isolate_desktop):
+    """A stop that completes after inference but right before the final
+    check: the text is neither pasted nor stored."""
+    genai.generate_error = None
+    app = _engine()
+    app.ensure_model()
+    app._model_ready.set()
+    states = []
+    app.add_callback(lambda state, data: states.append(state))
+    real_lock = app._output_lock
+
+    class StopFirst:
+        def __enter__(self):
+            app._output_lock = real_lock
+            app.stop()  # completes fully before the final check runs
+            return real_lock.__enter__()
+
+        def __exit__(self, *exc):
+            return real_lock.__exit__(*exc)
+
+    app._output_lock = StopFirst()
+    _transcribe_once(app)
+    assert genai.generate_calls == 1
+    isolate_desktop.assert_not_called()
+    assert app.history == []
+    assert AppState.READY not in states
+
+
+def test_settings_rebuild_refused_while_old_inference_runs(genai, isolate_desktop):
+    """Old engine is mid-inference on the GPU when Settings asks for a rebuild:
+    no config change, no new engine, no stop; after it finishes, Apply works."""
+    genai.generate_error = None
+    app = _engine()
+    app.ensure_model()
+    app._model_ready.set()
+    gui = _gui(app)
+    gui._settings_status = MagicMock()
+    gui._settings_set_apply = MagicMock()
+    inside, release = threading.Event(), threading.Event()
+
+    def pause():
+        inside.set()
+        assert release.wait(5)
+
+    genai.on_generate = pause
+    worker = threading.Thread(target=_transcribe_once, args=(app,), daemon=True)
+    worker.start()
+    assert inside.wait(5)
+
+    before = dict(gui._config)
+    factory, save = MagicMock(), MagicMock()
+    with patch.dict(GUIApp._on_settings_apply.__globals__, {
+        "DictationApp": factory, "save_config": save,
+    }):
+        gui._on_settings_apply({**gui._config, "device": "CPU"})
+        factory.assert_not_called()
+        save.assert_not_called()
+        gui._tray.update_info.assert_not_called()
+        assert gui._config == before  # shared with the running engine
+        assert not app._stopping.is_set()
+        message = gui._settings_status.call_args.args[0]
+        assert "transcription in progress" in message and "Apply again" in message
+
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        isolate_desktop.assert_called_once()
+        assert len(app.history) == 1
+
+        gui._on_settings_apply({**gui._config, "device": "CPU"})
+        factory.assert_called_once_with(gui._config)
+        assert app._stopping.is_set()
+    assert gui._config["device"] == "CPU"
+    assert genai.loads == ["GPU"]
+
+
+def test_stop_if_idle_refuses_recording_and_loading():
+    app = _engine()
+    app.is_recording = True
+    assert app.stop_if_idle() == "recording"
+    assert not app._stopping.is_set()
+    app.is_recording = False
+
+    entered, gate = threading.Event(), threading.Event()
+
+    def slow_load():
+        entered.set()
+        assert gate.wait(5)
+
+    with patch.object(app, "_load_model_background_inner", side_effect=slow_load):
+        app._start_loader()
+        assert entered.wait(5)
+        assert app.stop_if_idle() == "model loading"
+        assert not app._stopping.is_set()
+        gate.set()
+        _join_daemons()
+    assert app.stop_if_idle() is None
+    assert app._stopping.is_set()
+
+
+def test_stop_if_idle_wins_against_pending_hotkey_start(genai):
+    """A hotkey start already past its first checks when Settings stops the
+    engine must not open the microphone afterwards."""
+    app = _engine()
+    app.ensure_model()
+    reached, release = threading.Event(), threading.Event()
+
+    class PausingReady:
+        def is_set(self):
+            reached.set()
+            assert release.wait(5)
+            return True
+
+    app._model_ready = PausingReady()
+    app.toggle_recording()
+    assert reached.wait(5)
+    assert app.stop_if_idle() is None  # not recording yet: stops
+    release.set()
+    _join_daemons()
+    assert app.recorder.starts == 0
+    assert app.is_recording is False
 
 
 def test_gpu_load_failure_does_not_fall_back_to_cpu(genai, tmp_path):

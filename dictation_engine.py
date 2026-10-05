@@ -800,7 +800,17 @@ class ParakeetNPU:
                     self.device = fallback
                     log(f"  Encoder bucket {bucket} compiled on {fallback}")
                     return c
-                except Exception:
+                except Exception as fallback_exc:
+                    # The fallback device can fail fatally too (e.g. NPU hit an
+                    # ordinary compile error, then GPU raised
+                    # CL_OUT_OF_RESOURCES). Classify it against the device it
+                    # ran on and stop before any further compile: the decoder
+                    # would otherwise reuse the same failed GPU context.
+                    # Raising here keeps first_exc as __context__.
+                    kind = classify_device_failure(fallback_exc, {fallback})
+                    if kind is not None:
+                        raise DeviceFailureError(kind, fallback_exc) from fallback_exc
+                    log(f"  Encoder bucket {bucket} failed on {fallback}: {fallback_exc}")
                     log(f"  Falling back to CPU...")
                     c = core.compile_model(model_to_compile, "CPU", {"CACHE_DIR": str(CACHE_DIR)})
                     self.device = "CPU"
@@ -1492,7 +1502,14 @@ class DictationApp:
         self.chimes = ChimePlayer()
         self._audio_lifecycle_lock = threading.Lock()
         self._stopping = threading.Event()
+        # Orders the final "still running?" check plus paste/history against
+        # stop(). Only type_text and the history append run under it, never a
+        # state callback, so a callback that calls stop() cannot deadlock.
+        self._output_lock = threading.Lock()
         self._transcribing = False
+        # True while a model load/warmup thread is running (it compiles and
+        # infers on the accelerator). Guarded by _audio_lifecycle_lock.
+        self._loading = False
         self.whisper = None  # Lazy-loaded
         self.is_recording = False
         self._model_ready = threading.Event()
@@ -1571,8 +1588,24 @@ class DictationApp:
             "cause": cause,
         }
 
+    def _start_loader(self):
+        """Spawn the load thread, marking the engine busy before it starts so
+        stop_if_idle() can never miss a load that is about to begin."""
+        with self._audio_lifecycle_lock:
+            if self._stopping.is_set():
+                return
+            self._loading = True
+        threading.Thread(target=self._load_model_background, daemon=True).start()
+
     def _load_model_background(self):
         """Load model in background thread, setting _model_ready when done."""
+        try:
+            self._load_model_background_inner()
+        finally:
+            with self._audio_lifecycle_lock:
+                self._loading = False
+
+    def _load_model_background_inner(self):
         if self._stopping.is_set():
             return
         if device_failure():
@@ -1659,7 +1692,7 @@ class DictationApp:
         self._model_ready.clear()
         self.whisper = None
         self.config["device"] = new_device
-        threading.Thread(target=self._load_model_background, daemon=True).start()
+        self._start_loader()
 
     # -- Input device enumeration ----------------------------------------
 
@@ -1709,8 +1742,6 @@ class DictationApp:
                     sample_rate=self.config["sample_rate"],
                     language=self.config["language"],
                 )
-                if self._stopping.is_set():
-                    return
                 t_lower = text.strip().lower()
                 hallucinations = {"obrigado.", "obrigada.", "obrigado", "obrigada", "obrigado!", "obrigada!", "obrigado por assistir.", "obrigada por assistir.", "thank you.", "thank you", "thanks for watching.", "obrigado por assistir"}
                 if t_lower in hallucinations:
@@ -1718,15 +1749,21 @@ class DictationApp:
                     text = ""
 
                 if text:
-                    type_text(text, auto_enter=self.config["auto_enter"])
-                    # Store in history
-                    self._history.append({
-                        "timestamp": datetime.now().isoformat(),
-                        "text": text,
-                        "duration": len(audio) / self.config["sample_rate"],
-                    })
-                    if len(self._history) > self.MAX_HISTORY:
-                        self._history = self._history[-self.MAX_HISTORY:]
+                    # The final stop check and the paste are one step with
+                    # respect to stop(): once stop() returns, nothing pastes.
+                    # No callback runs while the lock is held.
+                    with self._output_lock:
+                        if self._stopping.is_set():
+                            log("Engine stopped; discarding late transcription.")
+                            return
+                        type_text(text, auto_enter=self.config["auto_enter"])
+                        self._history.append({
+                            "timestamp": datetime.now().isoformat(),
+                            "text": text,
+                            "duration": len(audio) / self.config["sample_rate"],
+                        })
+                        if len(self._history) > self.MAX_HISTORY:
+                            self._history = self._history[-self.MAX_HISTORY:]
                     self._set_state(AppState.READY, {"text": text})
                 else:
                     log("No speech detected.")
@@ -1842,11 +1879,48 @@ class DictationApp:
         log(f"Hotkey {hotkey} registered.")
 
         log("Loading model in background (first time may take several minutes)...")
-        threading.Thread(target=self._load_model_background, daemon=True).start()
+        self._start_loader()
+
+    def busy_reason(self) -> str | None:
+        """What accelerator/microphone work is in flight, or None if idle."""
+        with self._audio_lifecycle_lock:
+            return self._busy_reason_locked()
+
+    def _busy_reason_locked(self) -> str | None:
+        if self.is_recording:
+            return "recording"
+        if self._transcribing:
+            return "transcription"
+        if self._loading:
+            return "model loading"
+        return None
+
+    def stop_if_idle(self) -> str | None:
+        """Stop this engine only if no recording, transcription or model load
+        is in flight. Returns the busy reason (engine left running) or None
+        (engine stopped).
+
+        The idle check and the stop flag are set under the same lock every
+        start path (hotkey start, timer/user stop, loader spawn) takes, so no
+        new work can begin between the check and the stop. Used before a
+        Settings rebuild so a new pipeline is never compiled while the old
+        one may still be running on the same device. Never blocks on
+        in-flight inference, which may be hung in a driver.
+        """
+        with self._audio_lifecycle_lock:
+            reason = self._busy_reason_locked()
+            if reason is not None:
+                return reason
+            self._stopping.set()
+        self.stop()
+        return None
 
     def stop(self):
         """Clean shutdown — unhook keyboard and stop recording if active."""
-        self._stopping.set()
+        # Taking the output lock orders this against a paste in progress:
+        # after this line no transcription can be typed or added to history.
+        with self._output_lock:
+            self._stopping.set()
         try:
             import keyboard
             keyboard.unhook_all()
