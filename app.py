@@ -174,16 +174,20 @@ class GUIApp:
             self._tray.update_state(state_name, f"NPU Dictation — Error: {error_msg[:60]}")
             self._settings_status(f"Error: {error_msg[:40]}", "#FF453A")
 
-            # An NPU-only device loss may move to the GPU, which has not failed.
+            # An NPU-only device loss may move to the GPU/CUDA, which has not failed.
             if data.get("device_lost") and data.get("device_failure") == "NPU":
-                log("NPU DEVICE_LOST detected — falling back to GPU")
-                self._config["device"] = "GPU"
+                fallback_dev = "GPU"
+                from dictation_engine import has_nvidia_gpu
+                if has_nvidia_gpu():
+                    fallback_dev = "CUDA"
+                log(f"NPU DEVICE_LOST detected — falling back to {fallback_dev}")
+                self._config["device"] = fallback_dev
                 self._tray.update_info(
-                    device="GPU",
+                    device=fallback_dev,
                     model=self._config["model_size"],
                     hotkey=self._config["hotkey"],
                 )
-                self._engine.fallback_device("GPU")
+                self._engine.fallback_device(fallback_dev)
 
     def _show_restart_required(self, data: dict):
         """Tell the user, once, that only an app restart recovers the device."""
@@ -361,7 +365,7 @@ class GUIApp:
 
 def main():
     parser = argparse.ArgumentParser(description="NPU Dictation Engine (GUI)")
-    parser.add_argument("--device", choices=["NPU", "GPU", "CPU"], help="Override device")
+    parser.add_argument("--device", choices=["NPU", "GPU", "CPU", "CUDA"], help="Override device")
     parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), help="Model size")
     parser.add_argument("--language", type=str, help="Language code")
     parser.add_argument("--auto-enter", action="store_true", help="Press Enter after typing")
@@ -385,6 +389,12 @@ def main():
     if not args.device:
         model_info = MODEL_REGISTRY[config["model_size"]]
         preferred = model_info["preferred_device"]
+        
+        if preferred == "GPU":
+            from dictation_engine import has_nvidia_gpu
+            if has_nvidia_gpu():
+                preferred = "CUDA"
+
         if config["device"] != preferred:
             log(f"Auto-selecting {preferred} for {config['model_size']}")
             config["device"] = preferred

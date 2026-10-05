@@ -17,13 +17,18 @@ from enum import Enum
 from pathlib import Path
 from datetime import datetime
 
+# Disable HuggingFace symlinks on Windows to avoid WinError 1314
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 CONFIG_DIR = Path.home() / ".npu-dictation"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 MODEL_DIR = CONFIG_DIR / "models"
-LOG_FILE = CONFIG_DIR / "dictation.log"
+LOG_DIR = CONFIG_DIR / "logs"
+LOG_FILE = LOG_DIR / "app.log"
+TELEMETRY_LOG = LOG_DIR / "telemetry.log"
 CACHE_DIR = CONFIG_DIR / "ov-cache"
 
 DEFAULT_CONFIG = {
@@ -163,8 +168,9 @@ def log(msg: str):
     line = f"[{timestamp}] {msg}"
     print(line)
     try:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        target_file = TELEMETRY_LOG if "[Telemetry]" in msg else LOG_FILE
+        with open(target_file, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -192,7 +198,7 @@ def save_config(config: dict):
 
 def validate_config(config: dict):
     """Validate config values. Raises ValueError on invalid values."""
-    valid_devices = {"NPU", "GPU", "CPU"}
+    valid_devices = {"NPU", "GPU", "CPU", "CUDA"}
     if config.get("device") not in valid_devices:
         raise ValueError(f"device must be one of {valid_devices}, got '{config.get('device')}'")
 
@@ -225,6 +231,9 @@ def setup_model(config: dict, progress_callback=None):
     model_size = config["model_size"]
     model_info = MODEL_REGISTRY[model_size]
     model_path = MODEL_DIR / model_info["local_dir"]
+
+    if config["device"] == "CUDA":
+        return None
 
     # Check if model already exists (Whisper uses .xml, Parakeet uses .onnx)
     has_xml = model_path.exists() and any(model_path.glob("*.xml"))
@@ -338,6 +347,29 @@ def _exception_chain(exc: BaseException):
         exc = exc.__cause__ or exc.__context__
 
 
+def has_nvidia_gpu(return_name: bool = False):
+    """Check if an NVIDIA GPU is present and accessible via nvidia-smi.
+    If return_name is True, returns the GPU name string or None if not found."""
+    import shutil
+    import os
+    if not shutil.which("nvidia-smi"):
+        return None if return_name else False
+    try:
+        import subprocess
+        
+        args = ["nvidia-smi"]
+        if return_name:
+            args = ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]
+            
+        output = subprocess.check_output(
+            args,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        )
+        return output.decode("utf-8").strip() if return_name else True
+    except Exception:
+        return None if return_name else False
+
 def _failure_detail(exc: BaseException) -> str:
     """Short identifier of the original error (the deepest cause wins)."""
     chain = list(_exception_chain(exc))
@@ -434,6 +466,76 @@ def _model_active_devices(model) -> set:
 
 
 # ---------------------------------------------------------------------------
+# Whisper pipeline using Faster Whisper (CUDA)
+# ---------------------------------------------------------------------------
+class FasterWhisperCUDA:
+    """Whisper speech-to-text using faster-whisper on NVIDIA CUDA."""
+
+    def __init__(self, model_size: str, device: str = "cuda"):
+        self.device = device
+        self.model_size = model_size
+        self.pipeline = None
+        self._load_pipeline()
+
+    def active_devices(self) -> set:
+        return {"CUDA"}
+
+    def _load_pipeline(self):
+        ensure_devices_usable()
+        
+        # On Windows, CTranslate2 needs to find the CUDA runtime DLLs (cublas, cudnn).
+        # If installed via pip (nvidia-cublas-cu12, nvidia-cudnn-cu12), we must explicitly
+        # add them to the DLL search path.
+        if sys.platform == "win32":
+            try:
+                import site
+                for site_pkg in site.getsitepackages():
+                    nvidia_base = Path(site_pkg) / "nvidia"
+                    if nvidia_base.exists():
+                        for lib_dir in nvidia_base.iterdir():
+                            bin_path = lib_dir / "bin"
+                            if bin_path.exists():
+                                os.environ["PATH"] = str(bin_path) + os.pathsep + os.environ.get("PATH", "")
+                                if hasattr(os, "add_dll_directory"):
+                                    os.add_dll_directory(str(bin_path))
+            except Exception as e:
+                log(f"Warning: Failed to inject NVIDIA DLL paths: {e}")
+
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise RuntimeError("faster-whisper is not installed. Please install it to use CUDA backend.")
+            
+        log(f"Loading faster-whisper pipeline on CUDA ({self.model_size})...")
+        
+        # compute_type="int8_float16" gives the best performance/VRAM tradeoff on RTX.
+        start = time.time()
+        self.pipeline = WhisperModel(self.model_size, device="cuda", compute_type="int8_float16")
+        hw_name = has_nvidia_gpu(return_name=True) or "NVIDIA GPU"
+        log(f"Loaded faster-whisper on {hw_name} in {time.time() - start:.1f}s")
+
+    def transcribe(self, audio_data, sample_rate: int = 16000, language: str = "en") -> str:
+        import numpy as np
+        
+        if audio_data.dtype == np.int16:
+            audio_data = audio_data.astype(np.float32) / 32768.0
+        elif audio_data.dtype != np.float32:
+            audio_data = audio_data.astype(np.float32)
+
+        ensure_devices_usable()
+        
+        segments, info = self.pipeline.transcribe(
+            audio_data,
+            language=language if language != "auto" else None,
+            condition_on_previous_text=False,
+            without_timestamps=True
+        )
+        
+        text = "".join(segment.text for segment in segments)
+        return text.strip()
+
+
+# ---------------------------------------------------------------------------
 # Whisper pipeline using OpenVINO GenAI
 # ---------------------------------------------------------------------------
 class WhisperNPU:
@@ -463,12 +565,17 @@ class WhisperNPU:
 
         try:
             import openvino_genai as ov_genai
+            import openvino as ov
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             self.pipeline = ov_genai.WhisperPipeline(
                 str(self.model_path), self.device,
                 CACHE_DIR=str(CACHE_DIR)
             )
-            log(f"Loaded via openvino_genai in {time.time() - start:.1f}s")
+            try:
+                hw_name = ov.Core().get_property(self.device, "FULL_DEVICE_NAME")
+            except Exception:
+                hw_name = self.device
+            log(f"Loaded via openvino_genai on {hw_name} in {time.time() - start:.1f}s")
         except Exception as e:
             log(f"Failed to load model: {e}")
             kind = classify_device_failure(e, self.active_devices())
@@ -902,7 +1009,25 @@ class ParakeetNPU:
                 raise DeviceFailureError(kind, e) from e
             raise
 
-        log(f"Parakeet pipeline loaded in {time.time() - start:.1f}s")
+        import openvino as ov
+        try:
+            core = ov.Core()
+            enc_hw = core.get_property(self.device, "FULL_DEVICE_NAME")
+        except Exception:
+            enc_hw = self.device
+            
+        dec_dev = getattr(self, "dec_device", "GPU")
+        try:
+            dec_hw = core.get_property(dec_dev, "FULL_DEVICE_NAME")
+        except Exception:
+            dec_hw = dec_dev
+            
+        if enc_hw == dec_hw:
+            hw_str = enc_hw
+        else:
+            hw_str = f"{enc_hw} (Encoder) + {dec_hw} (Decoder)"
+
+        log(f"Parakeet pipeline loaded on {hw_str} in {time.time() - start:.1f}s")
 
     def _preprocess(self, audio_data) -> tuple:
         """Convert raw audio to mel features using nemo128.onnx."""
@@ -1037,20 +1162,25 @@ class ParakeetNPU:
         return text
 
 
-def create_model(model_path: Path, device: str, backend: str):
+def create_model(model_path: Path, device: str, backend: str, model_size: str = None):
     """Factory function to create the right model class based on backend.
 
     Args:
-        model_path: Path to model directory.
-        device: Device string (NPU, GPU, CPU).
+        model_path: Path to model directory (can be None for CUDA).
+        device: Device string (NPU, GPU, CPU, CUDA).
         backend: "whisper" or "parakeet" from MODEL_REGISTRY.
+        model_size: Size of the model (e.g. "turbo"), required for CUDA.
 
     Returns:
-        WhisperNPU or ParakeetNPU instance.
+        WhisperNPU, ParakeetNPU, or FasterWhisperCUDA instance.
     """
     # Covers engines rebuilt by Settings: a new instance in the same process
     # must not load anything after a fatal device failure.
     ensure_devices_usable()
+    
+    if device == "CUDA":
+        return FasterWhisperCUDA(model_size, device="cuda")
+        
     if backend == "parakeet":
         return ParakeetNPU(model_path, device=device)
     return WhisperNPU(model_path, device=device)
@@ -1528,6 +1658,40 @@ class DictationApp:
         self._callbacks: list = []
         self._history: list[dict] = []
 
+        self._resource_thread = threading.Thread(target=self._monitor_resources, daemon=True)
+        self._resource_thread.start()
+
+    def _monitor_resources(self):
+        """Continuously log CPU, RAM, and VRAM usage to telemetry."""
+        try:
+            import psutil
+            import sys
+            process = psutil.Process()
+            while True:
+                cpu = psutil.cpu_percent(interval=5.0)
+                mem = process.memory_info().rss / (1024 * 1024)
+                sys_mem = psutil.virtual_memory().percent
+                
+                vram_info = ""
+                if self.config.get("device") == "CUDA":
+                    try:
+                        import subprocess
+                        output = subprocess.check_output(
+                            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,nounits,noheader"],
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                        ).decode("utf-8").strip()
+                        used, total = output.split(", ")
+                        vram_info = f" | VRAM: {used}/{total}MB"
+                    except Exception:
+                        pass
+                
+                state_name = self._state.value if hasattr(self, "_state") else "UNKNOWN"
+                log(f"[Telemetry] State: {state_name} | CPU: {cpu:02.1f}% | App RAM: {mem:.0f}MB | Sys RAM: {sys_mem:02.1f}%{vram_info}")
+        except ImportError:
+            log("[Telemetry] psutil not found. Resource monitoring disabled.")
+        except Exception as e:
+            log(f"[Telemetry] Resource monitoring stopped: {e}")
+
     # -- Callback system -----------------------------------------------
 
     def add_callback(self, fn):
@@ -1564,6 +1728,7 @@ class DictationApp:
             self.whisper = create_model(
                 model_path, device=self.config["device"],
                 backend=model_info["backend"],
+                model_size=self.config["model_size"]
             )
 
     def _error_payload(self, exc: BaseException) -> dict:
@@ -2055,23 +2220,28 @@ def run_setup():
             log("  [OK] GPU detected (Intel iGPU)")
     except ImportError:
         log("  Could not import openvino - installation may have failed")
+        
+    if has_nvidia_gpu():
+        log("  [OK] CUDA detected (NVIDIA GPU)")
 
     # 4. Create default config
     config = load_config()
     
-    # Auto-detect best device
-    try:
-        import openvino as ov
-        core = ov.Core()
-        devices = core.available_devices
-        if "NPU" in devices:
-            config["device"] = "NPU"
-        elif "GPU" in devices:
-            config["device"] = "GPU"
-        else:
+    if has_nvidia_gpu():
+        config["device"] = "CUDA"
+    else:
+        try:
+            import openvino as ov
+            core = ov.Core()
+            devices = core.available_devices
+            if "NPU" in devices:
+                config["device"] = "NPU"
+            elif "GPU" in devices:
+                config["device"] = "GPU"
+            else:
+                config["device"] = "CPU"
+        except Exception:
             config["device"] = "CPU"
-    except Exception:
-        config["device"] = "CPU"
 
     save_config(config)
 
@@ -2093,7 +2263,8 @@ def run_setup():
             import numpy as np
             model_info = MODEL_REGISTRY[config["model_size"]]
             model = create_model(model_path, device=config["device"],
-                                 backend=model_info["backend"])
+                                 backend=model_info["backend"],
+                                 model_size=config["model_size"])
             silence = np.zeros(config["sample_rate"], dtype=np.float32)  # 1 second of silence
             model.transcribe(silence, sample_rate=config["sample_rate"], language=config["language"])
             log("Cache warm-up complete — subsequent starts will be fast.")
@@ -2115,7 +2286,7 @@ def run_setup():
 def main():
     parser = argparse.ArgumentParser(description="NPU Dictation Engine")
     parser.add_argument("--setup", action="store_true", help="Run first-time setup")
-    parser.add_argument("--device", choices=["NPU", "GPU", "CPU"], help="Override device")
+    parser.add_argument("--device", choices=["NPU", "GPU", "CPU", "CUDA"], help="Override device")
     parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), help="Model size")
     parser.add_argument("--language", type=str, help="Language code (e.g., en, ru, id)")
     parser.add_argument("--auto-enter", action="store_true", help="Press Enter after typing")
@@ -2144,6 +2315,10 @@ def main():
     if not args.device:
         model_info = MODEL_REGISTRY[config["model_size"]]
         preferred = model_info["preferred_device"]
+        
+        if preferred == "GPU" and has_nvidia_gpu():
+            preferred = "CUDA"
+                
         if config["device"] != preferred:
             log(f"Auto-selecting {preferred} for {config['model_size']} "
                 f"(override with --device {config['device']})")

@@ -28,7 +28,7 @@
 param(
     [switch]$Setup,
     [switch]$CLI,
-    [ValidateSet("NPU", "GPU", "CPU")]
+    [ValidateSet("NPU", "GPU", "CPU", "CUDA")]
     [string]$Device,
     [ValidateSet("base", "small", "medium", "turbo", "parakeet")]
     [string]$Model,
