@@ -301,6 +301,47 @@ def test_parakeet_gpu_fallback_failure_latches_before_any_further_compile(
     assert app.busy_reason() is None
 
 
+def test_parakeet_untagged_gpu_fallback_loss_is_not_blamed_on_npu(monkeypatch, tmp_path):
+    """NPU fails with a non-fatal but NPU/Level Zero tagged error, then the GPU
+    fallback raises an untagged device loss. The chain text still carries the
+    NPU tag; the failure must be latched on GPU, not reported as an NPU-only
+    loss that would make the GUI reload on the GPU that just failed."""
+    compiles = []
+    npu_error = "[NPU] ZE_RESULT_ERROR_UNKNOWN unsupported"
+
+    def compile_model(device):
+        compiles.append(device)
+        if device == "NPU":
+            raise RuntimeError(npu_error)
+        if device == "GPU":
+            raise RuntimeError("device lost")
+        raise AssertionError(f"compiled on {device} after the GPU failed")
+
+    _install_fake_parakeet_runtime(monkeypatch, tmp_path, compile_model)
+    assert de.classify_device_failure(RuntimeError(npu_error), {"NPU"}) is None
+    app = _engine({"model_size": "parakeet", "device": "NPU"})
+    gui = _gui(app)
+    states = []
+    app.add_callback(lambda state, data: states.append((state, data)))
+
+    with patch.object(app._stopping, "wait", return_value=False), \
+            patch.object(app, "fallback_device") as fallback:
+        app._load_model_background()
+
+    assert compiles == ["NPU", "GPU"]
+    fallback.assert_not_called()
+    assert not any(d.get("device_lost") or d.get("device_failure") == "NPU"
+                   for _, d in states)
+    state, data = states[-1]
+    assert state == AppState.ERROR
+    assert data["restart_required"] is True and data["device_failure"] == "GPU"
+    exc = de.device_failure()["exception"]
+    assert isinstance(exc, de.DeviceFailureError) and exc.device == "GPU"
+    assert "device lost" in str(exc.__cause__)
+    assert npu_error in str(exc.__cause__.__context__)
+    gui._alert_error.assert_called_once()
+
+
 def test_parakeet_benign_gpu_fallback_failure_still_reaches_cpu(monkeypatch, tmp_path):
     compiles = []
 
@@ -456,6 +497,78 @@ def test_stop_if_idle_refuses_recording_and_loading():
         _join_daemons()
     assert app.stop_if_idle() is None
     assert app._stopping.is_set()
+
+
+def test_npu_loss_fallback_loader_stays_busy_after_first_loader_returns(
+        genai, monkeypatch, tmp_path):
+    """The NPU-loss ERROR callback synchronously starts the GPU fallback
+    loader before the first loader has returned. Once the first loader is
+    done, the second (held pending) must still report 'model loading' and
+    refuse a Settings rebuild."""
+    genai.generate_error = None
+    genai.load_errors = {"NPU": "[NPU] ZE_RESULT_ERROR_DEVICE_LOST"}
+    entered, gate = threading.Event(), threading.Event()
+
+    def setup_model(config):
+        if config["device"] == "GPU":
+            entered.set()
+            assert gate.wait(5)
+        return tmp_path / "whisper-base"
+
+    monkeypatch.setattr(de, "setup_model", setup_model)
+    app = _engine({"device": "NPU"})
+    gui = _gui(app)  # synchronous Root: ERROR -> _update_ui -> fallback_device
+    states = []
+    app.add_callback(lambda state, data: states.append((state, data)))
+
+    with patch.object(app._stopping, "wait", return_value=False):
+        app._load_model_background()  # first loader, returns here
+        assert entered.wait(5), "GPU fallback loader never started"
+        assert any(d.get("device_failure") == "NPU" for _, d in states)
+        assert app.busy_reason() == "model loading"
+        assert app.stop_if_idle() == "model loading"
+        assert not app._stopping.is_set()
+        gate.set()
+        _join_daemons()
+
+    assert genai.loads == ["NPU", "GPU"]
+    assert states[-1][0] == AppState.READY
+    assert app.busy_reason() is None
+    assert de.device_failure() is None
+    gui._alert_error.assert_not_called()
+
+
+def test_loader_thread_start_failure_releases_reservation():
+    app = _engine()
+    with patch.object(threading.Thread, "start",
+                      side_effect=RuntimeError("can't start new thread")):
+        with pytest.raises(RuntimeError, match="start new thread"):
+            app._start_loader()
+    assert app.busy_reason() is None
+    assert app.stop_if_idle() is None
+
+
+def test_ready_callback_may_stop_engine_without_deadlock(genai):
+    """READY used to be emitted under _audio_lifecycle_lock; a callback that
+    stops the engine (or waits on a thread that does) deadlocked."""
+    genai.generate_error = None
+    app = _engine()
+    stopped = []
+
+    def on_state(state, data):
+        if state == AppState.READY:
+            app.stop()
+            stopped.append(True)
+
+    app.add_callback(on_state)
+    with patch.object(app._stopping, "wait", return_value=False):
+        loader = threading.Thread(target=app._load_model_background, daemon=True)
+        loader.start()
+        loader.join(5)
+    assert not loader.is_alive(), "READY callback deadlocked against the loader"
+    assert stopped == [True]
+    assert app._stopping.is_set()
+    assert app.busy_reason() is None
 
 
 def test_stop_if_idle_wins_against_pending_hotkey_start(genai):

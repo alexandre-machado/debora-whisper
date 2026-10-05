@@ -807,9 +807,15 @@ class ParakeetNPU:
                     # ran on and stop before any further compile: the decoder
                     # would otherwise reuse the same failed GPU context.
                     # Raising here keeps first_exc as __context__.
+                    # first_exc was already shown non-fatal above, so a match
+                    # here comes from the fallback compile. Blame the fallback
+                    # device: the chain text may still carry an "[NPU]" or
+                    # ZE_RESULT tag from first_exc, which would otherwise read
+                    # as an NPU-only loss and send the GUI back onto this GPU.
                     kind = classify_device_failure(fallback_exc, {fallback})
                     if kind is not None:
-                        raise DeviceFailureError(kind, fallback_exc) from fallback_exc
+                        failed = fallback if fallback != "CPU" else kind
+                        raise DeviceFailureError(failed, fallback_exc) from fallback_exc
                     log(f"  Encoder bucket {bucket} failed on {fallback}: {fallback_exc}")
                     log(f"  Falling back to CPU...")
                     c = core.compile_model(model_to_compile, "CPU", {"CACHE_DIR": str(CACHE_DIR)})
@@ -1507,9 +1513,11 @@ class DictationApp:
         # state callback, so a callback that calls stop() cannot deadlock.
         self._output_lock = threading.Lock()
         self._transcribing = False
-        # True while a model load/warmup thread is running (it compiles and
-        # infers on the accelerator). Guarded by _audio_lifecycle_lock.
-        self._loading = False
+        # Number of model load/warmup reservations in flight (each compiles
+        # and infers on the accelerator). A counter, not a flag, so an older
+        # loader finishing can never clear a newer loader's busy state.
+        # Guarded by _audio_lifecycle_lock.
+        self._loading = 0
         self.whisper = None  # Lazy-loaded
         self.is_recording = False
         self._model_ready = threading.Event()
@@ -1590,20 +1598,47 @@ class DictationApp:
 
     def _start_loader(self):
         """Spawn the load thread, marking the engine busy before it starts so
-        stop_if_idle() can never miss a load that is about to begin."""
+        stop_if_idle() can never miss a load that is about to begin.
+
+        The reservation taken here is released by the new thread only after
+        _load_model_background returns, so it covers the whole load even when
+        a caller (e.g. a synchronous ERROR callback that falls back to GPU)
+        starts the next loader before the previous one has returned.
+        """
         with self._audio_lifecycle_lock:
             if self._stopping.is_set():
                 return
-            self._loading = True
-        threading.Thread(target=self._load_model_background, daemon=True).start()
+            self._loading += 1
+
+        def run():
+            try:
+                self._load_model_background()
+            finally:
+                self._release_loading()
+
+        try:
+            threading.Thread(target=run, daemon=True).start()
+        except BaseException:
+            # The thread never ran, so its finally never will: undo here.
+            self._release_loading()
+            raise
+
+    def _release_loading(self):
+        with self._audio_lifecycle_lock:
+            self._loading -= 1
 
     def _load_model_background(self):
-        """Load model in background thread, setting _model_ready when done."""
+        """Load model in background thread, setting _model_ready when done.
+
+        Holds its own loading reservation, so direct callers (CLI ``run()``,
+        tests) are also reported busy while it runs.
+        """
+        with self._audio_lifecycle_lock:
+            self._loading += 1
         try:
             self._load_model_background_inner()
         finally:
-            with self._audio_lifecycle_lock:
-                self._loading = False
+            self._release_loading()
 
     def _load_model_background_inner(self):
         if self._stopping.is_set():
@@ -1663,7 +1698,11 @@ class DictationApp:
                     return
                 self.recorder.wait_ready()
                 self._model_ready.set()
-                self._set_state(AppState.READY)
+            # Notify outside the lock: a READY callback may call stop(),
+            # busy_reason() or stop_if_idle() (or wait on a thread that does),
+            # all of which take _audio_lifecycle_lock. _set_state re-checks
+            # _stopping, so a stop that lands here suppresses READY.
+            self._set_state(AppState.READY)
             log("Ready! Waiting for hotkey...")
         except Exception as e:
             import traceback

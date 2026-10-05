@@ -52,7 +52,15 @@ model (see README, "GPU failed: restart required"). A recording that hits
 `max_record_seconds` is kept and transcribed once. Text is never pasted after
 the engine has stopped (Quit or a Settings rebuild), and a Settings change
 that rebuilds the engine is refused, with a message, while a recording,
-transcription or model load is in flight.
+transcription or model load is in flight. That includes the GPU reload that
+follows an NPU device loss: loads are counted, so an earlier load finishing
+cannot mark a later one as idle.
+
+Known limitations: device failures are recognised from OpenVINO error text, so
+a fatal error worded differently from the known markers is treated as an
+ordinary error. A driver call that hangs keeps the engine busy (and Settings
+rebuilds refused) until you quit and restart the app. The latched failure keeps
+the original exception in memory for the rest of the process.
 
 Automated tests use simulated streams to check sample continuity, variable block
 sizes, chime reuse, readiness failures, telemetry, and cleanup. They do not
