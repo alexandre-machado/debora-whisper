@@ -35,6 +35,7 @@ class FakeGenAI:
         self.generate_error = generate_error
         self.load_errors = dict(load_errors or {})
         self.loads = []
+        self.load_kwargs = []
         self.generate_calls = 0
         self.on_generate = None  # test hook to pause inside inference
         fake = self
@@ -42,6 +43,7 @@ class FakeGenAI:
         class WhisperPipeline:
             def __init__(self, path, device, **kwargs):
                 fake.loads.append(device)
+                fake.load_kwargs.append(kwargs)
                 if device in fake.load_errors:
                     raise RuntimeError(fake.load_errors[device])
 
@@ -515,6 +517,109 @@ def test_npu_device_lost_falls_back_to_gpu_and_schedules_npu_recovery(genai):
     recovery.assert_called_once()
     assert de.device_failure() is None
     gui._alert_error.assert_not_called()
+
+
+def _probe_gui(genai):
+    genai.generate_error = None
+    app = _engine({"device": "CUDA"})
+    gui = _gui(app)
+    return app, gui
+
+
+def test_npu_recovery_probe_rejects_silent_cpu_fallback(genai):
+    # Real log: the lost NPU's quarantined model keeps the cache blob open,
+    # the probe's NPU compile fails benignly and WhisperNPU lands on CPU.
+    genai.load_errors = {"NPU": "remove: The process cannot access the file "
+                                "because it is being used by another process."}
+    app, gui = _probe_gui(genai)
+
+    with patch.object(app, "inject_recovered_model") as inject, \
+         patch.object(gui, "_schedule_npu_recovery") as recovery:
+        gui._run_npu_recovery_probe()
+
+    assert genai.loads == ["NPU", "CPU"]
+    inject.assert_not_called()
+    recovery.assert_called_once()
+    assert app.config["device"] == "CUDA"
+
+
+def test_npu_recovery_probe_swaps_when_npu_loads(genai):
+    app, gui = _probe_gui(genai)
+
+    with patch.object(app, "inject_recovered_model") as inject, \
+         patch.object(gui, "_schedule_npu_recovery") as recovery:
+        gui._run_npu_recovery_probe()
+
+    assert genai.loads == ["NPU"]
+    inject.assert_called_once()
+    assert inject.call_args.args[0] == "NPU"
+    recovery.assert_not_called()
+    # The quarantined model holds the shared cache blob open.
+    assert "CACHE_DIR" not in genai.load_kwargs[0]
+
+
+class QueuedRoot(Root):
+    """Tk root whose after() callbacks run only when the test says so."""
+
+    def __init__(self):
+        self.pending = []
+
+    def after(self, delay, fn, *args):
+        self.pending.append((delay, fn, args))
+        return "after-id"
+
+    def run_pending(self):
+        pending, self.pending = self.pending, []
+        for _delay, fn, args in pending:
+            fn(*args)
+
+
+def test_recovered_npu_swap_retries_until_engine_is_idle(genai):
+    app, gui = _probe_gui(genai)
+    gui._root = QueuedRoot()
+    recovered = object()
+
+    with patch.object(app, "inject_recovered_model", side_effect=[False, True]) as inject:
+        gui._swap_to_recovered_npu(app, recovered)
+        assert app.config["device"] == "CUDA"
+        assert [d for d, _, _ in gui._root.pending] == [gui.SWAP_RETRY_MS]
+
+        gui._root.run_pending()
+
+    assert inject.call_count == 2
+    assert app.config["device"] == "NPU"
+    assert gui._root.pending == []
+
+
+def test_recovered_npu_swap_dropped_after_engine_rebuild(genai):
+    app, gui = _probe_gui(genai)
+    gui._engine = _engine({"device": "CUDA"})
+
+    with patch.object(app, "inject_recovered_model") as inject:
+        gui._swap_to_recovered_npu(app, object())
+
+    inject.assert_not_called()
+
+
+def test_continuous_listening_swap_not_blocked_by_open_microphone():
+    app = _engine({"device": "CUDA", "continuous_listening": True})
+    app.is_recording = True
+
+    app._transcribing = True
+    assert app.inject_recovered_model("NPU", object()) is False
+
+    app._transcribing = False
+    recovered = object()
+    assert app.inject_recovered_model("NPU", recovered) is True
+    assert app.whisper is recovered
+    assert app.config["device"] == "NPU"
+
+
+def test_push_to_talk_swap_waits_for_recording_to_end():
+    app = _engine({"device": "CUDA"})
+    app.is_recording = True
+
+    assert app.inject_recovered_model("NPU", object()) is False
 
 
 def test_classification_uses_backend_devices_not_config():

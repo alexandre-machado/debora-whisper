@@ -269,19 +269,35 @@ class GUIApp:
             probe_config["device"] = "NPU"
             model_path = setup_model(probe_config)
             
-            test_model = create_model(model_path, device="NPU", backend=model_info["backend"], model_size=self._config["model_size"])
-            
+            # Uncached: the quarantined model still holds the ov-cache blob.
+            test_model = create_model(model_path, device="NPU", backend=model_info["backend"],
+                                      model_size=self._config["model_size"], use_cache=False)
+            # Loaders fall back silently on benign errors (e.g. a locked
+            # ov-cache blob), so a successful load is not proof of recovery.
+            if test_model.device != "NPU":
+                raise RuntimeError(f"probe model loaded on {test_model.device}, not NPU")
+
             silence = np.zeros(int(self._config["sample_rate"] * 0.5), dtype=np.float32)
             test_model.transcribe(silence, sample_rate=self._config["sample_rate"], language=self._config.get("language", "en"))
             
             log("NPU recovery successful! Swapping active engine back to NPU seamlessly...")
-            self._root.after(0, lambda: self._swap_to_recovered_npu(test_model))
-            
+            engine = self._engine
+            self._root.after(0, lambda: self._swap_to_recovered_npu(engine, test_model))
+
         except Exception as e:
             log(f"Background NPU recovery probe failed: {e}")
             self._schedule_npu_recovery()
 
-    def _swap_to_recovered_npu(self, test_model):
+    SWAP_RETRY_MS = 5000
+
+    def _swap_to_recovered_npu(self, engine, test_model):
+        if self._engine is not engine:
+            # Settings rebuilt the engine meanwhile; it chose its own device.
+            return
+        if not engine.inject_recovered_model("NPU", test_model):
+            self._root.after(self.SWAP_RETRY_MS,
+                             lambda: self._swap_to_recovered_npu(engine, test_model))
+            return
         self._config["device"] = "NPU"
         self._tray.update_info(
             device="NPU",
@@ -289,7 +305,6 @@ class GUIApp:
             hotkey=self._config["hotkey"],
         )
         self._npu_retry_count = 0
-        self._engine.inject_recovered_model("NPU", test_model)
 
     def _show_restart_required(self, data: dict):
         """Tell the user, once, that only an app restart recovers the device."""

@@ -31,6 +31,19 @@ LOG_FILE = LOG_DIR / "app.log"
 TELEMETRY_LOG = LOG_DIR / "telemetry.log"
 CACHE_DIR = CONFIG_DIR / "ov-cache"
 
+
+def ov_cache_config(use_cache: bool = True) -> dict:
+    """OpenVINO compile properties for the shared model cache.
+
+    use_cache=False compiles without it: a model quarantined on a lost NPU
+    keeps its cache blob open, so a recovery probe in the same process
+    cannot reuse or rewrite that blob.
+    """
+    if not use_cache:
+        return {}
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return {"CACHE_DIR": str(CACHE_DIR)}
+
 DEFAULT_CONFIG = {
     "device": "NPU",           # NPU, GPU, CPU
     "model_size": "base",      # tiny, base, small, medium (large not supported on NPU)
@@ -542,9 +555,10 @@ class FasterWhisperCUDA:
 class WhisperNPU:
     """Whisper speech-to-text using OpenVINO on NPU/GPU/CPU."""
 
-    def __init__(self, model_path: Path, device: str = "NPU"):
+    def __init__(self, model_path: Path, device: str = "NPU", use_cache: bool = True):
         self.model_path = model_path
         self.device = device
+        self.use_cache = use_cache
         self.pipeline = None
         self._load_pipeline()
 
@@ -567,10 +581,9 @@ class WhisperNPU:
         try:
             import openvino_genai as ov_genai
             import openvino as ov
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
             self.pipeline = ov_genai.WhisperPipeline(
                 str(self.model_path), self.device,
-                CACHE_DIR=str(CACHE_DIR)
+                **ov_cache_config(self.use_cache)
             )
             try:
                 hw_name = ov.Core().get_property(self.device, "FULL_DEVICE_NAME")
@@ -685,9 +698,11 @@ class ParakeetNPU:
     LSTM_DIM = 640
     DECODE_SPACE = re.compile(r"\A\s|\s\B|(\s)\b")
 
-    def __init__(self, model_path: Path, device: str = "NPU", latency_override: bool = None):
+    def __init__(self, model_path: Path, device: str = "NPU", latency_override: bool = None,
+                 use_cache: bool = True):
         self.model_path = model_path
         self.device = device
+        self.use_cache = use_cache
         # Measurable, opt-in lever from issue #3: sets
         # ov::intel_npu::compilation_mode_params with
         # performance-hint-override="latency" (NPU's default for that
@@ -881,14 +896,12 @@ class ParakeetNPU:
 
             encoder_path = self.model_path / "encoder-model.onnx"
 
-            compile_config = {"CACHE_DIR": str(CACHE_DIR)}
+            compile_config = ov_cache_config(self.use_cache)
             if self.latency_override:
                 # UNMEASURED lever (issue #3): NPU's default for this
                 # sub-property is "efficiency". Opt-in only; do not assume
                 # this helps or hurts until the harness reports a number.
                 compile_config["NPU_COMPILATION_MODE_PARAMS"] = "performance-hint-override=latency"
-
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
             def _fallback_compile(bucket, model_to_compile, cfg, first_exc):
                 """NPU/GPU -> CPU device-fallback chain, shared by every
@@ -926,7 +939,7 @@ class ParakeetNPU:
                         raise DeviceFailureError(failed, fallback_exc) from fallback_exc
                     log(f"  Encoder bucket {bucket} failed on {fallback}: {fallback_exc}")
                     log(f"  Falling back to CPU...")
-                    c = core.compile_model(model_to_compile, "CPU", {"CACHE_DIR": str(CACHE_DIR)})
+                    c = core.compile_model(model_to_compile, "CPU", ov_cache_config(self.use_cache))
                     self.device = "CPU"
                     return c
 
@@ -982,7 +995,7 @@ class ParakeetNPU:
             })
             try:
                 self.dec_compiled = core.compile_model(
-                    decoder_model, "GPU", {"CACHE_DIR": str(CACHE_DIR)}
+                    decoder_model, "GPU", ov_cache_config(self.use_cache)
                 )
                 log(f"  Decoder compiled on GPU")
             except Exception as e:
@@ -1163,7 +1176,8 @@ class ParakeetNPU:
         return text
 
 
-def create_model(model_path: Path, device: str, backend: str, model_size: str = None):
+def create_model(model_path: Path, device: str, backend: str, model_size: str = None,
+                 use_cache: bool = True):
     """Factory function to create the right model class based on backend.
 
     Args:
@@ -1171,6 +1185,7 @@ def create_model(model_path: Path, device: str, backend: str, model_size: str = 
         device: Device string (NPU, GPU, CPU, CUDA).
         backend: "whisper" or "parakeet" from MODEL_REGISTRY.
         model_size: Size of the model (e.g. "turbo"), required for CUDA.
+        use_cache: Use the shared OpenVINO cache (see ov_cache_config).
 
     Returns:
         WhisperNPU, ParakeetNPU, or FasterWhisperCUDA instance.
@@ -1183,8 +1198,8 @@ def create_model(model_path: Path, device: str, backend: str, model_size: str = 
         return FasterWhisperCUDA(model_size, device="cuda")
         
     if backend == "parakeet":
-        return ParakeetNPU(model_path, device=device)
-    return WhisperNPU(model_path, device=device)
+        return ParakeetNPU(model_path, device=device, use_cache=use_cache)
+    return WhisperNPU(model_path, device=device, use_cache=use_cache)
 
 
 # ---------------------------------------------------------------------------
@@ -2200,9 +2215,18 @@ class DictationApp:
         Returns False (nothing changed) while a recording, transcription or
         model load is in flight; the caller may retry later. The replaced
         model is a healthy fallback and is released normally.
+
+        In continuous mode the engine records for its whole lifetime, so an
+        open microphone does not block the swap: segments only reach the
+        model through _finish_recording, which sets _transcribing and takes
+        _model_lock like the swap does.
         """
         with self._audio_lifecycle_lock:
             busy = self._busy_reason_locked()
+            if busy == "recording" and self.config.get("continuous_listening", False):
+                # Recording is reported first; look past it.
+                busy = ("transcription" if self._transcribing
+                        else "model loading" if self._loading else None)
             if busy or self._stopping.is_set():
                 log(f"Deferring swap to {new_device}: {busy or 'engine stopping'}")
                 return False
