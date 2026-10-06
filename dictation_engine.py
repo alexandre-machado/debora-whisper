@@ -2381,7 +2381,11 @@ class DictationApp:
                         self._set_state(AppState.READY)
                 return
 
-            if is_final:
+            # Continuous mode transcribes all the time while the microphone
+            # stays open: keep showing RECORDING (live waveform and draft)
+            # instead of a "Transcribing..." balloon per sentence.
+            continuous = self.config.get("continuous_listening", False) and self.is_recording
+            if is_final and not continuous:
                 self._set_state(AppState.PROCESSING)
 
             try:
@@ -2461,11 +2465,10 @@ class DictationApp:
                             self._draft_target = target
 
                     if is_final:
-                        if self.config.get("continuous_listening", False):
-                            # Still dispatch READY with text so UI shows it,
-                            # but then quickly revert to RECORDING.
-                            # Wait, we can let App.py handle the visual transition back to recording
-                            self._set_state(AppState.READY, {"text": text})
+                        if continuous:
+                            # The text is already typed; no "Done" balloon
+                            # per sentence while the microphone stays open.
+                            self._set_state(AppState.RECORDING, {"draft_text": ""})
                         else:
                             self._set_state(AppState.READY, {"text": text})
                         self.last_draft_text = ""

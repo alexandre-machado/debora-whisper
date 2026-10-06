@@ -172,6 +172,29 @@ def test_same_input_target():
     assert not de.same_input_target(None, (1, 2))
 
 
+def test_continuous_final_shows_neither_transcribing_nor_done(screen):
+    app = _app()
+    app.is_recording = True
+    states = []
+    app.add_callback(lambda state, data: states.append(state))
+
+    _say(app, "Frase completa.", is_final=True)
+
+    assert AppState.PROCESSING not in states
+    # No "Done" balloon either: straight back to listening.
+    assert states == [AppState.RECORDING]
+
+
+def test_push_to_talk_final_still_shows_transcribing_and_done(screen):
+    app = _app(continuous_listening=False)
+    states = []
+    app.add_callback(lambda state, data: states.append(state))
+
+    _say(app, "Frase completa.", is_final=True)
+
+    assert states == [AppState.PROCESSING, AppState.READY]
+
+
 def test_unicode_typing_sends_utf16_units(monkeypatch):
     import ctypes
     units = []
