@@ -1746,20 +1746,19 @@ class DictationApp:
         if kind is None:
             return {"error": str(exc)}
         cause = f"{type(exc).__name__}: {exc}"
-        if kind == "NPU":
-            return {"error": str(exc), "device_lost": True,
-                    "device_failure": "NPU", "cause": cause}
-        failure = device_failure() if kind == "LATCHED" else record_device_failure(kind, exc)
-        # Never call into the failed model again from this engine.
-        self._load_error = failure["message"]
-        self._model_ready.set()
-        log(failure["message"])
-        return {
-            "error": failure["message"],
-            "restart_required": True,
-            "device_failure": failure["device"],
-            "cause": cause,
-        }
+        if kind == "LATCHED":
+            failure = device_failure()
+            self._load_error = failure["message"]
+            self._model_ready.set()
+            return {
+                "error": failure["message"],
+                "restart_required": True,
+                "device_failure": failure["device"],
+                "cause": cause,
+            }
+            
+        return {"error": str(exc), "device_lost": True,
+                "device_failure": kind, "cause": cause}
 
     def _start_loader(self):
         """Spawn the load thread, marking the engine busy before it starts so
@@ -1898,6 +1897,18 @@ class DictationApp:
         self.config["device"] = new_device
         self._start_loader()
 
+    def inject_recovered_model(self, new_device: str, new_whisper):
+        """Seamlessly hot-swap the active model with a recovered one."""
+        with self._audio_lifecycle_lock:
+            log(f"Seamlessly swapping active engine to {new_device}")
+            self.config["device"] = new_device
+            self.whisper = new_whisper
+            self._load_error = None
+            self._model_ready.set()
+            if self._state in (AppState.ERROR, AppState.LOADING):
+                self._set_state(AppState.READY)
+
+
     # -- Input device enumeration ----------------------------------------
 
     @staticmethod
@@ -1939,6 +1950,8 @@ class DictationApp:
             self._set_state(AppState.PROCESSING)
 
             try:
+                log("Waiting for model to be ready before transcription...")
+                self._model_ready.wait()
                 ensure_devices_usable()
                 self.ensure_model()
                 text = self.whisper.transcribe(
@@ -2006,11 +2019,7 @@ class DictationApp:
             t_thread_start = time.perf_counter()
             log(f"[Telemetry] Thread _do_start spawned in {t_thread_start - press_perf:.3f}s after key press")
 
-            if not self._model_ready.is_set():
-                log("Model still loading, please wait...")
-                if self.config["beep_on_start"]:
-                    self.chimes.play('warning')
-                return
+
 
             failure = device_failure()
             if failure:
@@ -2029,7 +2038,12 @@ class DictationApp:
                 with self._audio_lifecycle_lock:
                     if self._stopping.is_set() or self._transcribing:
                         return
-                    self.recorder.wait_ready(timeout=0)
+                    try:
+                        self.recorder.wait_ready(timeout=0)
+                    except Exception as e:
+                        log(f"Audio stream not ready ({e}), attempting recovery...")
+                        self.recorder.close()
+                        self.recorder.warmup(timeout=3.0)
                     self.recorder.start()
                     self.is_recording = True
             except Exception as exc:

@@ -255,6 +255,7 @@ def test_timeout_transcribes_captured_audio_once(audio_backend, monkeypatch):
     speech = np.linspace(-0.1, 0.1, 8000, dtype=np.float32)
     app.recorder._stream.feed(speech)
     generation = app.recorder._recording_generation
+    app._model_ready.set()
     app.recorder._timeout_stop(generation)
     app.recorder._timeout_stop(generation)
     app._finish_recording()

@@ -61,6 +61,7 @@ class GUIApp:
             on_quit=self._quit,
             on_settings=self._show_settings,
             on_history=self._show_history,
+            on_hardware_event=self._on_hardware_event,
             device=config["device"],
             model=config["model_size"],
             hotkey=config["hotkey"],
@@ -126,6 +127,23 @@ class GUIApp:
 
     # -- State callback (fires from bg threads) ----------------------------
 
+    def _on_hardware_event(self):
+        """Called by the tray manager when the PC wakes up or a device changes."""
+        import threading
+        from utils.logger import log
+
+        def recover():
+            try:
+                # Only warmup if not currently recording
+                if not self._engine.is_recording and self._engine._state != AppState.ERROR:
+                    log("Hardware change detected. Proactively warming up audio stream...")
+                    self._engine.recorder.close()
+                    self._engine.recorder.warmup(timeout=3.0)
+            except Exception as e:
+                log(f"Failed to proactively warmup audio: {e}")
+
+        threading.Thread(target=recover, daemon=True).start()
+
     def _on_state_change(self, state: AppState, data: dict):
         """Engine state changed — schedule UI update on main thread."""
         self._root.after(0, self._update_ui, state, data)
@@ -174,13 +192,25 @@ class GUIApp:
             self._tray.update_state(state_name, f"NPU Dictation — Error: {error_msg[:60]}")
             self._settings_status(f"Error: {error_msg[:40]}", "#FF453A")
 
-            # An NPU-only device loss may move to the GPU/CUDA, which has not failed.
-            if data.get("device_lost") and data.get("device_failure") == "NPU":
-                fallback_dev = "GPU"
-                from dictation_engine import has_nvidia_gpu
-                if has_nvidia_gpu():
-                    fallback_dev = "CUDA"
-                log(f"NPU DEVICE_LOST detected — falling back to {fallback_dev}")
+            if data.get("device_lost"):
+                failed_dev = data.get("device_failure")
+                
+                if failed_dev == "NPU":
+                    fallback_dev = "GPU"
+                    from dictation_engine import has_nvidia_gpu
+                    if has_nvidia_gpu():
+                        fallback_dev = "CUDA"
+                        
+                    # Schedule an invisible background recovery probe for NPU
+                    self._schedule_npu_recovery()
+                else:
+                    # GPU or CUDA failed, fallback to NPU immediately
+                    fallback_dev = "NPU"
+                    # Reset NPU retry counter since we are switching back
+                    if hasattr(self, "_npu_retry_count"):
+                        self._npu_retry_count = 0
+                    
+                log(f"{failed_dev} DEVICE_LOST detected — falling back to {fallback_dev} immediately")
                 self._config["device"] = fallback_dev
                 self._tray.update_info(
                     device=fallback_dev,
@@ -188,6 +218,66 @@ class GUIApp:
                     hotkey=self._config["hotkey"],
                 )
                 self._engine.fallback_device(fallback_dev)
+
+    def _schedule_npu_recovery(self):
+        if not hasattr(self, "_npu_retry_count"):
+            self._npu_retry_count = 0
+            
+        if self._npu_retry_count == 0:
+            delay = 30000
+        elif self._npu_retry_count == 1:
+            delay = 60000
+        else:
+            from utils.logger import log
+            log("NPU recovery retries exhausted. Staying on fallback device.")
+            return
+            
+        self._npu_retry_count += 1
+        from utils.logger import log
+        log(f"Scheduling background NPU recovery probe in {delay//1000}s (Attempt {self._npu_retry_count}/2)...")
+        
+        def _probe_thread():
+            import time
+            time.sleep(delay / 1000.0)
+            self._run_npu_recovery_probe()
+            
+        import threading
+        threading.Thread(target=_probe_thread, daemon=True).start()
+
+    def _run_npu_recovery_probe(self):
+        from dictation_engine import setup_model, create_model, MODEL_REGISTRY
+        from utils.logger import log
+        import numpy as np
+        
+        if self._engine.config["device"] == "NPU":
+            return
+            
+        log("Probing NPU recovery in background...")
+        try:
+            model_info = MODEL_REGISTRY[self._config["model_size"]]
+            model_path = setup_model(self._config)
+            
+            test_model = create_model(model_path, device="NPU", backend=model_info["backend"], model_size=self._config["model_size"])
+            
+            silence = np.zeros(int(self._config["sample_rate"] * 0.5), dtype=np.float32)
+            test_model.transcribe(silence, sample_rate=self._config["sample_rate"], language=self._config.get("language", "en"))
+            
+            log("NPU recovery successful! Swapping active engine back to NPU seamlessly...")
+            self._root.after(0, lambda: self._swap_to_recovered_npu(test_model))
+            
+        except Exception as e:
+            log(f"Background NPU recovery probe failed: {e}")
+            self._schedule_npu_recovery()
+
+    def _swap_to_recovered_npu(self, test_model):
+        self._config["device"] = "NPU"
+        self._tray.update_info(
+            device="NPU",
+            model=self._config["model_size"],
+            hotkey=self._config["hotkey"],
+        )
+        self._npu_retry_count = 0
+        self._engine.inject_recovered_model("NPU", test_model)
 
     def _show_restart_required(self, data: dict):
         """Tell the user, once, that only an app restart recovers the device."""

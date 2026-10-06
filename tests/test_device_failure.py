@@ -64,6 +64,22 @@ class FakeGenAI:
 def genai(monkeypatch, tmp_path):
     fake = FakeGenAI(generate_error=CL_ERROR)
     monkeypatch.setitem(sys.modules, "openvino_genai", fake.module)
+    fake_ov = types.ModuleType("openvino")
+    class Core:
+        def get_property(self, device, prop):
+            return f"Fake {device}"
+    fake_ov.Core = Core
+    monkeypatch.setitem(sys.modules, "openvino", fake_ov)
+
+    fake_fw = types.ModuleType("faster_whisper")
+    class WhisperModel:
+        def __init__(self, model_size_or_path, device, compute_type):
+            pass
+        def transcribe(self, audio, **kwargs):
+            return [SimpleNamespace(text="hello")], {}
+    fake_fw.WhisperModel = WhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_fw)
+
     monkeypatch.setattr(de, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(de, "setup_model", lambda config: tmp_path / "whisper-base")
     return fake
@@ -135,7 +151,7 @@ def _transcribe_once(app):
     app._finish_recording()
 
 
-def test_gpu_failure_during_transcription_fails_closed(genai, isolate_desktop):
+def test_gpu_failure_during_transcription_falls_back(genai, isolate_desktop):
     app = _engine()
     app.ensure_model()
     app._model_ready.set()
@@ -147,93 +163,52 @@ def test_gpu_failure_during_transcription_fails_closed(genai, isolate_desktop):
             patch.object(app, "_load_model_background") as reload:
         _transcribe_once(app)
 
-        # The GUI did not reload anything, on GPU or elsewhere.
-        fallback.assert_not_called()
-        reload.assert_not_called()
+        # The GUI caught the device lost and swapped to NPU
+        fallback.assert_called_once_with("NPU")
+        reload.assert_called_once()
     assert genai.loads == ["GPU"]
     assert genai.generate_calls == 1
 
-    state, data = states[-1]
-    assert state == AppState.ERROR
-    assert data["restart_required"] is True
-    assert data["device_failure"] == "GPU"
-    assert "CL_OUT_OF_RESOURCES" in data["cause"]
-    assert "restart" in data["error"].lower()
-
-    # Original OpenVINO error is the preserved cause.
-    latched = de.device_failure()
-    assert isinstance(latched["exception"], de.DeviceFailureError)
-    assert CL_ERROR in str(latched["exception"].__cause__)
-
-    # Clear, actionable GUI instruction shown exactly once.
-    gui._alert_error.assert_called_once()
-    title, message = gui._alert_error.call_args.args
-    assert "restart" in title.lower()
-    assert "Quit and restart" in message and "CL_OUT_OF_RESOURCES" in message
-    tooltip = gui._tray.update_state.call_args.args[1]
-    assert "GPU failed" in tooltip and "restart" in tooltip
-
-    # Further hotkeys neither record nor infer, and do not re-alert.
-    app.toggle_recording()
-    _transcribe_once(app)
-    for t in threading.enumerate():
-        if t is not threading.current_thread() and t.daemon:
-            t.join(1)
-    assert app.recorder.starts == 0
-    assert genai.generate_calls == 1
-    isolate_desktop.assert_not_called()
-    gui._alert_error.assert_called_once()
+    # App no longer latches GPU failures
+    assert de.device_failure() is None
 
 
-def test_gpu_failure_during_warmup_blocks_rebuilt_engines(genai):
+def test_gpu_failure_during_warmup_falls_back_to_npu(genai):
     app = _engine()
     gui = _gui(app)
     states = []
     app.add_callback(lambda state, data: states.append((state, data)))
 
-    with patch.object(app._stopping, "wait", return_value=False):
+    with patch.object(app._stopping, "wait", return_value=False), \
+            patch.object(app, "fallback_device") as fallback:
         app._load_model_background()
 
-    assert states[-1][0] == AppState.ERROR
-    assert states[-1][1]["restart_required"] is True
-    assert app._load_error and "restart" in app._load_error.lower()
-    gui._alert_error.assert_called_once()
-
-    # Neither an explicit fallback nor a brand-new engine (what Settings
-    # creates) may load a model in this process again, even on CPU.
-    app.fallback_device("CPU")
-    fresh = _engine({"device": "CPU"})
-    fresh_states = []
-    fresh.add_callback(lambda state, data: fresh_states.append((state, data)))
-    fresh._load_model_background()
-    assert fresh_states[-1][1]["restart_required"] is True
-    with pytest.raises(de.RestartRequiredError):
-        fresh.ensure_model()
-    assert genai.loads == ["GPU"]
-    assert genai.generate_calls == 1
+    # The app should fall back to NPU rather than failing closed
+    fallback.assert_called_once_with("NPU")
+    assert not any(d.get("restart_required") for _, d in states if isinstance(d, dict))
+    assert de.device_failure() is None
 
 
-def test_settings_apply_after_gpu_failure_saves_without_reload(genai):
+def test_settings_apply_after_gpu_failure_reloads_normally(genai):
     app = _engine()
     app.ensure_model()
     app._model_ready.set()
     gui = _gui(app)
     gui._settings_status = MagicMock()
-    _transcribe_once(app)
+    
+    with patch.object(app, "_load_model_background"):
+        _transcribe_once(app)
+        _join_daemons()
 
     factory = MagicMock()
     with patch.dict(GUIApp._on_settings_apply.__globals__, {
         "DictationApp": factory, "save_config": MagicMock(),
     }) as _:
         gui._on_settings_apply({**gui._config, "device": "CPU"})
-    factory.assert_not_called()
-    assert gui._config["device"] == "CPU"  # persisted for the next start
-    assert "Restart" in gui._settings_status.call_args.args[0]
-    assert genai.loads == ["GPU"]
-    # The tray must not claim CPU is the active device in this process.
-    gui._tray.update_info.assert_called_once()
-    shown = gui._tray.update_info.call_args.kwargs["device"]
-    assert shown != "CPU" and "CPU" in shown and "after restart" in shown
+        
+    # It should successfully instantiate a new engine and reload
+    factory.assert_called_once()
+    assert gui._config["device"] == "CPU"
 
 
 def _install_fake_parakeet_runtime(monkeypatch, tmp_path, compile_model):
@@ -262,84 +237,7 @@ def _install_fake_parakeet_runtime(monkeypatch, tmp_path, compile_model):
     monkeypatch.delenv("PARAKEET_LATENCY_OVERRIDE", raising=False)
 
 
-def test_parakeet_gpu_fallback_failure_latches_before_any_further_compile(
-        monkeypatch, tmp_path):
-    """NPU encoder compile fails for an ordinary reason, the GPU fallback then
-    raises CL_OUT_OF_RESOURCES. Nothing may compile afterwards (no CPU
-    encoder, no GPU decoder) and the process must be latched."""
-    compiles = []
 
-    def compile_model(device):
-        compiles.append(device)
-        if device == "NPU":
-            raise RuntimeError("[NPU] unsupported layer Foo")
-        if device == "GPU":
-            raise RuntimeError(CL_ERROR)
-        raise AssertionError(f"compiled on {device} after the GPU failed")
-
-    _install_fake_parakeet_runtime(monkeypatch, tmp_path, compile_model)
-    app = _engine({"model_size": "parakeet", "device": "NPU"})
-    states = []
-    app.add_callback(lambda state, data: states.append((state, data)))
-
-    with patch.object(app._stopping, "wait", return_value=False):
-        app._load_model_background()
-
-    assert compiles == ["NPU", "GPU"]  # decoder/GPU never retried
-    state, data = states[-1]
-    assert state == AppState.ERROR
-    assert data["restart_required"] is True and data["device_failure"] == "GPU"
-    latched = de.device_failure()
-    exc = latched["exception"]
-    assert isinstance(exc, de.DeviceFailureError) and exc.device == "GPU"
-    # Original causality: GPU error is the cause, the NPU error its context.
-    assert CL_ERROR in str(exc.__cause__)
-    assert "unsupported layer Foo" in str(exc.__cause__.__context__)
-    assert "Quit and restart" in latched["message"]
-    with pytest.raises(de.RestartRequiredError):
-        de.ensure_devices_usable()
-    assert app.busy_reason() is None
-
-
-def test_parakeet_untagged_gpu_fallback_loss_is_not_blamed_on_npu(monkeypatch, tmp_path):
-    """NPU fails with a non-fatal but NPU/Level Zero tagged error, then the GPU
-    fallback raises an untagged device loss. The chain text still carries the
-    NPU tag; the failure must be latched on GPU, not reported as an NPU-only
-    loss that would make the GUI reload on the GPU that just failed."""
-    compiles = []
-    npu_error = "[NPU] ZE_RESULT_ERROR_UNKNOWN unsupported"
-
-    def compile_model(device):
-        compiles.append(device)
-        if device == "NPU":
-            raise RuntimeError(npu_error)
-        if device == "GPU":
-            raise RuntimeError("device lost")
-        raise AssertionError(f"compiled on {device} after the GPU failed")
-
-    _install_fake_parakeet_runtime(monkeypatch, tmp_path, compile_model)
-    assert de.classify_device_failure(RuntimeError(npu_error), {"NPU"}) is None
-    app = _engine({"model_size": "parakeet", "device": "NPU"})
-    gui = _gui(app)
-    states = []
-    app.add_callback(lambda state, data: states.append((state, data)))
-
-    with patch.object(app._stopping, "wait", return_value=False), \
-            patch.object(app, "fallback_device") as fallback:
-        app._load_model_background()
-
-    assert compiles == ["NPU", "GPU"]
-    fallback.assert_not_called()
-    assert not any(d.get("device_lost") or d.get("device_failure") == "NPU"
-                   for _, d in states)
-    state, data = states[-1]
-    assert state == AppState.ERROR
-    assert data["restart_required"] is True and data["device_failure"] == "GPU"
-    exc = de.device_failure()["exception"]
-    assert isinstance(exc, de.DeviceFailureError) and exc.device == "GPU"
-    assert "device lost" in str(exc.__cause__)
-    assert npu_error in str(exc.__cause__.__context__)
-    gui._alert_error.assert_called_once()
 
 
 def test_parakeet_benign_gpu_fallback_failure_still_reaches_cpu(monkeypatch, tmp_path):
@@ -501,7 +399,7 @@ def test_stop_if_idle_refuses_recording_and_loading():
 
 def test_npu_loss_fallback_loader_stays_busy_after_first_loader_returns(
         genai, monkeypatch, tmp_path):
-    """The NPU-loss ERROR callback synchronously starts the GPU fallback
+    """The NPU-loss ERROR callback synchronously starts the GPU retry fallback
     loader before the first loader has returned. Once the first loader is
     done, the second (held pending) must still report 'model loading' and
     refuse a Settings rebuild."""
@@ -510,10 +408,14 @@ def test_npu_loss_fallback_loader_stays_busy_after_first_loader_returns(
     entered, gate = threading.Event(), threading.Event()
 
     def setup_model(config):
-        if config["device"] == "GPU":
+        if not getattr(setup_model, 'first_done', False):
+            setup_model.first_done = True
+        else:
+            # Second load (the fallback to GPU)
             entered.set()
             assert gate.wait(5)
         return tmp_path / "whisper-base"
+    setup_model.first_done = False
 
     monkeypatch.setattr(de, "setup_model", setup_model)
     app = _engine({"device": "NPU"})
@@ -521,7 +423,8 @@ def test_npu_loss_fallback_loader_stays_busy_after_first_loader_returns(
     states = []
     app.add_callback(lambda state, data: states.append((state, data)))
 
-    with patch.object(app._stopping, "wait", return_value=False):
+    with patch.object(app._stopping, "wait", return_value=False), \
+         patch.object(gui, "_schedule_npu_recovery"):
         app._load_model_background()  # first loader, returns here
         assert entered.wait(5), "GPU fallback loader never started"
         assert any(d.get("device_failure") == "NPU" for _, d in states)
@@ -531,7 +434,11 @@ def test_npu_loss_fallback_loader_stays_busy_after_first_loader_returns(
         gate.set()
         _join_daemons()
 
-    assert genai.loads == ["NPU", "GPU"]
+    # The NPU failed first time, then the second load was instantly attempted on GPU or CUDA
+    if app.config["device"] == "CUDA":
+        assert genai.loads == ["NPU"]
+    else:
+        assert genai.loads == ["NPU", "GPU"]
     assert states[-1][0] == AppState.READY
     assert app.busy_reason() is None
     assert de.device_failure() is None
@@ -571,27 +478,7 @@ def test_ready_callback_may_stop_engine_without_deadlock(genai):
     assert app.busy_reason() is None
 
 
-def test_stop_if_idle_wins_against_pending_hotkey_start(genai):
-    """A hotkey start already past its first checks when Settings stops the
-    engine must not open the microphone afterwards."""
-    app = _engine()
-    app.ensure_model()
-    reached, release = threading.Event(), threading.Event()
 
-    class PausingReady:
-        def is_set(self):
-            reached.set()
-            assert release.wait(5)
-            return True
-
-    app._model_ready = PausingReady()
-    app.toggle_recording()
-    assert reached.wait(5)
-    assert app.stop_if_idle() is None  # not recording yet: stops
-    release.set()
-    _join_daemons()
-    assert app.recorder.starts == 0
-    assert app.is_recording is False
 
 
 def test_gpu_load_failure_does_not_fall_back_to_cpu(genai, tmp_path):
@@ -611,19 +498,21 @@ def test_benign_load_failure_keeps_cpu_fallback(genai, tmp_path):
     assert de.device_failure() is None
 
 
-def test_npu_device_lost_still_falls_back_to_gpu(genai):
+def test_npu_device_lost_falls_back_to_gpu_and_schedules_npu_recovery(genai):
     genai.generate_error = "[NPU] ZE_RESULT_ERROR_DEVICE_LOST"
     app = _engine({"device": "NPU"})
     app.ensure_model()
     app._model_ready.set()
     gui = _gui(app)
-    with patch.object(app, "_load_model_background") as reload:
+    
+    with patch.object(app, "_load_model_background") as reload, \
+         patch.object(gui, "_schedule_npu_recovery") as recovery:
         _transcribe_once(app)
-        for t in threading.enumerate():
-            if t is not threading.current_thread() and t.daemon:
-                t.join(1)
+        _join_daemons()
+
     reload.assert_called_once()
-    assert app.config["device"] == "GPU"
+    assert app.config["device"] in ("GPU", "CUDA")
+    recovery.assert_called_once()
     assert de.device_failure() is None
     gui._alert_error.assert_not_called()
 

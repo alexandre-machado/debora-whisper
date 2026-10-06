@@ -8,12 +8,13 @@ from ui.icons import STATE_ICONS
 class TrayManager:
     """Manages the system tray icon and context menu."""
 
-    def __init__(self, on_toggle, on_quit, on_settings=None, on_history=None,
+    def __init__(self, on_toggle, on_quit, on_settings=None, on_history=None, on_hardware_event=None,
                  device="NPU", model="base", hotkey="ctrl+alt+d"):
         self._on_toggle = on_toggle
         self._on_quit = on_quit
         self._on_settings = on_settings
         self._on_history = on_history
+        self._on_hardware_event = on_hardware_event
         self._device = device
         self._model = model
         self._hotkey = hotkey
@@ -78,6 +79,27 @@ class TrayManager:
             title=self._tooltip,
             menu=self._build_menu(),
         )
+
+        import sys
+        if sys.platform == "win32" and hasattr(self._icon, "_message_handlers"):
+            WM_POWERBROADCAST = 0x021B
+            PBT_APMRESUMEAUTOMATIC = 0x0012
+            WM_DEVICECHANGE = 0x0219
+
+            def _on_power_broadcast(wparam, lparam):
+                if wparam == PBT_APMRESUMEAUTOMATIC and self._on_hardware_event:
+                    self._on_hardware_event()
+                return 1
+
+            def _on_device_change(wparam, lparam):
+                # 0x8000: DEVICEARRIVAL, 0x8004: DEVICEREMOVECOMPLETE, 0x0007: DEVNODES_CHANGED
+                if wparam in (0x8000, 0x8004, 0x0007) and self._on_hardware_event:
+                    self._on_hardware_event()
+                return 1
+
+            self._icon._message_handlers[WM_POWERBROADCAST] = _on_power_broadcast
+            self._icon._message_handlers[WM_DEVICECHANGE] = _on_device_change
+
         self._thread = threading.Thread(target=self._icon.run, daemon=True)
         self._thread.start()
 
