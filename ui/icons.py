@@ -85,8 +85,8 @@ def icon_ready() -> Image.Image:
 
 
 def icon_recording() -> Image.Image:
-    """App icon with red status dot — microphone active."""
-    return _app_icon_with_status("#EF4444")
+    """App icon with violet status dot — microphone active."""
+    return _app_icon_with_status("#8B5CF6")
 
 
 def icon_processing() -> Image.Image:

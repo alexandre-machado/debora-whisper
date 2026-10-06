@@ -1199,6 +1199,49 @@ def _log_audio_stream(sd, stream, direction):
         f"blocksize={stream.blocksize}")
 
 
+class NeuralVAD:
+    """Silero VAD ONNX wrapper for robust voice activity detection."""
+    def __init__(self, sample_rate=16000):
+        self.sample_rate = sample_rate
+        self.session = None
+        self.state = None
+        
+        import numpy as np
+        import onnxruntime as ort
+        
+        model_dir = MODEL_DIR / "silero_vad"
+        model_path = model_dir / "silero_vad.onnx"
+        
+        if not model_path.exists():
+            model_dir.mkdir(parents=True, exist_ok=True)
+            log("Downloading Silero VAD v5 ONNX model...")
+            import urllib.request
+            url = "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
+            urllib.request.urlretrieve(url, model_path)
+            log("Silero VAD downloaded.")
+            
+        self.session = ort.InferenceSession(str(model_path), providers=['CPUExecutionProvider'])
+        self.reset_state()
+
+    def reset_state(self):
+        import numpy as np
+        self.state = np.zeros((2, 1, 128), dtype=np.float32)
+
+    def process(self, audio_block):
+        import numpy as np
+        # audio_block should be (N,) float32
+        input_data = audio_block.reshape(1, -1).astype(np.float32)
+        sr = np.array(self.sample_rate, dtype=np.int64)
+        
+        out, state = self.session.run(None, {
+            'input': input_data,
+            'state': self.state,
+            'sr': sr
+        })
+        self.state = state
+        return float(out[0][0])
+
+
 class AudioRecorder:
     """Record audio from microphone using sounddevice. Supports PTT and VAD."""
 
@@ -1238,11 +1281,12 @@ class AudioRecorder:
         self.segment_queue = queue.Queue(maxsize=10)
         self._vad_thread = None
         self._stop_vad = False
+        self.neural_vad = None
         
         # VAD thresholds
-        self.energy_threshold = self.config.get("vad_energy_threshold", 0.005)
+        self.vad_threshold = self.config.get("vad_energy_threshold", 0.1) # Prob threshold for Silero
         self.min_speech_frames = int(sample_rate * self.config.get("vad_min_speech_seconds", 0.4))
-        self.end_silence_frames = int(sample_rate * self.config.get("vad_end_silence_seconds", 0.8))
+        self.end_silence_frames = int(sample_rate * self.config.get("vad_end_silence_seconds", 1.5))
         self.max_segment_frames = int(sample_rate * self.config.get("segment_max_seconds", 15))
         self.lookback_frames = int(sample_rate * self.config.get("vad_lookback_seconds", 0.5))
         self.trailing_frames = int(sample_rate * self.config.get("vad_trailing_seconds", 0.3))
@@ -1308,6 +1352,11 @@ class AudioRecorder:
             self.wait_ready(timeout)
             
             if self.continuous:
+                if self.neural_vad is None:
+                    try:
+                        self.neural_vad = NeuralVAD(sample_rate=self.sample_rate)
+                    except Exception as e:
+                        log(f"Failed to initialize Neural VAD: {e}")
                 self._stop_vad = False
                 self._vad_thread = threading.Thread(target=self._vad_loop, daemon=True)
                 self._vad_thread.start()
@@ -1356,11 +1405,17 @@ class AudioRecorder:
                     start_read_pos = self._read_pos
                     self._read_pos = self._write_pos
                     
-                block_size = int(self.sample_rate * 0.02)
+                # Silero VAD prefers 512 frames for 16kHz
+                block_size = 512
                 for i in range(0, len(new_data), block_size):
                     block = new_data[i:i+block_size]
-                    if len(block) == 0:
-                        continue
+                    if len(block) < block_size:
+                        # Put back leftover frames by winding back read_pos slightly
+                        # In practice, we could just ignore or buffer it, but it's easier to just rewind
+                        with self._lock:
+                            leftover = len(block)
+                            self._read_pos = (self._read_pos - leftover) % self.capacity
+                        break
                         
                     is_paused = getattr(self, "paused", False)
                     cut_segment = False
@@ -1372,13 +1427,43 @@ class AudioRecorder:
                                 log("VAD: Cutting segment due to pause.")
                             else:
                                 is_speaking = False
+                                if self.neural_vad: self.neural_vad.reset_state()
                         else:
                             continue
                     else:
-                        rms = float(np.sqrt(np.mean(block**2)))
+                        # Use Neural VAD if available, fallback to RMS
                         block_len = len(block)
+                        is_speech_now = False
                         
-                        if rms > self.energy_threshold:
+                        if self.neural_vad:
+                            # Apply DC blocker (zero mean) to prevent offset issues on bad mics
+                            block_zero_mean = block.flatten()
+                            block_zero_mean = block_zero_mean - np.mean(block_zero_mean)
+                            prob = self.neural_vad.process(block_zero_mean)
+                            
+                            # Calculate RMS for hybrid fallback
+                            rms = float(np.sqrt(np.mean(block_zero_mean**2)))
+                            
+                            # Log prob occasionally to debug mic issues
+                            if not hasattr(self, "_max_prob"): self._max_prob = 0.0
+                            if not hasattr(self, "_max_amp"): self._max_amp = 0.0
+                            if not hasattr(self, "_last_prob_log"): self._last_prob_log = time.time()
+                            self._max_prob = max(self._max_prob, prob)
+                            self._max_amp = max(self._max_amp, float(np.max(np.abs(block_zero_mean))))
+                            if time.time() - self._last_prob_log > 2.0:
+                                if self._max_prob > 0.01 or self._max_amp > 0.005: 
+                                    log(f"[VAD Debug] Max prob: {self._max_prob:.3f}, Max amp: {self._max_amp:.4f}, RMS: {rms:.4f}")
+                                self._max_prob = 0.0
+                                self._max_amp = 0.0
+                                self._last_prob_log = time.time()
+                                
+                            # Hybrid approach: trigger if neural says speech, OR if it's super loud (fallback for bad mic+offset combinations)
+                            is_speech_now = (prob > self.vad_threshold) or (rms > 0.01)
+                        else:
+                            rms = float(np.sqrt(np.mean(block**2)))
+                            is_speech_now = rms > self.config.get("vad_energy_threshold", 0.005)
+                        
+                        if is_speech_now:
                             if not is_speaking:
                                 is_speaking = True
                                 speech_start_pos = (start_read_pos + i - self.lookback_frames) % self.capacity
@@ -1419,6 +1504,7 @@ class AudioRecorder:
                             else:
                                 # Too short, discard
                                 is_speaking = False
+                                if self.neural_vad: self.neural_vad.reset_state()
                                 
                         elif is_speaking and speech_frames >= self.max_segment_frames:
                             # Forced cut
@@ -1427,6 +1513,7 @@ class AudioRecorder:
                             
                     if cut_segment:
                         is_speaking = False
+                        if self.neural_vad: self.neural_vad.reset_state()
                         # Extract segment
                         with self._lock:
                             end_pos = (start_read_pos + i + block_len + self.trailing_frames) % self.capacity
@@ -2218,7 +2305,10 @@ class DictationApp:
                         # e.g., "legal" -> "legal ". If they manually type punctuation later,
                         # Windows handles it naturally, but this prevents "legalFicou".
                         if self.config.get("continuous_listening", False):
-                            if not text.endswith(' '):
+                            stripped = text.strip()
+                            if stripped and not re.search(r'[.,!?;\:]$', stripped):
+                                text = stripped + '... '
+                            elif not text.endswith(' '):
                                 text += ' '
                                 
                         if is_final:

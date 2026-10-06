@@ -43,9 +43,10 @@ class OverlayWindow:
     TEXT_DIM = "#8E8E93"
     GREEN = "#30D158"
     RED = "#FF453A"
+    VIOLET = "#8B5CF6"
     AMBER = "#FF9F0A"
     GRAY = "#48484A"
-    WAVE_COLOR = "#FF6961"
+    WAVE_COLOR = "#A78BFA"
 
     # The dot button hit area (left side of the pill)
     _DOT_HIT_X = 38
@@ -148,8 +149,8 @@ class OverlayWindow:
         if k not in getattr(self, "_btn_cache", {}):
             if not hasattr(self, "_btn_cache"): self._btn_cache = {}
             from ui.glass import render_icon_stop, render_button
-            icon = render_icon_stop(max(1, int(10 * s)), self.RED)
-            self._btn_cache[k] = render_button(max(1, int(24 * s)), self.RED, "#3A1B1B", icon)
+            icon = render_icon_stop(max(1, int(10 * s)), self.VIOLET)
+            self._btn_cache[k] = render_button(max(1, int(24 * s)), self.VIOLET, "#2E1A47", icon)
         return self._btn_cache[k]
 
     # --- Window setup -----------------------------------------------------
