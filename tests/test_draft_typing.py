@@ -142,6 +142,36 @@ def test_failed_final_keeps_draft_but_next_segment_does_not_erase_it(screen):
     assert screen.text == "Texto do rascunho... Outra frase. "
 
 
+def test_failed_draft_keeps_tracking_so_final_corrects_it(screen):
+    # Real log: the NPU was lost during a draft; the final of the same
+    # segment ran on CUDA and typed the whole sentence after the stale draft.
+    app = _app()
+    _say(app, "Oi, ae, tudo bem", is_final=False)
+    _say(app, RuntimeError("inference failed"), is_final=False)
+
+    _say(app, "Oi, e aí, tudo bem?", is_final=True)
+
+    assert screen.text == "Oi, e aí, tudo bem? "
+
+
+def test_missing_focus_report_is_not_a_focus_change(screen):
+    app = _app()
+    _say(app, "Tudo", is_final=False)
+    screen.target = ("window", None)  # GetGUIThreadInfo blinked
+
+    _say(app, "Tudo bem.", is_final=True)
+
+    assert screen.text == "Tudo bem. "
+
+
+def test_same_input_target():
+    assert de.same_input_target((1, 2), (1, 2))
+    assert de.same_input_target((1, None), (1, 2))
+    assert not de.same_input_target((1, 2), (1, 3))
+    assert not de.same_input_target((1, 2), (4, 2))
+    assert not de.same_input_target(None, (1, 2))
+
+
 def test_unicode_typing_sends_utf16_units(monkeypatch):
     import ctypes
     units = []

@@ -1681,6 +1681,17 @@ def get_input_target():
         return None
 
 
+def same_input_target(a, b) -> bool:
+    """Whether keys still land where they landed before.
+
+    GetGUIThreadInfo briefly reports no focused control (seen in about one
+    poll in 300), so a missing focus on either side only compares windows.
+    """
+    if a is None or b is None or a[0] != b[0]:
+        return False
+    return a[1] is None or b[1] is None or a[1] == b[1]
+
+
 def type_draft_text(text: str):
     """Type a live draft without touching the clipboard.
 
@@ -2325,7 +2336,7 @@ class DictationApp:
         """Stop tracking the typed draft, first erasing it if asked and keys
         still land where it was typed. Caller holds _output_lock."""
         if erase and self._draft_typed_text:
-            if self._draft_target is not None and get_input_target() == self._draft_target:
+            if same_input_target(get_input_target(), self._draft_target):
                 delete_text(len(self._draft_typed_text))
             else:
                 log("Input focus changed; leaving the draft where it was typed.")
@@ -2408,7 +2419,7 @@ class DictationApp:
                         target = get_input_target()
                         text_to_type = text
                         if self._draft_typed_text:
-                            if target is not None and target == self._draft_target:
+                            if same_input_target(target, self._draft_target):
                                 common = os.path.commonprefix([self._draft_typed_text, text])
                                 delete_text(len(self._draft_typed_text) - len(common))
                                 text_to_type = text[len(common):]
@@ -2473,10 +2484,14 @@ class DictationApp:
                 import traceback
                 log(f"Error during transcription: {e}")
                 log(traceback.format_exc())
-                # Leave any typed draft as the best text we have, but stop
-                # tracking it: the next segment must not backspace over it.
-                with self._output_lock:
-                    self._forget_draft_locked(erase=False)
+                # A failed draft changes nothing: the segment keeps going and
+                # its final (maybe on a fallback device) still corrects the
+                # typed draft. A failed final ends the segment: leave the
+                # draft as the best text we have, but stop tracking it so the
+                # next segment does not backspace over it.
+                if is_final:
+                    with self._output_lock:
+                        self._forget_draft_locked(erase=False)
                 # Latches GPU failures even if shutdown started meanwhile.
                 self._set_state(AppState.ERROR, self._error_payload(e))
         except Exception as exc:
