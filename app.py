@@ -130,8 +130,11 @@ class GUIApp:
     def _on_hardware_event(self):
         """Called by the tray manager when the PC wakes up or a device changes."""
         import threading
-        from utils.logger import log
-
+        from dictation_engine import log
+        
+        if getattr(self, "_hw_event_timer", None):
+            self._hw_event_timer.cancel()
+            
         def recover():
             try:
                 # Only warmup if not currently recording
@@ -141,8 +144,10 @@ class GUIApp:
                     self._engine.recorder.warmup(timeout=3.0)
             except Exception as e:
                 log(f"Failed to proactively warmup audio: {e}")
-
-        threading.Thread(target=recover, daemon=True).start()
+                
+        self._hw_event_timer = threading.Timer(1.0, recover)
+        self._hw_event_timer.daemon = True
+        self._hw_event_timer.start()
 
     def _on_state_change(self, state: AppState, data: dict):
         """Engine state changed — schedule UI update on main thread."""
@@ -228,12 +233,12 @@ class GUIApp:
         elif self._npu_retry_count == 1:
             delay = 60000
         else:
-            from utils.logger import log
+            from dictation_engine import log
             log("NPU recovery retries exhausted. Staying on fallback device.")
             return
             
         self._npu_retry_count += 1
-        from utils.logger import log
+        from dictation_engine import log
         log(f"Scheduling background NPU recovery probe in {delay//1000}s (Attempt {self._npu_retry_count}/2)...")
         
         def _probe_thread():
@@ -246,7 +251,7 @@ class GUIApp:
 
     def _run_npu_recovery_probe(self):
         from dictation_engine import setup_model, create_model, MODEL_REGISTRY
-        from utils.logger import log
+        from dictation_engine import log
         import numpy as np
         
         if self._engine.config["device"] == "NPU":
@@ -255,7 +260,9 @@ class GUIApp:
         log("Probing NPU recovery in background...")
         try:
             model_info = MODEL_REGISTRY[self._config["model_size"]]
-            model_path = setup_model(self._config)
+            probe_config = self._config.copy()
+            probe_config["device"] = "NPU"
+            model_path = setup_model(probe_config)
             
             test_model = create_model(model_path, device="NPU", backend=model_info["backend"], model_size=self._config["model_size"])
             

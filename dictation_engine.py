@@ -1627,6 +1627,9 @@ class DictationApp:
     """Main dictation application with hotkey toggle."""
 
     MAX_HISTORY = 20
+    # Upper bound for a recording to wait on a model (re)load before it is
+    # discarded with an error, instead of blocking its thread forever.
+    MODEL_WAIT_SECONDS = 120
 
     def __init__(self, config: dict):
         self.config = config
@@ -1652,6 +1655,20 @@ class DictationApp:
         self.is_recording = False
         self._model_ready = threading.Event()
         self._load_error: str | None = None
+        # Serializes model use (warmup/transcribe) against model replacement
+        # (fallback, quarantine, NPU recovery hot-swap). Reentrant because
+        # _error_payload() may quarantine from a thread already holding it.
+        self._model_lock = threading.RLock()
+        # Models whose accelerator reported DEVICE_LOST. They are never called
+        # again and deliberately never released: calling into a pipeline bound
+        # to a lost device crashed the process natively (0xc0000005), and
+        # freeing it runs the same driver code. Memory returns on restart.
+        self._quarantined_models: list = []
+        # Configured device whose model was lost and not yet replaced by a
+        # fallback or recovery. ensure_model() refuses to load on it.
+        self._lost_device: str | None = None
+        # True while the loader's 2 s microphone warmup owns the recorder.
+        self._mic_warmup = False
 
         # State machine & callbacks (used by GUI, harmless in CLI mode)
         self._state = AppState.LOADING
@@ -1722,14 +1739,29 @@ class DictationApp:
 
     def ensure_model(self):
         """Ensure model is loaded."""
-        if self.whisper is None:
-            model_path = setup_model(self.config)
-            model_info = MODEL_REGISTRY[self.config["model_size"]]
-            self.whisper = create_model(
-                model_path, device=self.config["device"],
-                backend=model_info["backend"],
-                model_size=self.config["model_size"]
-            )
+        with self._model_lock:
+            if self.whisper is None:
+                if self._lost_device and self.config["device"] == self._lost_device:
+                    raise RuntimeError(
+                        f"{self._lost_device} was lost; not reloading on it until "
+                        f"a fallback device is selected")
+                model_path = setup_model(self.config)
+                model_info = MODEL_REGISTRY[self.config["model_size"]]
+                self.whisper = create_model(
+                    model_path, device=self.config["device"],
+                    backend=model_info["backend"],
+                    model_size=self.config["model_size"]
+                )
+
+    def _quarantine_lost_model(self):
+        """Take the model bound to a lost device out of service for good."""
+        with self._model_lock:
+            self._lost_device = self.config["device"]
+            if self.whisper is not None:
+                self._quarantined_models.append(self.whisper)
+                self.whisper = None
+                log(f"Quarantined model on lost {self._lost_device}: it will not "
+                    f"be called or released again in this process.")
 
     def _error_payload(self, exc: BaseException) -> dict:
         """Classify an engine error and build the ERROR state payload.
@@ -1756,7 +1788,10 @@ class DictationApp:
                 "device_failure": failure["device"],
                 "cause": cause,
             }
-            
+
+        # Never call into the failed pipeline again: a second generate() on
+        # the lost NPU crashed the whole process (access violation).
+        self._quarantine_lost_model()
         return {"error": str(exc), "device_lost": True,
                 "device_failure": kind, "cause": cause}
 
@@ -1833,25 +1868,40 @@ class DictationApp:
             with self._audio_lifecycle_lock:
                 if self._stopping.is_set():
                     return
-                self.recorder.wait_ready()
-                log("Performing real 2-second microphone capture to warm up hardware...")
-                self.recorder.start()
-            if self._stopping.wait(2.0):
-                return
-            with self._audio_lifecycle_lock:
-                if self._stopping.is_set():
-                    return
-                warmup_audio = self.recorder.stop()
-                if not self.recorder.telemetry.get('live_frames', 0):
-                    raise RuntimeError("Microphone warmup captured no new audio frames")
-            
+                # Recording is allowed while a (fallback) model loads; never
+                # hijack the user's recording for the warmup capture.
+                capture_warmup = not self.is_recording
+                if capture_warmup:
+                    self.recorder.wait_ready()
+                    log("Performing real 2-second microphone capture to warm up hardware...")
+                    self._mic_warmup = True
+                    self.recorder.start()
+            if capture_warmup:
+                try:
+                    if self._stopping.wait(2.0):
+                        return
+                    with self._audio_lifecycle_lock:
+                        if self._stopping.is_set():
+                            return
+                        warmup_audio = self.recorder.stop()
+                        if not self.recorder.telemetry.get('live_frames', 0):
+                            raise RuntimeError("Microphone warmup captured no new audio frames")
+                finally:
+                    self._mic_warmup = False
+            else:
+                import numpy as np
+                log("Recording in progress; warming up inference on silence instead.")
+                warmup_audio = np.zeros(int(self.config["sample_rate"]), dtype=np.float32)
+
             if len(warmup_audio) > 0:
                 log("Hardware warmup capture successful. Pre-warming Whisper inference...")
-                _ = self.whisper.transcribe(
-                    warmup_audio,
-                    sample_rate=self.config["sample_rate"],
-                    language=self.config["language"]
-                )
+                with self._model_lock:
+                    self.ensure_model()
+                    _ = self.whisper.transcribe(
+                        warmup_audio,
+                        sample_rate=self.config["sample_rate"],
+                        language=self.config["language"]
+                    )
                 log("End-to-end warmup complete.")
             else:
                 raise RuntimeError("Hardware warmup capture failed (empty buffer)")
@@ -1891,23 +1941,42 @@ class DictationApp:
                 RestartRequiredError(failure["message"])))
             return
         log(f"Falling back to device: {new_device}")
-        self._load_error = None
-        self._model_ready.clear()
-        self.whisper = None
-        self.config["device"] = new_device
+        with self._model_lock:
+            self._load_error = None
+            self._model_ready.clear()
+            self.whisper = None  # a lost model is already quarantined
+            self.config["device"] = new_device
+            if new_device != self._lost_device:
+                self._lost_device = None
         self._start_loader()
 
-    def inject_recovered_model(self, new_device: str, new_whisper):
-        """Seamlessly hot-swap the active model with a recovered one."""
+    def inject_recovered_model(self, new_device: str, new_whisper) -> bool:
+        """Hot-swap the active model with a recovered one.
+
+        Returns False (nothing changed) while a recording, transcription or
+        model load is in flight; the caller may retry later. The replaced
+        model is a healthy fallback and is released normally.
+        """
         with self._audio_lifecycle_lock:
+            busy = self._busy_reason_locked()
+            if busy or self._stopping.is_set():
+                log(f"Deferring swap to {new_device}: {busy or 'engine stopping'}")
+                return False
+        with self._model_lock:
             log(f"Seamlessly swapping active engine to {new_device}")
+            old = self.whisper
             self.config["device"] = new_device
             self.whisper = new_whisper
+            self._lost_device = None
             self._load_error = None
             self._model_ready.set()
-            if self._state in (AppState.ERROR, AppState.LOADING):
-                self._set_state(AppState.READY)
-
+        del old
+        import gc
+        gc.collect()
+        # Notify outside every lock (see _load_model_background_inner).
+        if self._state in (AppState.ERROR, AppState.LOADING):
+            self._set_state(AppState.READY)
+        return True
 
     # -- Input device enumeration ----------------------------------------
 
@@ -1950,15 +2019,20 @@ class DictationApp:
             self._set_state(AppState.PROCESSING)
 
             try:
-                log("Waiting for model to be ready before transcription...")
-                self._model_ready.wait()
+                if not self._model_ready.is_set():
+                    log("Waiting for model to be ready before transcription...")
+                if not self._model_ready.wait(self.MODEL_WAIT_SECONDS):
+                    raise RuntimeError(
+                        f"Model not ready after {self.MODEL_WAIT_SECONDS}s; "
+                        f"recording discarded")
                 ensure_devices_usable()
-                self.ensure_model()
-                text = self.whisper.transcribe(
-                    audio,
-                    sample_rate=self.config["sample_rate"],
-                    language=self.config["language"],
-                )
+                with self._model_lock:
+                    self.ensure_model()
+                    text = self.whisper.transcribe(
+                        audio,
+                        sample_rate=self.config["sample_rate"],
+                        language=self.config["language"],
+                    )
                 t_lower = text.strip().lower()
                 hallucinations = {"obrigado.", "obrigada.", "obrigado", "obrigada", "obrigado!", "obrigada!", "obrigado por assistir.", "obrigada por assistir.", "thank you.", "thank you", "thanks for watching.", "obrigado por assistir"}
                 if t_lower in hallucinations:
@@ -2033,10 +2107,23 @@ class DictationApp:
                 log(f"Cannot record — model failed to load: {self._load_error}")
                 return
 
+            if self._lost_device and self._lost_device == self.config["device"]:
+                log(f"Cannot record — {self._lost_device} was lost and no fallback "
+                    f"device is active yet.")
+                if self.config["beep_on_start"]:
+                    self.chimes.play('warning')
+                return
+
+            if self._mic_warmup:
+                log("Cannot record — microphone warmup in progress, try again in a moment.")
+                if self.config["beep_on_start"]:
+                    self.chimes.play('warning')
+                return
+
             t_before_rec = time.perf_counter()
             try:
                 with self._audio_lifecycle_lock:
-                    if self._stopping.is_set() or self._transcribing:
+                    if self._stopping.is_set() or self._transcribing or self._mic_warmup:
                         return
                     try:
                         self.recorder.wait_ready(timeout=0)
