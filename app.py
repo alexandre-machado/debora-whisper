@@ -269,9 +269,11 @@ class GUIApp:
             probe_config["device"] = "NPU"
             model_path = setup_model(probe_config)
             
-            # Uncached: the quarantined model still holds the ov-cache blob.
+            # Do not compile uncached here: a long NPU compile holds the GIL
+            # and froze the whole app. The cached load fails fast while the
+            # quarantined model still holds the ov-cache blob.
             test_model = create_model(model_path, device="NPU", backend=model_info["backend"],
-                                      model_size=self._config["model_size"], use_cache=False)
+                                      model_size=self._config["model_size"])
             # Loaders fall back silently on benign errors (e.g. a locked
             # ov-cache blob), so a successful load is not proof of recovery.
             if test_model.device != "NPU":

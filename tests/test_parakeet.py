@@ -49,13 +49,13 @@ class TestCreateModel:
     def test_creates_whisper_for_whisper_backend(self, mock_cls):
         mock_cls.return_value = MagicMock()
         result = create_model(Path("/fake"), device="NPU", backend="whisper")
-        mock_cls.assert_called_once_with(Path("/fake"), device="NPU", use_cache=True)
+        mock_cls.assert_called_once_with(Path("/fake"), device="NPU")
 
     @patch("dictation_engine.ParakeetNPU")
     def test_creates_parakeet_for_parakeet_backend(self, mock_cls):
         mock_cls.return_value = MagicMock()
         result = create_model(Path("/fake"), device="NPU", backend="parakeet")
-        mock_cls.assert_called_once_with(Path("/fake"), device="NPU", use_cache=True)
+        mock_cls.assert_called_once_with(Path("/fake"), device="NPU")
 
 
 class TestEnsureModelDispatch:

@@ -554,8 +554,8 @@ def test_npu_recovery_probe_swaps_when_npu_loads(genai):
     inject.assert_called_once()
     assert inject.call_args.args[0] == "NPU"
     recovery.assert_not_called()
-    # The quarantined model holds the shared cache blob open.
-    assert "CACHE_DIR" not in genai.load_kwargs[0]
+    # An uncached NPU compile holds the GIL for minutes and froze the app.
+    assert "CACHE_DIR" in genai.load_kwargs[0]
 
 
 class QueuedRoot(Root):

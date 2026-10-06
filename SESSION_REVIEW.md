@@ -23,4 +23,5 @@
 * **Rascunho vazio não apaga nada:** um rascunho vazio (por exemplo, uma alucinação "Obrigado." descartada no meio da frase) mantém o rascunho digitado; só um final vazio o apaga.
 * **Erro na transcrição:** o rascunho fica na tela, mas deixa de ser rastreado, para a próxima frase não apagá-lo.
 * **`auto_enter`:** quando o final é igual ao rascunho, o Enter agora é pressionado mesmo sem nada para colar.
-* **Recuperação da NPU:** a sondagem não confunde mais um carregamento na CPU com recuperação, compila sem o `ov-cache` (que o modelo em quarentena mantém aberto) e, no modo contínuo, a troca não fica adiada para sempre.
+* **Recuperação da NPU:** a sondagem não confunde mais um carregamento na CPU com recuperação e, no modo contínuo, a troca não fica adiada para sempre.
+  * ⚠️ Tentamos compilar a sondagem sem o `ov-cache` (que o modelo em quarentena mantém aberto), mas a compilação do turbo na NPU segura o GIL e **congelou o app inteiro**. Revertido: a sondagem volta a falhar rápido no cache travado, ou seja, na prática ela nunca recupera a NPU no mesmo processo. Voltar para a NPU exige reiniciar o app.
