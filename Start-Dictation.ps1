@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     NPU Dictation Engine - PowerShell Launcher
     Local voice-to-text powered by Intel NPU via OpenVINO + Whisper
@@ -35,6 +35,7 @@ param(
     [string]$Language,
     [switch]$AutoEnter,
     [string]$Hotkey,
+    [switch]$Continuous,
     [switch]$Help
 )
 
@@ -209,6 +210,7 @@ function Start-Dictation {
     if ($Language)  { $engineArgs += "--language", $Language }
     if ($AutoEnter) { $engineArgs += "--auto-enter" }
     if ($Hotkey)    { $engineArgs += "--hotkey", $Hotkey }
+    if ($Continuous){ $engineArgs += "--continuous" }
 
     # Check if engine file exists
     if (-not (Test-Path $EnginePath)) {

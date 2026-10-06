@@ -28,7 +28,7 @@ class OverlayWindow:
     COMPACT_W = 150
     COMPACT_H = 38
     HOVER_H = 38
-    EXPANDED_W = 300
+    EXPANDED_W = 450
     EXPANDED_H = 38
     RADIUS = 19  # half compact height -> perfect capsule ends
     MARGIN = 19  # right padding for waveform to avoid curve intersection
@@ -317,23 +317,30 @@ class OverlayWindow:
 
         elif self._state == "recording":
             self._paste_centered(frame, self._get_stop_btn(), bx, mid)
+            
+            wave_start = int(60 * s)
+            wave_w = int(100 * s)
+            wave_end = wave_start + wave_w
+            
+            draft = getattr(self, "_draft_text", "")
+            if draft:
+                text_items.append((int(wave_end + 15 * s), mid, draft[-40:],
+                                   self.TEXT, ("Segoe UI", max(1, int(10 * s))), "w"))
+            else:
+                text_items.append((int(wave_end + 15 * s), mid, "Listening...",
+                                   self.TEXT_DIM, ("Segoe UI", max(1, int(10 * s))), "w"))
+
             # Waveform
-            wave_start = int(114 * s)
-            wave_end = w - margin
             levels = list(self._wave)
             if levels:
-                wave_w = wave_end - wave_start
-                wave_h = h - int(8 * s)
+                wave_h = int((h - int(8 * s)) * 0.6)
                 if wave_w > 0 and wave_h > 0:
                     wave_img = render_waveform(wave_w, wave_h, levels,
                                                bar_width=max(1, int(3 * s)), gap=max(1, int(3 * s)),
                                                color=self.WAVE_COLOR)
                     frame.alpha_composite(wave_img,
                                           (wave_start, mid - wave_h // 2))
-            # Timer text
-            elapsed = time.time() - self._rec_start
-            text_items.append((int(50 * s), mid, f"{elapsed:.1f}s",
-                               self.TEXT, ("Segoe UI", max(1, int(14 * s)), "bold"), "w"))
+            # Timer text removed as it doesn't make sense for continuous mode
 
         elif self._state == "processing":
             dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.AMBER))
@@ -473,14 +480,17 @@ class OverlayWindow:
         self._hover = False
         self._animate(self.COMPACT_W, self.COMPACT_H)
 
-    def show_recording(self):
+    def show_recording(self, draft_text=""):
         """Expand with pulsing red dot, timer, and waveform."""
-        self._cancel_timers()
-        self._state = "recording"
-        self._rec_start = time.time()
-        self._wave.clear()
-        self._animate(self.EXPANDED_W, self.EXPANDED_H)
-        self._tick_recording()
+        if self._state != "recording":
+            self._cancel_timers()
+            self._state = "recording"
+            self._rec_start = time.time()
+            self._wave.clear()
+            self._animate(self.EXPANDED_W, self.EXPANDED_H)
+            self._tick_recording()
+        self._draft_text = draft_text
+        self._redraw()
 
     def _tick_recording(self):
         if self._state != "recording":

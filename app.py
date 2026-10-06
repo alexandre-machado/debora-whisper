@@ -172,10 +172,15 @@ class GUIApp:
                 self._overlay.show_ready()
             self._settings_status("Model ready.", "#30D158")
             self._settings_set_apply(True)
+            
+            if self._engine.config.get("continuous_listening", False):
+                # Transition back to recording visually
+                self._root.after(1500, lambda: self._update_ui(AppState.RECORDING, {}) if getattr(self._engine, "is_recording", False) else None)
 
         elif state == AppState.RECORDING:
+            draft = data.get("draft_text", "")
             self._tray.update_state(state_name, "NPU Dictation — Recording...")
-            self._overlay.show_recording()
+            self._overlay.show_recording(draft)
             self._start_audio_polling()
 
         elif state == AppState.PROCESSING:
@@ -467,6 +472,7 @@ def main():
     parser.add_argument("--language", type=str, help="Language code")
     parser.add_argument("--auto-enter", action="store_true", help="Press Enter after typing")
     parser.add_argument("--hotkey", type=str, help="Global hotkey")
+    parser.add_argument("--continuous", action="store_true", help="Enable continuous listening")
     args = parser.parse_args()
 
     config = load_config()
@@ -481,6 +487,8 @@ def main():
         config["auto_enter"] = True
     if args.hotkey:
         config["hotkey"] = args.hotkey
+    if args.continuous:
+        config["continuous_listening"] = True
 
     # Auto-select device if not explicitly overridden
     if not args.device:

@@ -41,6 +41,7 @@ DEFAULT_CONFIG = {
     "max_record_seconds": 60,  # Max recording length
     "sample_rate": 16000,      # Whisper expects 16kHz
     "show_balloon": True,      # Show text balloon under notch after transcription
+    "continuous_listening": False, # Enable VAD continuous listening
 }
 
 # Supported languages (Whisper's top languages + display names)
@@ -1199,23 +1200,23 @@ def _log_audio_stream(sd, stream, direction):
 
 
 class AudioRecorder:
-    """Record audio from microphone using sounddevice."""
+    """Record audio from microphone using sounddevice. Supports PTT and VAD."""
 
     def __init__(self, sample_rate: int = 16000, channels: int = 1,
-                 max_record_seconds: float = None, on_timeout=None):
+                 max_record_seconds: float = None, on_timeout=None, config=None):
         self.sample_rate = sample_rate
         self.channels = channels
         self.max_record_seconds = max_record_seconds
         self.on_timeout = on_timeout
+        self.config = config or {}
         self.recording = False
+        self.continuous = self.config.get("continuous_listening", False)
+        
         self._frames = []
 
         import numpy as np
-        # A sample-based ring works with PortAudio's variable callback sizes.
-        self._lookback = np.zeros((int(sample_rate * 1.5), channels), dtype=np.float32)
-        self._lookback_position = 0
-        self._lookback_count = 0
-
+        import queue
+        
         self._stream = None
         self._lock = threading.Lock()
         self._timer = None
@@ -1225,6 +1226,26 @@ class AudioRecorder:
         self._last_callback = None
         self._expected_adc_time = None
         self._stable_callbacks = 0
+        self.paused = False
+
+        # Continuous VAD properties
+        self.capacity = int(sample_rate * self.config.get("ring_buffer_seconds", 30))
+        self._buffer = np.zeros((self.capacity, channels), dtype=np.float32)
+        self._write_pos = 0
+        self._read_pos = 0
+        self._lookback_count = 0
+        self._data_cv = threading.Condition(self._lock)
+        self.segment_queue = queue.Queue(maxsize=10)
+        self._vad_thread = None
+        self._stop_vad = False
+        
+        # VAD thresholds
+        self.energy_threshold = self.config.get("vad_energy_threshold", 0.005)
+        self.min_speech_frames = int(sample_rate * self.config.get("vad_min_speech_seconds", 0.4))
+        self.end_silence_frames = int(sample_rate * self.config.get("vad_end_silence_seconds", 0.8))
+        self.max_segment_frames = int(sample_rate * self.config.get("segment_max_seconds", 15))
+        self.lookback_frames = int(sample_rate * self.config.get("vad_lookback_seconds", 0.5))
+        self.trailing_frames = int(sample_rate * self.config.get("vad_trailing_seconds", 0.3))
 
     def warmup(self, timeout=3.0):
         """Open the stream continuously in the background."""
@@ -1237,6 +1258,7 @@ class AudioRecorder:
             now = time.perf_counter()
             adc_time = time_info.inputBufferAdcTime
             delivery_delay = max(0.0, time_info.currentTime - adc_time) if adc_time > 0 else 0.0
+            
             with self._lock:
                 gap = now - self._last_callback if self._last_callback is not None else 0.0
                 adc_gap = (max(0.0, adc_time - self._expected_adc_time)
@@ -1244,11 +1266,26 @@ class AudioRecorder:
                 self._last_callback = now
                 self._expected_adc_time = adc_time + frames / self.sample_rate if adc_time > 0 else None
                 self._stable_callbacks = self._stable_callbacks + 1 if gap < 0.5 and not status else 0
+                
                 if self._stable_callbacks >= 3:
                     self._audio_ready.set()
                 else:
                     self._audio_ready.clear()
-                if self.recording:
+                    
+                # Always write to ring buffer
+                capacity = self.capacity
+                count = min(frames, capacity)
+                data = indata[-count:]
+                first = min(count, capacity - self._write_pos)
+                self._buffer[self._write_pos:self._write_pos + first] = data[:first]
+                self._buffer[:count - first] = data[first:]
+                self._write_pos = (self._write_pos + count) % capacity
+                self._lookback_count = min(capacity, self._lookback_count + count)
+                
+                if self.continuous:
+                    self._data_cv.notify()
+
+                if self.recording and not self.continuous:
                     self.telemetry.setdefault('first_frame', now)
                     self.telemetry['live_frames'] += frames
                     self.telemetry['input_overflows'] += int(status.input_overflow)
@@ -1256,15 +1293,6 @@ class AudioRecorder:
                     self.telemetry['max_adc_gap'] = max(self.telemetry['max_adc_gap'], adc_gap)
                     self.telemetry['max_delivery_delay'] = max(self.telemetry['max_delivery_delay'], delivery_delay)
                     self._frames.append(indata.copy())
-                else:
-                    capacity = len(self._lookback)
-                    count = min(frames, capacity)
-                    data = indata[-count:]
-                    first = min(count, capacity - self._lookback_position)
-                    self._lookback[self._lookback_position:self._lookback_position + first] = data[:first]
-                    self._lookback[:count - first] = data[first:]
-                    self._lookback_position = (self._lookback_position + count) % capacity
-                    self._lookback_count = min(capacity, self._lookback_count + count)
 
         try:
             self._stream = sd.InputStream(
@@ -1278,12 +1306,17 @@ class AudioRecorder:
             self._stream.start()
             _log_audio_stream(sd, self._stream, "input")
             self.wait_ready(timeout)
+            
+            if self.continuous:
+                self._stop_vad = False
+                self._vad_thread = threading.Thread(target=self._vad_loop, daemon=True)
+                self._vad_thread.start()
+                
         except Exception:
             self.close()
             raise
 
     def wait_ready(self, timeout=3.0):
-        """Require recent callbacks, including when the microphone is silent."""
         if not self._audio_ready.wait(timeout):
             raise RuntimeError("Microphone did not deliver stable audio callbacks during warmup")
         with self._lock:
@@ -1291,23 +1324,148 @@ class AudioRecorder:
                     self._last_callback is None or time.perf_counter() - self._last_callback > 0.5):
                 raise RuntimeError("Microphone audio stream is inactive or stalled")
 
+    def _vad_loop(self):
+        import numpy as np
+        is_speaking = False
+        speech_start_pos = 0
+        silence_frames = 0
+        speech_frames = 0
+        last_draft_time = 0.0
+        
+        log("VAD thread started.")
+        try:
+            while not self._stop_vad:
+                with self._lock:
+                    self._data_cv.wait(timeout=0.1)
+                    if self._write_pos >= self._read_pos:
+                        available = self._write_pos - self._read_pos
+                    else:
+                        available = self.capacity - self._read_pos + self._write_pos
+                        
+                    if available == 0:
+                        continue
+                        
+                    if self._write_pos > self._read_pos:
+                        new_data = self._buffer[self._read_pos:self._write_pos].copy()
+                    else:
+                        new_data = np.concatenate((
+                            self._buffer[self._read_pos:], 
+                            self._buffer[:self._write_pos]
+                        ))
+                    
+                    start_read_pos = self._read_pos
+                    self._read_pos = self._write_pos
+                    
+                block_size = int(self.sample_rate * 0.02)
+                for i in range(0, len(new_data), block_size):
+                    block = new_data[i:i+block_size]
+                    if len(block) == 0:
+                        continue
+                        
+                    is_paused = getattr(self, "paused", False)
+                    cut_segment = False
+                    
+                    if is_paused:
+                        if is_speaking:
+                            if speech_frames >= self.min_speech_frames:
+                                cut_segment = True
+                                log("VAD: Cutting segment due to pause.")
+                            else:
+                                is_speaking = False
+                        else:
+                            continue
+                    else:
+                        rms = float(np.sqrt(np.mean(block**2)))
+                        block_len = len(block)
+                        
+                        if rms > self.energy_threshold:
+                            if not is_speaking:
+                                is_speaking = True
+                                speech_start_pos = (start_read_pos + i - self.lookback_frames) % self.capacity
+                                silence_frames = 0
+                                speech_frames = self.lookback_frames + block_len
+                                last_draft_time = time.time()
+                            else:
+                                silence_frames = 0
+                                speech_frames += block_len
+                        else:
+                            if is_speaking:
+                                silence_frames += block_len
+                                speech_frames += block_len
+                                
+                        # Draft logic
+                        if is_speaking and not cut_segment:
+                            current_time = time.time()
+                            if current_time - last_draft_time > 1.0:
+                                if self.segment_queue.empty() and speech_frames > self.min_speech_frames:
+                                    # NPU is free, let's transcribe a draft!
+                                    with self._lock:
+                                        draft_end_pos = (start_read_pos + i + block_len) % self.capacity
+                                        if draft_end_pos > speech_start_pos:
+                                            draft_audio = self._buffer[speech_start_pos:draft_end_pos].copy()
+                                        else:
+                                            draft_audio = np.concatenate((
+                                                self._buffer[speech_start_pos:],
+                                                self._buffer[:draft_end_pos]
+                                            ))
+                                    self.segment_queue.put((draft_audio.flatten(), False))
+                                    last_draft_time = current_time
+
+                        # End of speech conditions
+                        if is_speaking and silence_frames > self.end_silence_frames:
+                            if speech_frames >= self.min_speech_frames:
+                                cut_segment = True
+                                log("VAD: Cutting segment due to natural silence.")
+                            else:
+                                # Too short, discard
+                                is_speaking = False
+                                
+                        elif is_speaking and speech_frames >= self.max_segment_frames:
+                            # Forced cut
+                            cut_segment = True
+                            log("VAD: Cutting segment due to max duration.")
+                            
+                    if cut_segment:
+                        is_speaking = False
+                        # Extract segment
+                        with self._lock:
+                            end_pos = (start_read_pos + i + block_len + self.trailing_frames) % self.capacity
+                            if end_pos > speech_start_pos:
+                                audio = self._buffer[speech_start_pos:end_pos].copy()
+                            else:
+                                audio = np.concatenate((
+                                    self._buffer[speech_start_pos:],
+                                    self._buffer[:end_pos]
+                                ))
+                            
+                        self.segment_queue.put((audio.flatten(), True))
+        except Exception as e:
+            import traceback
+            log(f"CRITICAL ERROR in VAD loop: {e}\n{traceback.format_exc()}")
+
+
     def start(self):
-        """Start recording."""
+        """Start recording (PTT mode)."""
+        if self.continuous:
+            return # VAD handles recording
+            
         with self._lock:
             if self.recording:
                 return
             self.telemetry = dict(start_called=time.perf_counter(), live_frames=0,
                                   input_overflows=0, max_callback_gap=0.0,
                                   max_adc_gap=0.0, max_delivery_delay=0.0)
-            # Snapshot in chronological order; never duplicate the live blocks.
-            count = self._lookback_count
-            begin = (self._lookback_position - count) % len(self._lookback)
-            first = min(count, len(self._lookback) - begin)
+            
+            # Extract lookback from continuous buffer
+            count = min(self._lookback_count, int(self.sample_rate * 1.5))
+            begin = (self._write_pos - count) % self.capacity
+            first = min(count, self.capacity - begin)
             self._frames = []
             if first:
-                self._frames.append(self._lookback[begin:begin + first].copy())
+                self._frames.append(self._buffer[begin:begin + first].copy())
             if count > first:
-                self._frames.append(self._lookback[:count - first].copy())
+                self._frames.append(self._buffer[:count - first].copy())
+                
             self._lookback_count = 0
             self.recording = True
             self._recording_generation += 1
@@ -1322,11 +1480,9 @@ class AudioRecorder:
         log("Recording started...")
 
     def _timeout_stop(self, generation):
-        """Called when max_record_seconds is reached."""
         with self._lock:
             if not self.recording or generation != self._recording_generation:
                 return
-            # Freeze capture, preserving frames until the consumer calls stop().
             self.recording = False
             self._timer = None
         log(f"Max recording time ({self.max_record_seconds}s) reached, stopping.")
@@ -1334,8 +1490,11 @@ class AudioRecorder:
             self.on_timeout(generation)
 
     def stop(self):
-        """Stop recording and return audio as numpy array."""
+        """Stop recording and return audio as numpy array (PTT mode)."""
         import numpy as np
+
+        if self.continuous:
+            return np.array([], dtype=np.float32)
 
         with self._lock:
             self.recording = False
@@ -1346,19 +1505,6 @@ class AudioRecorder:
                 self._timer.cancel()
                 self._timer = None
 
-        t_first = telemetry.get('first_frame')
-        t_start = telemetry.get('start_called')
-        if t_first is not None and t_start is not None:
-            log(f"[Telemetry] First audio block arrived {t_first - t_start:.3f}s after recorder.start() was called")
-        elif t_start is not None:
-            log("[Telemetry] No frames captured from callback! Relied entirely on lookback buffer.")
-        if t_start is not None:
-            log(f"[Telemetry] Capture: live_frames={telemetry['live_frames']}, "
-                f"overflows={telemetry['input_overflows']}, "
-                f"max_callback_gap={telemetry['max_callback_gap']:.3f}s, "
-                f"max_adc_gap={telemetry['max_adc_gap']:.3f}s, "
-                f"max_delivery_delay={telemetry['max_delivery_delay']:.3f}s")
-
         if not frames:
             return np.array([], dtype=np.float32)
 
@@ -1368,9 +1514,10 @@ class AudioRecorder:
         return audio
 
     def close(self):
-        """Close the stream permanently."""
         with self._lock:
             self.recording = False
+            self._stop_vad = True
+            self._data_cv.notify_all()
             if self._timer:
                 self._timer.cancel()
                 self._timer = None
@@ -1393,19 +1540,23 @@ class AudioRecorder:
 
     @property
     def audio_level(self) -> float:
-        """Return current RMS audio level normalized to 0.0-1.0."""
         import numpy as np
         with self._lock:
-            if not self._frames or not self.recording:
-                return 0.0
-            last_frame = self._frames[-1].copy()
+            if self.continuous:
+                if self._lookback_count == 0:
+                    return 0.0
+                last_frame = self._buffer[(self._write_pos - 1024) % self.capacity : self._write_pos].copy()
+            else:
+                if not self._frames or not self.recording:
+                    return 0.0
+                last_frame = self._frames[-1].copy()
+                
+        if len(last_frame) == 0:
+            return 0.0
         rms = float(np.sqrt(np.mean(last_frame ** 2)))
-        # Scale aggressively — typical speech RMS is 0.01-0.05
         return min(rms * 25.0, 1.0)
 
 
-# ---------------------------------------------------------------------------
-# Text output (type into active window)
 # ---------------------------------------------------------------------------
 def type_text(text: str, auto_enter: bool = False):
     """Type text into the currently active window using keyboard simulation."""
@@ -1637,6 +1788,7 @@ class DictationApp:
             sample_rate=config["sample_rate"],
             max_record_seconds=config.get("max_record_seconds"),
             on_timeout=self._finish_recording,
+            config=config,
         )
         self.chimes = ChimePlayer()
         self._audio_lifecycle_lock = threading.Lock()
@@ -1870,7 +2022,7 @@ class DictationApp:
                     return
                 # Recording is allowed while a (fallback) model loads; never
                 # hijack the user's recording for the warmup capture.
-                capture_warmup = not self.is_recording
+                capture_warmup = not self.is_recording and not self.config.get("continuous_listening", False)
                 if capture_warmup:
                     self.recorder.wait_ready()
                     log("Performing real 2-second microphone capture to warm up hardware...")
@@ -1916,8 +2068,13 @@ class DictationApp:
             # busy_reason() or stop_if_idle() (or wait on a thread that does),
             # all of which take _audio_lifecycle_lock. _set_state re-checks
             # _stopping, so a stop that lands here suppresses READY.
-            self._set_state(AppState.READY)
-            log("Ready! Waiting for hotkey...")
+            if self.config.get("continuous_listening", False):
+                self.is_recording = True
+                self._set_state(AppState.RECORDING)
+                log("Continuous listening mode active. VAD will process speech.")
+            else:
+                self._set_state(AppState.READY)
+                log("Ready! Waiting for hotkey...")
         except Exception as e:
             import traceback
             log(f"Model loading failed: {e}")
@@ -1996,27 +2153,35 @@ class DictationApp:
 
     # -- Recording -------------------------------------------------------
 
-    def _finish_recording(self, generation=None):
+    def _finish_recording(self, generation=None, audio=None, is_final=True):
         """Consume one recording, whether stopped by the user or its timer."""
         with self._audio_lifecycle_lock:
-            if (self._stopping.is_set() or not self.is_recording or self._transcribing or
-                    (generation is not None and generation != self.recorder._recording_generation)):
+            if self._stopping.is_set() or self._transcribing:
                 return
-            self.is_recording = False
+            if audio is None:
+                if not self.is_recording or (generation is not None and generation != self.recorder._recording_generation):
+                    return
+                self.is_recording = False
             self._transcribing = True
         try:
-            audio = self.recorder.stop()
+            if audio is None:
+                audio = self.recorder.stop()
             if self._stopping.is_set():
                 return
-            if self.config["beep_on_start"]:
+            if self.config["beep_on_start"] and is_final:
                 self.chimes.play('stop')
 
             if len(audio) < self.config["sample_rate"] * 0.3:
                 log("Recording too short, ignoring.")
-                self._set_state(AppState.READY)
+                if is_final:
+                    if self.config.get("continuous_listening", False) and getattr(self, "is_recording", False):
+                        self._set_state(AppState.RECORDING)
+                    else:
+                        self._set_state(AppState.READY)
                 return
 
-            self._set_state(AppState.PROCESSING)
+            if is_final:
+                self._set_state(AppState.PROCESSING)
 
             try:
                 if not self._model_ready.is_set():
@@ -2034,7 +2199,8 @@ class DictationApp:
                         language=self.config["language"],
                     )
                 t_lower = text.strip().lower()
-                hallucinations = {"obrigado.", "obrigada.", "obrigado", "obrigada", "obrigado!", "obrigada!", "obrigado por assistir.", "obrigada por assistir.", "thank you.", "thank you", "thanks for watching.", "obrigado por assistir"}
+                hallucinations = {"obrigado.", "obrigada.", "obrigado", "obrigada", "obrigado!", "obrigada!", "obrigado por assistir.", "obrigada por assistir.", 
+"thank you.", "thank you", "thanks for watching.", "obrigado por assistir"}
                 if t_lower in hallucinations:
                     log(f"Ignoring hallucination: '{text}'")
                     text = ""
@@ -2047,18 +2213,50 @@ class DictationApp:
                         if self._stopping.is_set():
                             log("Engine stopped; discarding late transcription.")
                             return
-                        type_text(text, auto_enter=self.config["auto_enter"])
-                        self._history.append({
-                            "timestamp": datetime.now().isoformat(),
-                            "text": text,
-                            "duration": len(audio) / self.config["sample_rate"],
-                        })
-                        if len(self._history) > self.MAX_HISTORY:
-                            self._history = self._history[-self.MAX_HISTORY:]
-                    self._set_state(AppState.READY, {"text": text})
+                            
+                        # Append a trailing space in continuous mode so next phrase doesn't stick
+                        # e.g., "legal" -> "legal ". If they manually type punctuation later,
+                        # Windows handles it naturally, but this prevents "legalFicou".
+                        if self.config.get("continuous_listening", False):
+                            if not text.endswith(' '):
+                                text += ' '
+                                
+                        if is_final:
+                            type_text(text, auto_enter=self.config["auto_enter"])
+                            self._history.append({
+                                "timestamp": datetime.now().isoformat(),
+                                "text": text,
+                                "duration": len(audio) / self.config["sample_rate"],
+                            })
+                            if len(self._history) > self.MAX_HISTORY:
+                                self._history = self._history[-self.MAX_HISTORY:]
+                    
+                    if is_final:
+                        if self.config.get("continuous_listening", False):
+                            # Still dispatch READY with text so UI shows it,
+                            # but then quickly revert to RECORDING.
+                            # Wait, we can let App.py handle the visual transition back to recording
+                            self._set_state(AppState.READY, {"text": text})
+                        else:
+                            self._set_state(AppState.READY, {"text": text})
+                        self.last_draft_text = ""
+                    else:
+                        self.last_draft_text = text
+                        self._set_state(AppState.RECORDING, {"draft_text": text})
                 else:
-                    log("No speech detected.")
-                    self._set_state(AppState.READY)
+                    if is_final:
+                        self.last_draft_text = ""
+                        log("No speech detected.")
+                        if self.config.get("continuous_listening", False):
+                            if getattr(self, "is_recording", False):
+                                self._set_state(AppState.RECORDING)
+                            else:
+                                self._set_state(AppState.READY)
+                        else:
+                            self._set_state(AppState.READY)
+                    else:
+                        # Draft but no text detected
+                        self._set_state(AppState.RECORDING, {"draft_text": ""})
             except Exception as e:
                 import traceback
                 log(f"Error during transcription: {e}")
@@ -2078,6 +2276,27 @@ class DictationApp:
         import threading
 
         if self._stopping.is_set() or self._transcribing:
+            return
+
+        if self.config.get("continuous_listening", False):
+            with self._audio_lifecycle_lock:
+                if getattr(self, "_hotkey_held", False):
+                    return
+                self._hotkey_held = True
+                
+                if self.is_recording:
+                    log("Pausing continuous listening mode.")
+                    self.is_recording = False
+                    self.recorder.paused = True
+                    self._set_state(AppState.READY)
+                else:
+                    log("Resuming continuous listening mode.")
+                    self.is_recording = True
+                    self.recorder.paused = False
+                    self._set_state(AppState.RECORDING)
+                
+                # Release hotkey immediately for tap
+                self._hotkey_held = False
             return
 
         if getattr(self, "_hotkey_held", False):
@@ -2185,6 +2404,39 @@ class DictationApp:
 
         log("Loading model in background (first time may take several minutes)...")
         self._start_loader()
+        
+        if self.config.get("continuous_listening", False):
+            def _continuous_consumer():
+                import queue
+                import traceback
+                log("Agente de escuta contínua iniciado. VAD ativo.")
+                while not self._stopping.is_set():
+                    try:
+                        item = self.recorder.segment_queue.get(timeout=0.5)
+                        if item is not None:
+                            if isinstance(item, tuple):
+                                audio_segment, is_final = item
+                            else:
+                                audio_segment, is_final = item, True
+                            
+                            if len(audio_segment) > 0:
+                                # Se _transcribing estiver True, _finish_recording retorna.
+                                # Mas queremos esperar até que ele termine.
+                                while getattr(self, "_transcribing", False) and not self._stopping.is_set():
+                                    time.sleep(0.1)
+                                self._finish_recording(audio=audio_segment, is_final=is_final)
+                    except queue.Empty:
+                        pass
+                    except Exception as e:
+                        log(f"CRITICAL ERROR in _continuous_consumer: {e}\n{traceback.format_exc()}")
+            
+            threading.Thread(target=_continuous_consumer, daemon=True).start()
+            # Precisamos chamar recorder.warmup() primeiro se não estiver pronto?
+            # warmup é chamado pelo loader, mas podemos iniciar a captura do VAD.
+            # actually recorder.start() does nothing in continuous except returning early,
+            # warmup is enough since VAD loop starts when warmup starts the continuous thread.
+            # Wait, our rewrite_audio.py made warmup() start the _vad_loop!
+            pass
 
     def busy_reason(self) -> str | None:
         """What accelerator/microphone work is in flight, or None if idle."""
@@ -2237,6 +2489,15 @@ class DictationApp:
                 self.recorder.close()
             finally:
                 self.chimes.close()
+
+        try:
+            import pyperclip
+            draft = getattr(self, "last_draft_text", "")
+            if draft:
+                pyperclip.copy(draft)
+                log(f"Saved incomplete draft to clipboard: {draft}")
+        except Exception:
+            pass
 
         log("Engine stopped.")
 
@@ -2392,6 +2653,7 @@ def main():
     parser.add_argument("--language", type=str, help="Language code (e.g., en, ru, id)")
     parser.add_argument("--auto-enter", action="store_true", help="Press Enter after typing")
     parser.add_argument("--hotkey", type=str, help="Global hotkey (e.g., ctrl+alt+d)")
+    parser.add_argument("--continuous", action="store_true", help="Enable continuous listening (VAD)")
     args = parser.parse_args()
 
     if args.setup:
@@ -2411,6 +2673,8 @@ def main():
         config["auto_enter"] = True
     if args.hotkey:
         config["hotkey"] = args.hotkey
+    if args.continuous:
+        config["continuous_listening"] = True
 
     # Auto-select device based on model when --device not explicitly set
     if not args.device:
