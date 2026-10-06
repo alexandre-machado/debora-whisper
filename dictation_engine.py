@@ -1223,22 +1223,30 @@ class NeuralVAD:
         self.session = ort.InferenceSession(str(model_path), providers=['CPUExecutionProvider'])
         self.reset_state()
 
+    # Silero v5 expects each 512-sample chunk prefixed with the last 64
+    # samples of the previous one, as its own OnnxWrapper does. Without them
+    # the model scores mic-level speech at ~0.001 (seen in every log line).
+    CONTEXT_SAMPLES = 64
+
     def reset_state(self):
         import numpy as np
         self.state = np.zeros((2, 1, 128), dtype=np.float32)
+        self.context = np.zeros(self.CONTEXT_SAMPLES, dtype=np.float32)
 
     def process(self, audio_block):
+        """Speech probability of one 512-sample (N,) float32 block."""
         import numpy as np
-        # audio_block should be (N,) float32
-        input_data = audio_block.reshape(1, -1).astype(np.float32)
+        block = audio_block.reshape(-1).astype(np.float32)
+        input_data = np.concatenate((self.context, block)).reshape(1, -1)
         sr = np.array(self.sample_rate, dtype=np.int64)
-        
+
         out, state = self.session.run(None, {
             'input': input_data,
             'state': self.state,
             'sr': sr
         })
         self.state = state
+        self.context = block[-self.CONTEXT_SAMPLES:]
         return float(out[0][0])
 
 
@@ -1284,7 +1292,13 @@ class AudioRecorder:
         self.neural_vad = None
         
         # VAD thresholds
-        self.vad_threshold = self.config.get("vad_energy_threshold", 0.1) # Prob threshold for Silero
+        # Silero speech probability. Like Silero's own get_speech_timestamps,
+        # speech starts above the threshold and only ends below it minus
+        # 0.15, so a soft syllable does not count as silence.
+        self.vad_threshold = self.config.get("vad_speech_threshold", 0.5)
+        self.vad_neg_threshold = max(self.vad_threshold - 0.15, 0.01)
+        # RMS threshold, used only when Silero cannot be loaded.
+        self.energy_threshold = self.config.get("vad_energy_threshold", 0.005)
         self.min_speech_frames = int(sample_rate * self.config.get("vad_min_speech_seconds", 0.4))
         self.end_silence_frames = int(sample_rate * self.config.get("vad_end_silence_seconds", 1.5))
         self.max_segment_frames = int(sample_rate * self.config.get("segment_max_seconds", 15))
@@ -1373,6 +1387,31 @@ class AudioRecorder:
                     self._last_callback is None or time.perf_counter() - self._last_callback > 0.5):
                 raise RuntimeError("Microphone audio stream is inactive or stalled")
 
+    def _block_is_speech(self, block, is_speaking: bool) -> bool:
+        """Classify one 512-sample block; Silero when loaded, else RMS."""
+        import numpy as np
+        if not self.neural_vad:
+            rms = float(np.sqrt(np.mean(block ** 2)))
+            return rms > self.energy_threshold
+
+        # DC blocker (zero mean) for mics with an offset.
+        samples = block.flatten()
+        samples = samples - np.mean(samples)
+        prob = self.neural_vad.process(samples)
+
+        # Peak probability and amplitude every 2 s, to tune mics.
+        now = time.time()
+        if not hasattr(self, "_last_prob_log"):
+            self._max_prob, self._max_amp, self._last_prob_log = 0.0, 0.0, now
+        self._max_prob = max(self._max_prob, prob)
+        self._max_amp = max(self._max_amp, float(np.max(np.abs(samples))))
+        if now - self._last_prob_log > 2.0:
+            if self._max_prob > 0.01 or self._max_amp > 0.005:
+                log(f"[VAD Debug] Max prob: {self._max_prob:.3f}, Max amp: {self._max_amp:.4f}")
+            self._max_prob, self._max_amp, self._last_prob_log = 0.0, 0.0, now
+
+        return prob > (self.vad_neg_threshold if is_speaking else self.vad_threshold)
+
     def _vad_loop(self):
         import numpy as np
         is_speaking = False
@@ -1433,36 +1472,8 @@ class AudioRecorder:
                     else:
                         # Use Neural VAD if available, fallback to RMS
                         block_len = len(block)
-                        is_speech_now = False
-                        
-                        if self.neural_vad:
-                            # Apply DC blocker (zero mean) to prevent offset issues on bad mics
-                            block_zero_mean = block.flatten()
-                            block_zero_mean = block_zero_mean - np.mean(block_zero_mean)
-                            prob = self.neural_vad.process(block_zero_mean)
-                            
-                            # Calculate RMS for hybrid fallback
-                            rms = float(np.sqrt(np.mean(block_zero_mean**2)))
-                            
-                            # Log prob occasionally to debug mic issues
-                            if not hasattr(self, "_max_prob"): self._max_prob = 0.0
-                            if not hasattr(self, "_max_amp"): self._max_amp = 0.0
-                            if not hasattr(self, "_last_prob_log"): self._last_prob_log = time.time()
-                            self._max_prob = max(self._max_prob, prob)
-                            self._max_amp = max(self._max_amp, float(np.max(np.abs(block_zero_mean))))
-                            if time.time() - self._last_prob_log > 2.0:
-                                if self._max_prob > 0.01 or self._max_amp > 0.005: 
-                                    log(f"[VAD Debug] Max prob: {self._max_prob:.3f}, Max amp: {self._max_amp:.4f}, RMS: {rms:.4f}")
-                                self._max_prob = 0.0
-                                self._max_amp = 0.0
-                                self._last_prob_log = time.time()
-                                
-                            # Hybrid approach: trigger if neural says speech, OR if it's super loud (fallback for bad mic+offset combinations)
-                            is_speech_now = (prob > self.vad_threshold) or (rms > 0.01)
-                        else:
-                            rms = float(np.sqrt(np.mean(block**2)))
-                            is_speech_now = rms > self.config.get("vad_energy_threshold", 0.005)
-                        
+                        is_speech_now = self._block_is_speech(block, is_speaking)
+
                         if is_speech_now:
                             if not is_speaking:
                                 is_speaking = True

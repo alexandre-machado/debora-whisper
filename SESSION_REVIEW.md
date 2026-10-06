@@ -2,7 +2,8 @@
 
 ### 🎤 1. Melhorias no VAD (Voice Activity Detection) e Captação
 * **Sensibilidade e Ruído:** Implementamos a remoção de *DC offset* e adicionamos um *fallback* híbrido de RMS (Root Mean Square) no `NeuralVAD`: um bloco conta como fala se o Silero disser que é **ou** se o RMS passar de `0.01`.
-  * ⚠️ **Pendente:** nos logs o Silero nunca passa de `prob 0.001`, nem com fala, então hoje quem detecta fala é só o RMS (e ruído alto também conta como fala). Causa provável: o wrapper oficial do Silero v5 junta as últimas 64 amostras do bloco anterior em cada chamada, e o `NeuralVAD.process` não faz isso.
+  * ✅ **Corrigido depois:** nos logs o Silero nunca passava de `prob 0.001`, nem com fala, então quem detectava fala era só o RMS (e ruído alto também contava como fala). Causa: o Silero v5 espera cada bloco de 512 amostras prefixado com as últimas 64 do bloco anterior, como o wrapper oficial faz. Com o contexto, fala sintetizada em volume de microfone é detectada em 69% dos blocos (antes 0%) e ruído branco com RMS 0.05 em 0%.
+  * O fallback `rms > 0.01` saiu; o RMS só é usado se o Silero não carregar. O limiar agora tem chave própria, `vad_speech_threshold` (padrão 0.5, o do Silero), com histerese: a fala só termina abaixo de 0.35.
 * **Gerenciamento de Pausas:** Aumentamos o tempo de espera do VAD (`vad_end_silence_seconds`) de `0.8s` para `1.5s`. Isso evita que pausas naturais de respiração ou de raciocínio sejam cortadas no meio, diminuindo o particionamento exagerado e dando mais contexto ao modelo Whisper.
 
 ### 🎨 2. Melhorias de Interface (UI) e Formatação
