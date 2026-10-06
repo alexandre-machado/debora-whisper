@@ -341,6 +341,7 @@ class GUIApp:
         if self._engine.is_recording:
             level = self._engine.recorder.audio_level
             self._overlay.update_audio_level(level)
+            self._tray.update_audio_level(level)
             self._audio_poll_id = self._root.after(50, self._poll_audio)
 
     def _stop_audio_polling(self):

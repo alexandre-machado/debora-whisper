@@ -1,8 +1,9 @@
 """System tray icon manager using pystray."""
 
 import threading
+import time
 import pystray
-from ui.icons import STATE_ICONS
+from ui.icons import get_icon
 
 
 class TrayManager:
@@ -22,6 +23,11 @@ class TrayManager:
         self._tooltip = "NPU Dictation — Loading..."
         self._icon: pystray.Icon | None = None
         self._thread: threading.Thread | None = None
+        
+        # Animation state
+        self._animating = False
+        self._anim_frame = 0
+        self._anim_thread: threading.Thread | None = None
 
     def _build_menu(self):
         """Build the right-click context menu with dynamic state text."""
@@ -72,7 +78,7 @@ class TrayManager:
 
     def start(self):
         """Start the tray icon in a daemon thread."""
-        initial_icon = STATE_ICONS[self._state]()
+        initial_icon = get_icon(self._state)
         self._icon = pystray.Icon(
             name="npu-dictation",
             icon=initial_icon,
@@ -102,6 +108,36 @@ class TrayManager:
 
         self._thread = threading.Thread(target=self._icon.run, daemon=True)
         self._thread.start()
+        
+        self._check_animation()
+
+    def _animation_loop(self):
+        """Background loop to update the icon for animated states."""
+        while self._animating and self._icon:
+            if not self._icon.visible:
+                time.sleep(0.1)
+                continue
+                
+            self._anim_frame += 1
+            try:
+                self._icon.icon = get_icon(self._state, self._anim_frame)
+            except Exception:
+                pass
+            time.sleep(0.15)  # 150ms per frame
+
+    def _check_animation(self):
+        """Start or stop the animation loop based on the current state."""
+        should_animate = self._state in ("loading", "processing")
+        
+        if should_animate and not self._animating:
+            self._animating = True
+            self._anim_frame = 0
+            self._anim_thread = threading.Thread(target=self._animation_loop, daemon=True)
+            self._anim_thread.start()
+        elif not should_animate and self._animating:
+            self._animating = False
+            # Wait for thread to exit naturally
+            self._anim_thread = None
 
     def update_state(self, state_name: str, tooltip: str | None = None):
         """Update tray icon and tooltip for a new state."""
@@ -109,14 +145,23 @@ class TrayManager:
         if tooltip:
             self._tooltip = tooltip
 
+        self._check_animation()
+
         if self._icon and self._icon.visible:
-            icon_fn = STATE_ICONS.get(state_name)
-            if icon_fn:
-                self._icon.icon = icon_fn()
+            self._icon.icon = get_icon(self._state, 0)
             self._icon.title = self._tooltip
             # Force menu rebuild so dynamic text updates
             self._icon.menu = self._build_menu()
             self._icon.update_menu()
+
+    def update_audio_level(self, level: float):
+        """Update the icon dynamically based on audio volume level."""
+        if self._state == "recording" and self._icon and self._icon.visible:
+            from ui.icons import get_volume_icon
+            try:
+                self._icon.icon = get_volume_icon(level)
+            except Exception:
+                pass
 
     def update_info(self, device: str, model: str, hotkey: str):
         """Update the device/model/hotkey shown in the menu."""
@@ -126,6 +171,7 @@ class TrayManager:
 
     def stop(self):
         """Stop the tray icon."""
+        self._animating = False
         if self._icon:
             try:
                 self._icon.stop()
