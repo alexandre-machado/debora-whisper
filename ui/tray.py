@@ -3,7 +3,7 @@
 import threading
 import time
 import pystray
-from ui.icons import get_icon
+from ui.icons import get_icon, get_volume_icon
 
 
 class TrayManager:
@@ -114,7 +114,7 @@ class TrayManager:
     def _animation_loop(self):
         """Background loop to update the icon for animated states."""
         while self._animating and self._icon:
-            if not self._icon.visible:
+            if not getattr(self._icon, "visible", True):
                 time.sleep(0.1)
                 continue
                 
@@ -136,7 +136,6 @@ class TrayManager:
             self._anim_thread.start()
         elif not should_animate and self._animating:
             self._animating = False
-            # Wait for thread to exit naturally
             self._anim_thread = None
 
     def update_state(self, state_name: str, tooltip: str | None = None):
@@ -147,17 +146,19 @@ class TrayManager:
 
         self._check_animation()
 
-        if self._icon and self._icon.visible:
-            self._icon.icon = get_icon(self._state, 0)
-            self._icon.title = self._tooltip
-            # Force menu rebuild so dynamic text updates
-            self._icon.menu = self._build_menu()
-            self._icon.update_menu()
+        if self._icon and getattr(self._icon, "visible", True):
+            try:
+                self._icon.icon = get_icon(self._state, 0)
+                self._icon.title = self._tooltip
+                # Force menu rebuild so dynamic text updates
+                self._icon.menu = self._build_menu()
+                self._icon.update_menu()
+            except Exception:
+                pass
 
     def update_audio_level(self, level: float):
         """Update the icon dynamically based on audio volume level."""
-        if self._state == "recording" and self._icon and self._icon.visible:
-            from ui.icons import get_volume_icon
+        if self._state == "recording" and self._icon and getattr(self._icon, "visible", True):
             try:
                 self._icon.icon = get_volume_icon(level)
             except Exception:
