@@ -5,7 +5,7 @@ when that happened, `_quit` never ran, so the global keyboard hook and the
 tray icon were left running until the process died.
 """
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -55,6 +55,83 @@ def _under_test():
 
 
 GUIApp = _under_test()
+
+
+@pytest.mark.parametrize('key,value', [
+    ('beep_on_start', True),
+    ('beep_on_start', False),
+    ('sample_rate', 48000),
+    ('max_record_seconds', 30),
+])
+def test_audio_settings_restart_engine(key, value):
+    from dictation_engine import DEFAULT_CONFIG
+    app = GUIApp.__new__(GUIApp)
+    app._config = dict(DEFAULT_CONFIG)
+    if key == 'beep_on_start':
+        app._config[key] = not value
+    old_engine = MagicMock()
+    old_engine.stop_if_idle.return_value = None  # idle: it stops itself
+    app._engine = old_engine
+    app._overlay = MagicMock()
+    app._tray = MagicMock()
+    app._settings_status = MagicMock()
+    app._settings_set_apply = MagicMock()
+    # Use the function's globals, including on headless hosts where the
+    # import helper removes app from sys.modules after installing GUI stubs.
+    new_engine = MagicMock()
+    engine_factory = MagicMock(return_value=new_engine)
+    with patch.dict(GUIApp._on_settings_apply.__globals__, {
+        'DictationApp': engine_factory, 'save_config': MagicMock(),
+    }):
+        app._on_settings_apply({**app._config, key: value})
+    old_engine.stop_if_idle.assert_called_once()
+    engine_factory.assert_called_once_with(app._config)
+    new_engine.start_background.assert_called_once()
+
+
+def test_overlay_and_tray_toggle_follow_replaced_engine():
+    """Settings replaces the engine; the overlay dot and the tray menu item
+    must drive the new engine, not the stopped one they were built with."""
+    from types import SimpleNamespace
+    from dictation_engine import DEFAULT_CONFIG
+
+    g = GUIApp.__init__.__globals__
+    RealTray, RealOverlay = g["TrayManager"], g["OverlayWindow"]
+    captured = {}
+
+    class CapturingOverlay:
+        def __init__(self, root, on_toggle=None, **kwargs):
+            captured["on_toggle"] = on_toggle
+
+        def set_show_balloon(self, value):
+            pass
+
+        def set_balloon_font_size(self, value):
+            pass
+
+    first, second = MagicMock(), MagicMock()
+    first.stop_if_idle.return_value = None
+    factory = MagicMock(side_effect=[first, second])
+    config = dict(DEFAULT_CONFIG)
+    with patch.dict(g, {"ctk": MagicMock(), "DictationApp": factory,
+                        "OverlayWindow": CapturingOverlay,
+                        "save_config": MagicMock()}), \
+            patch("ui.icons.render_app_icon"), patch("PIL.ImageTk.PhotoImage"):
+        app = GUIApp(config)  # real __init__ wiring
+        app._settings_win = None
+        app._on_settings_apply({**config, "beep_on_start": not config["beep_on_start"]})
+
+    assert app._engine is second
+    # Real tray menu handler, built by the real __init__.
+    assert isinstance(app._tray, RealTray)
+    app._tray._on_toggle_click()
+    # Real overlay dot-click handler, given the callback __init__ passed in.
+    overlay = SimpleNamespace(_DOT_HIT_X=10, _state="ready", _drag_is_click=False,
+                              _on_toggle=captured["on_toggle"])
+    RealOverlay._on_drag_start(overlay, SimpleNamespace(x=0, y=0))
+
+    assert second.toggle_recording.call_count == 2
+    first.toggle_recording.assert_not_called()
 
 
 class _Stop:

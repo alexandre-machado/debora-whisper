@@ -17,13 +17,18 @@ from enum import Enum
 from pathlib import Path
 from datetime import datetime
 
+# Disable HuggingFace symlinks on Windows to avoid WinError 1314
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 CONFIG_DIR = Path.home() / ".npu-dictation"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 MODEL_DIR = CONFIG_DIR / "models"
-LOG_FILE = CONFIG_DIR / "dictation.log"
+LOG_DIR = CONFIG_DIR / "logs"
+LOG_FILE = LOG_DIR / "app.log"
+TELEMETRY_LOG = LOG_DIR / "telemetry.log"
 CACHE_DIR = CONFIG_DIR / "ov-cache"
 
 DEFAULT_CONFIG = {
@@ -163,8 +168,9 @@ def log(msg: str):
     line = f"[{timestamp}] {msg}"
     print(line)
     try:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        target_file = TELEMETRY_LOG if "[Telemetry]" in msg else LOG_FILE
+        with open(target_file, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -192,7 +198,7 @@ def save_config(config: dict):
 
 def validate_config(config: dict):
     """Validate config values. Raises ValueError on invalid values."""
-    valid_devices = {"NPU", "GPU", "CPU"}
+    valid_devices = {"NPU", "GPU", "CPU", "CUDA"}
     if config.get("device") not in valid_devices:
         raise ValueError(f"device must be one of {valid_devices}, got '{config.get('device')}'")
 
@@ -225,6 +231,9 @@ def setup_model(config: dict, progress_callback=None):
     model_size = config["model_size"]
     model_info = MODEL_REGISTRY[model_size]
     model_path = MODEL_DIR / model_info["local_dir"]
+
+    if config["device"] == "CUDA":
+        return None
 
     # Check if model already exists (Whisper uses .xml, Parakeet uses .onnx)
     has_xml = model_path.exists() and any(model_path.glob("*.xml"))
@@ -300,6 +309,233 @@ def setup_model(config: dict, progress_callback=None):
 
 
 # ---------------------------------------------------------------------------
+# Accelerator failure policy
+# ---------------------------------------------------------------------------
+# OpenCL runtime errors that OpenVINO reports from the GPU plugin. After one of
+# these, OpenVINO warns that later OpenCL calls may hang, so the process must not
+# touch the GPU (or anything sharing its context) again.
+_GPU_FATAL_MARKERS = (
+    "CL_OUT_OF_RESOURCES", "CL_OUT_OF_HOST_MEMORY",
+    "CL_MEM_OBJECT_ALLOCATION_FAILURE", "CL_DEVICE_NOT_AVAILABLE",
+    "CL_INVALID_COMMAND_QUEUE", "subsequent OpenCL calls",
+)
+_DEVICE_LOSS_MARKERS = ("device_lost", "device lost", "device hung")
+
+
+class DeviceFailureError(RuntimeError):
+    """An accelerator failed at runtime. ``device`` is GPU, NPU or UNKNOWN."""
+
+    def __init__(self, device: str, cause: BaseException):
+        self.device = device
+        self.detail = _failure_detail(cause)
+        super().__init__(f"{device} device failure: {self.detail}")
+
+
+class RestartRequiredError(RuntimeError):
+    """Raised for any load/inference attempt after a fatal device failure."""
+
+
+_device_failure_lock = threading.Lock()
+_device_failure: dict | None = None
+
+
+def _exception_chain(exc: BaseException):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+
+
+def has_nvidia_gpu(return_name: bool = False):
+    """Check if an NVIDIA GPU is present and accessible via nvidia-smi.
+    If return_name is True, returns the GPU name string or None if not found."""
+    import shutil
+    import os
+    if not shutil.which("nvidia-smi"):
+        return None if return_name else False
+    try:
+        import subprocess
+        
+        args = ["nvidia-smi"]
+        if return_name:
+            args = ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]
+            
+        output = subprocess.check_output(
+            args,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        )
+        return output.decode("utf-8").strip() if return_name else True
+    except Exception:
+        return None if return_name else False
+
+def _failure_detail(exc: BaseException) -> str:
+    """Short identifier of the original error (the deepest cause wins)."""
+    chain = list(_exception_chain(exc))
+    text = " ".join(str(e) for e in chain)
+    for marker in _GPU_FATAL_MARKERS[:-1]:
+        if marker in text:
+            return marker
+    root = chain[-1]
+    return f"{type(root).__name__}: {str(root)[:120]}"
+
+
+def classify_device_failure(exc: BaseException, active_devices=()) -> str | None:
+    """Return GPU, NPU or UNKNOWN for a fatal accelerator error, else None.
+
+    The decision uses the error text of the whole exception chain and the
+    devices the loaded backend really uses (Parakeet runs its decoder on GPU
+    even when the configured device is NPU), never the configured device alone.
+    """
+    if isinstance(exc, DeviceFailureError):
+        return exc.device
+    text = " ".join(str(e) for e in _exception_chain(exc))
+    if any(m in text for m in _GPU_FATAL_MARKERS):
+        return "GPU"
+    if not any(m in text.lower() for m in _DEVICE_LOSS_MARKERS):
+        return None
+    if "[GPU]" in text:
+        return "GPU"
+    if "[NPU]" in text or "ZE_RESULT" in text:
+        return "NPU"
+    devices = {str(d).upper() for d in active_devices if d}
+    if "GPU" in devices:
+        # A hybrid NPU+GPU pipeline cannot tell which one was lost: fail closed.
+        return "UNKNOWN" if "NPU" in devices else "GPU"
+    if "NPU" in devices:
+        return "NPU"
+    return "UNKNOWN"
+
+
+def restart_required_message(device: str, detail: str) -> str:
+    name = "The accelerator" if device == "UNKNOWN" else f"The {device}"
+    return (
+        f"{name} failed ({detail}). Dictation is disabled until NPU Dictation "
+        f"is restarted, because further calls could hang the driver. Quit and "
+        f"restart the app. If it happens again, pick another device in "
+        f"Settings before restarting."
+    )
+
+
+def record_device_failure(device: str, exc: BaseException) -> dict:
+    """Latch a fatal accelerator failure for the rest of this process."""
+    global _device_failure
+    with _device_failure_lock:
+        if _device_failure is None:
+            detail = _failure_detail(exc)
+            _device_failure = {
+                "device": device,
+                "detail": detail,
+                "message": restart_required_message(device, detail),
+                "exception": exc,
+            }
+        return dict(_device_failure)
+
+
+def device_failure() -> dict | None:
+    """The latched fatal failure for this process, or None."""
+    with _device_failure_lock:
+        return dict(_device_failure) if _device_failure else None
+
+
+def ensure_devices_usable():
+    """Refuse any model load/inference once the process has a fatal failure."""
+    failure = device_failure()
+    if failure:
+        raise RestartRequiredError(failure["message"]) from failure["exception"]
+
+
+def _reset_device_failure_for_tests():
+    global _device_failure
+    with _device_failure_lock:
+        _device_failure = None
+
+
+def _model_active_devices(model) -> set:
+    if model is None:
+        return set()
+    getter = getattr(model, "active_devices", None)
+    if callable(getter):
+        try:
+            return set(getter())
+        except Exception:
+            return set()
+    device = getattr(model, "device", None)
+    return {device} if isinstance(device, str) else set()
+
+
+# ---------------------------------------------------------------------------
+# Whisper pipeline using Faster Whisper (CUDA)
+# ---------------------------------------------------------------------------
+class FasterWhisperCUDA:
+    """Whisper speech-to-text using faster-whisper on NVIDIA CUDA."""
+
+    def __init__(self, model_size: str, device: str = "cuda"):
+        self.device = device
+        self.model_size = model_size
+        self.pipeline = None
+        self._load_pipeline()
+
+    def active_devices(self) -> set:
+        return {"CUDA"}
+
+    def _load_pipeline(self):
+        ensure_devices_usable()
+        
+        # On Windows, CTranslate2 needs to find the CUDA runtime DLLs (cublas, cudnn).
+        # If installed via pip (nvidia-cublas-cu12, nvidia-cudnn-cu12), we must explicitly
+        # add them to the DLL search path.
+        if sys.platform == "win32":
+            try:
+                import site
+                for site_pkg in site.getsitepackages():
+                    nvidia_base = Path(site_pkg) / "nvidia"
+                    if nvidia_base.exists():
+                        for lib_dir in nvidia_base.iterdir():
+                            bin_path = lib_dir / "bin"
+                            if bin_path.exists():
+                                os.environ["PATH"] = str(bin_path) + os.pathsep + os.environ.get("PATH", "")
+                                if hasattr(os, "add_dll_directory"):
+                                    os.add_dll_directory(str(bin_path))
+            except Exception as e:
+                log(f"Warning: Failed to inject NVIDIA DLL paths: {e}")
+
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise RuntimeError("faster-whisper is not installed. Please install it to use CUDA backend.")
+            
+        log(f"Loading faster-whisper pipeline on CUDA ({self.model_size})...")
+        
+        # compute_type="int8_float16" gives the best performance/VRAM tradeoff on RTX.
+        start = time.time()
+        self.pipeline = WhisperModel(self.model_size, device="cuda", compute_type="int8_float16")
+        hw_name = has_nvidia_gpu(return_name=True) or "NVIDIA GPU"
+        log(f"Loaded faster-whisper on {hw_name} in {time.time() - start:.1f}s")
+
+    def transcribe(self, audio_data, sample_rate: int = 16000, language: str = "en") -> str:
+        import numpy as np
+        
+        if audio_data.dtype == np.int16:
+            audio_data = audio_data.astype(np.float32) / 32768.0
+        elif audio_data.dtype != np.float32:
+            audio_data = audio_data.astype(np.float32)
+
+        ensure_devices_usable()
+        
+        segments, info = self.pipeline.transcribe(
+            audio_data,
+            language=language if language != "auto" else None,
+            condition_on_previous_text=False,
+            without_timestamps=True
+        )
+        
+        text = "".join(segment.text for segment in segments)
+        return text.strip()
+
+
+# ---------------------------------------------------------------------------
 # Whisper pipeline using OpenVINO GenAI
 # ---------------------------------------------------------------------------
 class WhisperNPU:
@@ -311,6 +547,10 @@ class WhisperNPU:
         self.pipeline = None
         self._load_pipeline()
 
+    def active_devices(self) -> set:
+        """Devices the loaded pipeline actually runs on."""
+        return {self.device}
+
     def _load_pipeline(self):
         """Load the OpenVINO Whisper pipeline."""
         # Warn about large models on NPU — they may trigger driver instability
@@ -319,19 +559,30 @@ class WhisperNPU:
             log(f"NOTE: Large models on NPU may cause driver instability (DEVICE_LOST).")
             log(f"  If inference fails, try rebooting to reset the NPU, or use --device GPU")
 
+        ensure_devices_usable()
         log(f"Loading Whisper pipeline on {self.device}...")
         start = time.time()
 
         try:
             import openvino_genai as ov_genai
+            import openvino as ov
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             self.pipeline = ov_genai.WhisperPipeline(
                 str(self.model_path), self.device,
                 CACHE_DIR=str(CACHE_DIR)
             )
-            log(f"Loaded via openvino_genai in {time.time() - start:.1f}s")
+            try:
+                hw_name = ov.Core().get_property(self.device, "FULL_DEVICE_NAME")
+            except Exception:
+                hw_name = self.device
+            log(f"Loaded via openvino_genai on {hw_name} in {time.time() - start:.1f}s")
         except Exception as e:
             log(f"Failed to load model: {e}")
+            kind = classify_device_failure(e, self.active_devices())
+            if kind is not None:
+                # A lost device or broken OpenCL context: do not keep loading
+                # in this process, not even on CPU.
+                raise DeviceFailureError(kind, e) from e
             log("Falling back to CPU...")
             if self.device != "CPU":
                 self.device = "CPU"
@@ -357,22 +608,15 @@ class WhisperNPU:
         config.task = "transcribe"
         config.return_timestamps = False
 
+        ensure_devices_usable()
         try:
             result = self.pipeline.generate(audio_data, config)
-        except RuntimeError as e:
-            if "DEVICE_LOST" in str(e) or "device hung" in str(e):
-                log(f"NPU DEVICE_LOST — the NPU driver crashed or is in a bad state.")
-                log(f"  A reboot will reset the NPU. Or use --device GPU to bypass it.")
-                raise RuntimeError(
-                    f"NPU device lost. Reboot to reset the NPU, "
-                    f"or use --device GPU."
-                ) from e
-            elif "CL_OUT_OF_RESOURCES" in str(e):
-                log(f"GPU CL_OUT_OF_RESOURCES — the GPU ran out of memory or its driver crashed.")
-                raise RuntimeError(
-                    f"GPU out of resources or driver crash."
-                ) from e
-            raise
+        except Exception as e:
+            kind = classify_device_failure(e, self.active_devices())
+            if kind is None:
+                raise
+            log(f"{kind} failure during inference on {self.device}: {e}")
+            raise DeviceFailureError(kind, e) from e
         text = str(result).strip()
 
         elapsed = time.time() - start
@@ -459,8 +703,14 @@ class ParakeetNPU:
         self.preproc = None  # onnxruntime session
         self.enc_compiled: dict[int, "object"] = {}  # bucket frame count -> compiled encoder
         self.dec_compiled = None  # OpenVINO compiled decoder
+        # Decoder target; it is attempted on GPU even when device is NPU/CPU.
+        self.dec_device = "GPU"
         self.enc_time_dim: dict[int, int] = {}  # bucket frame count -> encoder output time dim
         self._load_pipeline()
+
+    def active_devices(self) -> set:
+        """Devices the hybrid pipeline uses (encoder plus decoder)."""
+        return {self.device, self.dec_device}
 
     @classmethod
     def select_bucket(cls, actual_frames: int) -> tuple[int, bool]:
@@ -646,6 +896,9 @@ class ParakeetNPU:
                 every single startup that hits this path)."""
                 if self.device == "CPU":
                     raise first_exc
+                kind = classify_device_failure(first_exc, {self.device})
+                if kind is not None:
+                    raise DeviceFailureError(kind, first_exc) from first_exc
                 fallback = "GPU" if self.device == "NPU" else "CPU"
                 log(f"  Encoder bucket {bucket} failed on {self.device}: {first_exc}")
                 log(f"  Falling back to {fallback}...")
@@ -654,7 +907,23 @@ class ParakeetNPU:
                     self.device = fallback
                     log(f"  Encoder bucket {bucket} compiled on {fallback}")
                     return c
-                except Exception:
+                except Exception as fallback_exc:
+                    # The fallback device can fail fatally too (e.g. NPU hit an
+                    # ordinary compile error, then GPU raised
+                    # CL_OUT_OF_RESOURCES). Classify it against the device it
+                    # ran on and stop before any further compile: the decoder
+                    # would otherwise reuse the same failed GPU context.
+                    # Raising here keeps first_exc as __context__.
+                    # first_exc was already shown non-fatal above, so a match
+                    # here comes from the fallback compile. Blame the fallback
+                    # device: the chain text may still carry an "[NPU]" or
+                    # ZE_RESULT tag from first_exc, which would otherwise read
+                    # as an NPU-only loss and send the GUI back onto this GPU.
+                    kind = classify_device_failure(fallback_exc, {fallback})
+                    if kind is not None:
+                        failed = fallback if fallback != "CPU" else kind
+                        raise DeviceFailureError(failed, fallback_exc) from fallback_exc
+                    log(f"  Encoder bucket {bucket} failed on {fallback}: {fallback_exc}")
                     log(f"  Falling back to CPU...")
                     c = core.compile_model(model_to_compile, "CPU", {"CACHE_DIR": str(CACHE_DIR)})
                     self.device = "CPU"
@@ -716,8 +985,12 @@ class ParakeetNPU:
                 )
                 log(f"  Decoder compiled on GPU")
             except Exception as e:
+                kind = classify_device_failure(e, {"GPU"})
+                if kind is not None:
+                    raise DeviceFailureError(kind, e) from e
                 log(f"  Decoder failed on GPU: {e}, falling back to CPU")
                 self.dec_compiled = core.compile_model(decoder_model, "CPU")
+                self.dec_device = "CPU"
                 log(f"  Decoder compiled on CPU")
 
             # 5. Validate the vocab-derived constants against the decoder's
@@ -731,9 +1004,30 @@ class ParakeetNPU:
 
         except Exception as e:
             log(f"Failed to load Parakeet pipeline: {e}")
+            kind = classify_device_failure(e, self.active_devices())
+            if kind is not None and not isinstance(e, DeviceFailureError):
+                raise DeviceFailureError(kind, e) from e
             raise
 
-        log(f"Parakeet pipeline loaded in {time.time() - start:.1f}s")
+        import openvino as ov
+        try:
+            core = ov.Core()
+            enc_hw = core.get_property(self.device, "FULL_DEVICE_NAME")
+        except Exception:
+            enc_hw = self.device
+            
+        dec_dev = getattr(self, "dec_device", "GPU")
+        try:
+            dec_hw = core.get_property(dec_dev, "FULL_DEVICE_NAME")
+        except Exception:
+            dec_hw = dec_dev
+            
+        if enc_hw == dec_hw:
+            hw_str = enc_hw
+        else:
+            hw_str = f"{enc_hw} (Encoder) + {dec_hw} (Decoder)"
+
+        log(f"Parakeet pipeline loaded on {hw_str} in {time.time() - start:.1f}s")
 
     def _preprocess(self, audio_data) -> tuple:
         """Convert raw audio to mel features using nemo128.onnx."""
@@ -840,16 +1134,24 @@ class ParakeetNPU:
         # else: actual_frames stays the true (shorter) frame count so the
         # encoder does not attend over the zero-padding pad_to_bucket() added.
 
-        # 2. Encoder (NPU/GPU) — dispatch to the compiled graph for this bucket
-        enc_result = self.enc_compiled[bucket]({
-            "audio_signal": mel,
-            "length": np.array([actual_frames], dtype=np.int64),
-        })
-        enc_out = enc_result["outputs"]
-        enc_len = int(enc_result["encoded_lengths"][0])
+        ensure_devices_usable()
+        try:
+            # 2. Encoder (NPU/GPU) — dispatch to the compiled graph for this bucket
+            enc_result = self.enc_compiled[bucket]({
+                "audio_signal": mel,
+                "length": np.array([actual_frames], dtype=np.int64),
+            })
+            enc_out = enc_result["outputs"]
+            enc_len = int(enc_result["encoded_lengths"][0])
 
-        # 3. TDT Decoder (CPU)
-        text = self._tdt_greedy_decode(enc_out, enc_len)
+            # 3. TDT Decoder (GPU, or CPU after a load-time fallback)
+            text = self._tdt_greedy_decode(enc_out, enc_len)
+        except Exception as e:
+            kind = classify_device_failure(e, self.active_devices())
+            if kind is None:
+                raise
+            log(f"{kind} failure during Parakeet inference: {e}")
+            raise DeviceFailureError(kind, e) from e
 
         elapsed = time.time() - start
         audio_duration = len(audio_data) / sample_rate
@@ -860,17 +1162,25 @@ class ParakeetNPU:
         return text
 
 
-def create_model(model_path: Path, device: str, backend: str):
+def create_model(model_path: Path, device: str, backend: str, model_size: str = None):
     """Factory function to create the right model class based on backend.
 
     Args:
-        model_path: Path to model directory.
-        device: Device string (NPU, GPU, CPU).
+        model_path: Path to model directory (can be None for CUDA).
+        device: Device string (NPU, GPU, CPU, CUDA).
         backend: "whisper" or "parakeet" from MODEL_REGISTRY.
+        model_size: Size of the model (e.g. "turbo"), required for CUDA.
 
     Returns:
-        WhisperNPU or ParakeetNPU instance.
+        WhisperNPU, ParakeetNPU, or FasterWhisperCUDA instance.
     """
+    # Covers engines rebuilt by Settings: a new instance in the same process
+    # must not load anything after a fatal device failure.
+    ensure_devices_usable()
+    
+    if device == "CUDA":
+        return FasterWhisperCUDA(model_size, device="cuda")
+        
     if backend == "parakeet":
         return ParakeetNPU(model_path, device=device)
     return WhisperNPU(model_path, device=device)
@@ -892,10 +1202,11 @@ class AudioRecorder:
     """Record audio from microphone using sounddevice."""
 
     def __init__(self, sample_rate: int = 16000, channels: int = 1,
-                 max_record_seconds: float = None):
+                 max_record_seconds: float = None, on_timeout=None):
         self.sample_rate = sample_rate
         self.channels = channels
         self.max_record_seconds = max_record_seconds
+        self.on_timeout = on_timeout
         self.recording = False
         self._frames = []
 
@@ -908,6 +1219,7 @@ class AudioRecorder:
         self._stream = None
         self._lock = threading.Lock()
         self._timer = None
+        self._recording_generation = 0
         self.telemetry = {}
         self._audio_ready = threading.Event()
         self._last_callback = None
@@ -998,19 +1310,28 @@ class AudioRecorder:
                 self._frames.append(self._lookback[:count - first].copy())
             self._lookback_count = 0
             self.recording = True
+            self._recording_generation += 1
+            if self.max_record_seconds:
+                self._timer = threading.Timer(
+                    self.max_record_seconds, self._timeout_stop,
+                    args=(self._recording_generation,),
+                )
+                self._timer.daemon = True
+                self._timer.start()
 
         log("Recording started...")
 
-        if self.max_record_seconds:
-            self._timer = threading.Timer(self.max_record_seconds, self._timeout_stop)
-            self._timer.daemon = True
-            self._timer.start()
-
-    def _timeout_stop(self):
+    def _timeout_stop(self, generation):
         """Called when max_record_seconds is reached."""
-        if self.recording:
-            log(f"Max recording time ({self.max_record_seconds}s) reached, stopping.")
-            self.stop()
+        with self._lock:
+            if not self.recording or generation != self._recording_generation:
+                return
+            # Freeze capture, preserving frames until the consumer calls stop().
+            self.recording = False
+            self._timer = None
+        log(f"Max recording time ({self.max_record_seconds}s) reached, stopping.")
+        if self.on_timeout is not None:
+            self.on_timeout(generation)
 
     def stop(self):
         """Stop recording and return audio as numpy array."""
@@ -1021,10 +1342,9 @@ class AudioRecorder:
             frames = self._frames
             self._frames = []
             telemetry = dict(self.telemetry)
-
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
 
         t_first = telemetry.get('first_frame')
         t_start = telemetry.get('start_called')
@@ -1049,9 +1369,11 @@ class AudioRecorder:
 
     def close(self):
         """Close the stream permanently."""
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
+        with self._lock:
+            self.recording = False
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
         stream, self._stream = self._stream, None
         try:
             if stream is not None:
@@ -1311,10 +1633,21 @@ class DictationApp:
         self.recorder = AudioRecorder(
             sample_rate=config["sample_rate"],
             max_record_seconds=config.get("max_record_seconds"),
+            on_timeout=self._finish_recording,
         )
         self.chimes = ChimePlayer()
         self._audio_lifecycle_lock = threading.Lock()
         self._stopping = threading.Event()
+        # Orders the final "still running?" check plus paste/history against
+        # stop(). Only type_text and the history append run under it, never a
+        # state callback, so a callback that calls stop() cannot deadlock.
+        self._output_lock = threading.Lock()
+        self._transcribing = False
+        # Number of model load/warmup reservations in flight (each compiles
+        # and infers on the accelerator). A counter, not a flag, so an older
+        # loader finishing can never clear a newer loader's busy state.
+        # Guarded by _audio_lifecycle_lock.
+        self._loading = 0
         self.whisper = None  # Lazy-loaded
         self.is_recording = False
         self._model_ready = threading.Event()
@@ -1325,6 +1658,40 @@ class DictationApp:
         self._callbacks: list = []
         self._history: list[dict] = []
 
+        self._resource_thread = threading.Thread(target=self._monitor_resources, daemon=True)
+        self._resource_thread.start()
+
+    def _monitor_resources(self):
+        """Continuously log CPU, RAM, and VRAM usage to telemetry."""
+        try:
+            import psutil
+            import sys
+            process = psutil.Process()
+            while True:
+                cpu = psutil.cpu_percent(interval=5.0)
+                mem = process.memory_info().rss / (1024 * 1024)
+                sys_mem = psutil.virtual_memory().percent
+                
+                vram_info = ""
+                if self.config.get("device") == "CUDA":
+                    try:
+                        import subprocess
+                        output = subprocess.check_output(
+                            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,nounits,noheader"],
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                        ).decode("utf-8").strip()
+                        used, total = output.split(", ")
+                        vram_info = f" | VRAM: {used}/{total}MB"
+                    except Exception:
+                        pass
+                
+                state_name = self._state.value if hasattr(self, "_state") else "UNKNOWN"
+                log(f"[Telemetry] State: {state_name} | CPU: {cpu:02.1f}% | App RAM: {mem:.0f}MB | Sys RAM: {sys_mem:02.1f}%{vram_info}")
+        except ImportError:
+            log("[Telemetry] psutil not found. Resource monitoring disabled.")
+        except Exception as e:
+            log(f"[Telemetry] Resource monitoring stopped: {e}")
+
     # -- Callback system -----------------------------------------------
 
     def add_callback(self, fn):
@@ -1333,6 +1700,8 @@ class DictationApp:
 
     def _set_state(self, state: AppState, data: dict | None = None):
         """Update state and notify all callbacks."""
+        if self._stopping.is_set():
+            return
         self._state = state
         data = data or {}
         for cb in self._callbacks:
@@ -1359,11 +1728,89 @@ class DictationApp:
             self.whisper = create_model(
                 model_path, device=self.config["device"],
                 backend=model_info["backend"],
+                model_size=self.config["model_size"]
             )
 
+    def _error_payload(self, exc: BaseException) -> dict:
+        """Classify an engine error and build the ERROR state payload.
+
+        A GPU (or unattributable) device failure is latched for the whole
+        process: this engine and any engine created later refuse to load or
+        infer until the app is restarted. An NPU-only loss keeps the existing
+        ``device_lost`` payload so the GUI may move to a healthy GPU.
+        """
+        if isinstance(exc, RestartRequiredError):
+            kind = "LATCHED"
+        else:
+            kind = classify_device_failure(exc, _model_active_devices(self.whisper))
+        if kind is None:
+            return {"error": str(exc)}
+        cause = f"{type(exc).__name__}: {exc}"
+        if kind == "NPU":
+            return {"error": str(exc), "device_lost": True,
+                    "device_failure": "NPU", "cause": cause}
+        failure = device_failure() if kind == "LATCHED" else record_device_failure(kind, exc)
+        # Never call into the failed model again from this engine.
+        self._load_error = failure["message"]
+        self._model_ready.set()
+        log(failure["message"])
+        return {
+            "error": failure["message"],
+            "restart_required": True,
+            "device_failure": failure["device"],
+            "cause": cause,
+        }
+
+    def _start_loader(self):
+        """Spawn the load thread, marking the engine busy before it starts so
+        stop_if_idle() can never miss a load that is about to begin.
+
+        The reservation taken here is released by the new thread only after
+        _load_model_background returns, so it covers the whole load even when
+        a caller (e.g. a synchronous ERROR callback that falls back to GPU)
+        starts the next loader before the previous one has returned.
+        """
+        with self._audio_lifecycle_lock:
+            if self._stopping.is_set():
+                return
+            self._loading += 1
+
+        def run():
+            try:
+                self._load_model_background()
+            finally:
+                self._release_loading()
+
+        try:
+            threading.Thread(target=run, daemon=True).start()
+        except BaseException:
+            # The thread never ran, so its finally never will: undo here.
+            self._release_loading()
+            raise
+
+    def _release_loading(self):
+        with self._audio_lifecycle_lock:
+            self._loading -= 1
+
     def _load_model_background(self):
-        """Load model in background thread, setting _model_ready when done."""
+        """Load model in background thread, setting _model_ready when done.
+
+        Holds its own loading reservation, so direct callers (CLI ``run()``,
+        tests) are also reported busy while it runs.
+        """
+        with self._audio_lifecycle_lock:
+            self._loading += 1
+        try:
+            self._load_model_background_inner()
+        finally:
+            self._release_loading()
+
+    def _load_model_background_inner(self):
         if self._stopping.is_set():
+            return
+        if device_failure():
+            self._set_state(AppState.ERROR, self._error_payload(
+                RestartRequiredError(device_failure()["message"])))
             return
         self._set_state(AppState.LOADING)
         try:
@@ -1416,24 +1863,40 @@ class DictationApp:
                     return
                 self.recorder.wait_ready()
                 self._model_ready.set()
-                self._set_state(AppState.READY)
+            # Notify outside the lock: a READY callback may call stop(),
+            # busy_reason() or stop_if_idle() (or wait on a thread that does),
+            # all of which take _audio_lifecycle_lock. _set_state re-checks
+            # _stopping, so a stop that lands here suppresses READY.
+            self._set_state(AppState.READY)
             log("Ready! Waiting for hotkey...")
         except Exception as e:
+            import traceback
+            log(f"Model loading failed: {e}")
+            log(traceback.format_exc())
+            # Classify (and latch) even during shutdown: the failed device
+            # must stay off-limits for any engine created afterwards.
+            payload = self._error_payload(e)
             if self._stopping.is_set():
                 return
-            self._load_error = str(e)
+            if not payload.get("restart_required"):
+                self._load_error = str(e)
             self._model_ready.set()  # Unblock waiters so they can see the error
-            self._set_state(AppState.ERROR, {"error": str(e)})
-            log(f"Model loading failed: {e}")
+            self._set_state(AppState.ERROR, payload)
 
     def fallback_device(self, new_device: str):
         """Clear error state and reload model on a different device."""
+        failure = device_failure()
+        if failure:
+            log(f"Refusing to reload on {new_device}: {failure['message']}")
+            self._set_state(AppState.ERROR, self._error_payload(
+                RestartRequiredError(failure["message"])))
+            return
         log(f"Falling back to device: {new_device}")
         self._load_error = None
         self._model_ready.clear()
         self.whisper = None
         self.config["device"] = new_device
-        threading.Thread(target=self._load_model_background, daemon=True).start()
+        self._start_loader()
 
     # -- Input device enumeration ----------------------------------------
 
@@ -1453,26 +1916,18 @@ class DictationApp:
 
     # -- Recording -------------------------------------------------------
 
-    def toggle_recording(self):
-        """Toggle recording on/off (Supports Tap-to-Toggle and Push-To-Talk)."""
-        import time
-        import threading
-        
-        if self._stopping.is_set():
-            return
-
-        if getattr(self, "_hotkey_held", False):
-            # Ignore auto-repeat while the key is physically held
-            return
-            
-        self._hotkey_held = True
-        press_time = time.time()
-
-        def _do_stop():
-            if not self.is_recording:
+    def _finish_recording(self, generation=None):
+        """Consume one recording, whether stopped by the user or its timer."""
+        with self._audio_lifecycle_lock:
+            if (self._stopping.is_set() or not self.is_recording or self._transcribing or
+                    (generation is not None and generation != self.recorder._recording_generation)):
                 return
-            audio = self.recorder.stop()
             self.is_recording = False
+            self._transcribing = True
+        try:
+            audio = self.recorder.stop()
+            if self._stopping.is_set():
+                return
             if self.config["beep_on_start"]:
                 self.chimes.play('stop')
 
@@ -1484,6 +1939,7 @@ class DictationApp:
             self._set_state(AppState.PROCESSING)
 
             try:
+                ensure_devices_usable()
                 self.ensure_model()
                 text = self.whisper.transcribe(
                     audio,
@@ -1497,32 +1953,52 @@ class DictationApp:
                     text = ""
 
                 if text:
-                    type_text(text, auto_enter=self.config["auto_enter"])
-                    # Store in history
-                    self._history.append({
-                        "timestamp": datetime.now().isoformat(),
-                        "text": text,
-                        "duration": len(audio) / self.config["sample_rate"],
-                    })
-                    if len(self._history) > self.MAX_HISTORY:
-                        self._history = self._history[-self.MAX_HISTORY:]
+                    # The final stop check and the paste are one step with
+                    # respect to stop(): once stop() returns, nothing pastes.
+                    # No callback runs while the lock is held.
+                    with self._output_lock:
+                        if self._stopping.is_set():
+                            log("Engine stopped; discarding late transcription.")
+                            return
+                        type_text(text, auto_enter=self.config["auto_enter"])
+                        self._history.append({
+                            "timestamp": datetime.now().isoformat(),
+                            "text": text,
+                            "duration": len(audio) / self.config["sample_rate"],
+                        })
+                        if len(self._history) > self.MAX_HISTORY:
+                            self._history = self._history[-self.MAX_HISTORY:]
                     self._set_state(AppState.READY, {"text": text})
                 else:
                     log("No speech detected.")
                     self._set_state(AppState.READY)
-            except RuntimeError as e:
-                import traceback
-                log(f"RuntimeError during transcription: {e}")
-                log(traceback.format_exc())
-                if "DEVICE_LOST" in str(e) or "device hung" in str(e) or "GPU out of resources" in str(e) or "CL_OUT_OF_RESOURCES" in str(e):
-                    self._set_state(AppState.ERROR, {"error": str(e), "device_lost": True})
-                else:
-                    self._set_state(AppState.ERROR, {"error": str(e)})
             except Exception as e:
                 import traceback
                 log(f"Error during transcription: {e}")
                 log(traceback.format_exc())
-                self._set_state(AppState.ERROR, {"error": str(e)})
+                # Latches GPU failures even if shutdown started meanwhile.
+                self._set_state(AppState.ERROR, self._error_payload(e))
+        except Exception as exc:
+            log(f"Error stopping recording: {exc}")
+            self._set_state(AppState.ERROR, {"error": str(exc)})
+        finally:
+            with self._audio_lifecycle_lock:
+                self._transcribing = False
+
+    def toggle_recording(self):
+        """Toggle recording on/off (Supports Tap-to-Toggle and Push-To-Talk)."""
+        import time
+        import threading
+
+        if self._stopping.is_set() or self._transcribing:
+            return
+
+        if getattr(self, "_hotkey_held", False):
+            # Ignore auto-repeat while the key is physically held
+            return
+
+        self._hotkey_held = True
+        press_time = time.time()
 
         press_perf = time.perf_counter()
 
@@ -1536,6 +2012,14 @@ class DictationApp:
                     self.chimes.play('warning')
                 return
 
+            failure = device_failure()
+            if failure:
+                # Another engine in this process may have hit the failure.
+                log(f"Cannot record: {failure['message']}")
+                self._set_state(AppState.ERROR, self._error_payload(
+                    RestartRequiredError(failure["message"])))
+                return
+
             if self._load_error:
                 log(f"Cannot record — model failed to load: {self._load_error}")
                 return
@@ -1543,7 +2027,7 @@ class DictationApp:
             t_before_rec = time.perf_counter()
             try:
                 with self._audio_lifecycle_lock:
-                    if self._stopping.is_set():
+                    if self._stopping.is_set() or self._transcribing:
                         return
                     self.recorder.wait_ready(timeout=0)
                     self.recorder.start()
@@ -1573,11 +2057,11 @@ class DictationApp:
             # treat it as Push-To-Talk and stop recording upon release.
             duration = time.time() - press_time
             if started_recording and duration > 0.4:
-                _do_stop()
+                self._finish_recording()
 
         if self.is_recording:
             # Stop recording immediately in a thread
-            threading.Thread(target=_do_stop, daemon=True).start()
+            threading.Thread(target=self._finish_recording, daemon=True).start()
             threading.Thread(target=_watch_key, args=(False,), daemon=True).start()
         else:
             # Start recording immediately in a thread
@@ -1599,11 +2083,48 @@ class DictationApp:
         log(f"Hotkey {hotkey} registered.")
 
         log("Loading model in background (first time may take several minutes)...")
-        threading.Thread(target=self._load_model_background, daemon=True).start()
+        self._start_loader()
+
+    def busy_reason(self) -> str | None:
+        """What accelerator/microphone work is in flight, or None if idle."""
+        with self._audio_lifecycle_lock:
+            return self._busy_reason_locked()
+
+    def _busy_reason_locked(self) -> str | None:
+        if self.is_recording:
+            return "recording"
+        if self._transcribing:
+            return "transcription"
+        if self._loading:
+            return "model loading"
+        return None
+
+    def stop_if_idle(self) -> str | None:
+        """Stop this engine only if no recording, transcription or model load
+        is in flight. Returns the busy reason (engine left running) or None
+        (engine stopped).
+
+        The idle check and the stop flag are set under the same lock every
+        start path (hotkey start, timer/user stop, loader spawn) takes, so no
+        new work can begin between the check and the stop. Used before a
+        Settings rebuild so a new pipeline is never compiled while the old
+        one may still be running on the same device. Never blocks on
+        in-flight inference, which may be hung in a driver.
+        """
+        with self._audio_lifecycle_lock:
+            reason = self._busy_reason_locked()
+            if reason is not None:
+                return reason
+            self._stopping.set()
+        self.stop()
+        return None
 
     def stop(self):
         """Clean shutdown — unhook keyboard and stop recording if active."""
-        self._stopping.set()
+        # Taking the output lock orders this against a paste in progress:
+        # after this line no transcription can be typed or added to history.
+        with self._output_lock:
+            self._stopping.set()
         try:
             import keyboard
             keyboard.unhook_all()
@@ -1699,23 +2220,28 @@ def run_setup():
             log("  [OK] GPU detected (Intel iGPU)")
     except ImportError:
         log("  Could not import openvino - installation may have failed")
+        
+    if has_nvidia_gpu():
+        log("  [OK] CUDA detected (NVIDIA GPU)")
 
     # 4. Create default config
     config = load_config()
     
-    # Auto-detect best device
-    try:
-        import openvino as ov
-        core = ov.Core()
-        devices = core.available_devices
-        if "NPU" in devices:
-            config["device"] = "NPU"
-        elif "GPU" in devices:
-            config["device"] = "GPU"
-        else:
+    if has_nvidia_gpu():
+        config["device"] = "CUDA"
+    else:
+        try:
+            import openvino as ov
+            core = ov.Core()
+            devices = core.available_devices
+            if "NPU" in devices:
+                config["device"] = "NPU"
+            elif "GPU" in devices:
+                config["device"] = "GPU"
+            else:
+                config["device"] = "CPU"
+        except Exception:
             config["device"] = "CPU"
-    except Exception:
-        config["device"] = "CPU"
 
     save_config(config)
 
@@ -1737,7 +2263,8 @@ def run_setup():
             import numpy as np
             model_info = MODEL_REGISTRY[config["model_size"]]
             model = create_model(model_path, device=config["device"],
-                                 backend=model_info["backend"])
+                                 backend=model_info["backend"],
+                                 model_size=config["model_size"])
             silence = np.zeros(config["sample_rate"], dtype=np.float32)  # 1 second of silence
             model.transcribe(silence, sample_rate=config["sample_rate"], language=config["language"])
             log("Cache warm-up complete — subsequent starts will be fast.")
@@ -1759,7 +2286,7 @@ def run_setup():
 def main():
     parser = argparse.ArgumentParser(description="NPU Dictation Engine")
     parser.add_argument("--setup", action="store_true", help="Run first-time setup")
-    parser.add_argument("--device", choices=["NPU", "GPU", "CPU"], help="Override device")
+    parser.add_argument("--device", choices=["NPU", "GPU", "CPU", "CUDA"], help="Override device")
     parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), help="Model size")
     parser.add_argument("--language", type=str, help="Language code (e.g., en, ru, id)")
     parser.add_argument("--auto-enter", action="store_true", help="Press Enter after typing")
@@ -1788,6 +2315,10 @@ def main():
     if not args.device:
         model_info = MODEL_REGISTRY[config["model_size"]]
         preferred = model_info["preferred_device"]
+        
+        if preferred == "GPU" and has_nvidia_gpu():
+            preferred = "CUDA"
+                
         if config["device"] != preferred:
             log(f"Auto-selecting {preferred} for {config['model_size']} "
                 f"(override with --device {config['device']})")

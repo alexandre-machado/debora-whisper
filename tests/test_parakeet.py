@@ -73,6 +73,7 @@ class TestEnsureModelDispatch:
 
         mock_create.assert_called_once_with(
             Path("/fake/parakeet"), device="NPU", backend="parakeet",
+            model_size="parakeet"
         )
 
     @patch("dictation_engine.create_model")
@@ -87,6 +88,7 @@ class TestEnsureModelDispatch:
 
         mock_create.assert_called_once_with(
             Path("/fake/whisper"), device="NPU", backend="whisper",
+            model_size="base"
         )
 
 

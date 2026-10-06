@@ -7,6 +7,11 @@
 openvino>=2025.1,<2026.0
 openvino-genai>=2025.1,<2026.0
 
+# CUDA backend (RTX GPUs)
+faster-whisper>=1.0.0
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+
 # Model export
 # This cap does NOT by itself keep resolution off optimum-intel 2.0.0 /
 # openvino 2026.x: optimum's own "openvino" extra has no upper bound on

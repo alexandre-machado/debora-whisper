@@ -22,8 +22,9 @@ and logs the error while allowing microphone initialization to continue.
 
 1. Restart the app with audio feedback enabled. Wait for READY, then repeat a
    short phrase starting immediately at the hotkey, including after idle time.
-2. Repeat with `beep_on_start` disabled and restart the app. This also prevents
-   opening the persistent output stream, giving a capture-only baseline.
+2. Repeat with `beep_on_start` disabled. Applying this setting reloads the
+   engine and closes the persistent output stream, giving a capture-only
+   baseline. When editing the configuration file directly, restart the app.
 3. Compare the actual device/HostAPI and capture telemetry in
    `~/.npu-dictation/dictation.log`:
    - `live_frames`: samples captured after recording started, excluding lookback.
@@ -43,6 +44,23 @@ ADC metrics remain zero when the backend reports unavailable/nonpositive ADC
 timestamps. Silence is valid audio. No configuration here guarantees immunity
 to driver stalls or device removal. A stalled microphone produces an error;
 automatic device reconnection is not implemented.
+
+Inference failures are separate from audio capture. After an OpenVINO GPU
+error such as `CL_OUT_OF_RESOURCES`, the app disables recording and inference
+for the rest of the process and asks for a restart instead of reloading the
+model (see README, "GPU failed: restart required"). A recording that hits
+`max_record_seconds` is kept and transcribed once. Text is never pasted after
+the engine has stopped (Quit or a Settings rebuild), and a Settings change
+that rebuilds the engine is refused, with a message, while a recording,
+transcription or model load is in flight. That includes the GPU reload that
+follows an NPU device loss: loads are counted, so an earlier load finishing
+cannot mark a later one as idle.
+
+Known limitations: device failures are recognised from OpenVINO error text, so
+a fatal error worded differently from the known markers is treated as an
+ordinary error. A driver call that hangs keeps the engine busy (and Settings
+rebuilds refused) until you quit and restart the app. The latched failure keeps
+the original exception in memory for the rest of the process.
 
 Automated tests use simulated streams to check sample continuity, variable block
 sizes, chime reuse, readiness failures, telemetry, and cleanup. They do not

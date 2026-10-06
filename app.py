@@ -14,7 +14,7 @@ import customtkinter as ctk
 from dictation_engine import (
     AppState, DictationApp, MODEL_REGISTRY, MODEL_DIR,
     load_config, save_config, validate_config, log, create_model,
-    is_model_downloaded,
+    is_model_downloaded, device_failure,
 )
 from ui.tray import TrayManager
 from ui.overlay import OverlayWindow
@@ -46,8 +46,8 @@ class GUIApp:
 
         # Overlay
         self._overlay = OverlayWindow(
-            self._root, 
-            on_toggle=self._engine.toggle_recording,
+            self._root,
+            on_toggle=self._toggle_recording,
             pos_x=config.get("pos_x"),
             pos_y=config.get("pos_y", 10),
             on_pos_changed=self._on_pos_changed
@@ -57,7 +57,7 @@ class GUIApp:
 
         # Tray
         self._tray = TrayManager(
-            on_toggle=self._engine.toggle_recording,
+            on_toggle=self._toggle_recording,
             on_quit=self._quit,
             on_settings=self._show_settings,
             on_history=self._show_history,
@@ -119,6 +119,11 @@ class GUIApp:
         """Start the engine in non-blocking mode."""
         self._engine.start_background()
 
+    def _toggle_recording(self):
+        """Overlay/tray toggle. Looks the engine up on every call, because
+        Settings can replace it; a bound method would keep the stopped one."""
+        self._engine.toggle_recording()
+
     # -- State callback (fires from bg threads) ----------------------------
 
     def _on_state_change(self, state: AppState, data: dict):
@@ -158,25 +163,54 @@ class GUIApp:
         elif state == AppState.ERROR:
             self._stop_audio_polling()
             error_msg = data.get("error", "Unknown error")
-            self._tray.update_state(state_name, f"NPU Dictation — Error: {error_msg[:60]}")
             self._overlay.show_error()
-            self._settings_status(f"Error: {error_msg[:40]}", "#FF453A")
             self._settings_set_apply(True)
 
-            # Auto-fallback on DEVICE_LOST or driver crash
-            if data.get("device_lost"):
-                if self._config["device"] == "NPU":
-                    log("NPU DEVICE_LOST detected — auto-falling back to GPU")
-                    self._config["device"] = "GPU"
-                    self._tray.update_info(
-                        device="GPU",
-                        model=self._config["model_size"],
-                        hotkey=self._config["hotkey"],
-                    )
-                    self._engine.fallback_device("GPU")
-                elif self._config["device"] == "GPU":
-                    log("GPU driver crashed or out of resources — reloading on GPU for next transcription")
-                    self._engine.fallback_device("GPU")
+            if data.get("restart_required") or device_failure():
+                # Fail closed: no reload of any kind in this process.
+                self._show_restart_required(data)
+                return
+
+            self._tray.update_state(state_name, f"NPU Dictation — Error: {error_msg[:60]}")
+            self._settings_status(f"Error: {error_msg[:40]}", "#FF453A")
+
+            # An NPU-only device loss may move to the GPU/CUDA, which has not failed.
+            if data.get("device_lost") and data.get("device_failure") == "NPU":
+                fallback_dev = "GPU"
+                from dictation_engine import has_nvidia_gpu
+                if has_nvidia_gpu():
+                    fallback_dev = "CUDA"
+                log(f"NPU DEVICE_LOST detected — falling back to {fallback_dev}")
+                self._config["device"] = fallback_dev
+                self._tray.update_info(
+                    device=fallback_dev,
+                    model=self._config["model_size"],
+                    hotkey=self._config["hotkey"],
+                )
+                self._engine.fallback_device(fallback_dev)
+
+    def _show_restart_required(self, data: dict):
+        """Tell the user, once, that only an app restart recovers the device."""
+        failure = device_failure() or {}
+        device = data.get("device_failure") or failure.get("device") or "accelerator"
+        message = failure.get("message") or data.get("error", "Restart the app.")
+        self._tray.update_state(
+            AppState.ERROR.value,
+            f"NPU Dictation — {device} failed. Quit and restart the app.",
+        )
+        self._settings_status(f"{device} failed: restart NPU Dictation.", "#FF453A")
+        if getattr(self, "_restart_alert_shown", False):
+            return
+        self._restart_alert_shown = True
+        log(f"Restart required: {message}")
+        self._alert_error("NPU Dictation: restart required", message)
+
+    def _alert_error(self, title: str, message: str):
+        try:
+            from tkinter import messagebox
+            messagebox.showerror(title, message, parent=self._root)
+        except Exception as exc:
+            log(f"Could not show error dialog: {exc}")
 
     # -- Audio level polling -----------------------------------------------
 
@@ -210,10 +244,33 @@ class GUIApp:
         )
         self._root.after(0, self._settings_win.show)
 
+    # Settings that only take effect in a newly built engine.
+    _REBUILD_KEYS = ("model_size", "device", "hotkey",
+                     "beep_on_start", "sample_rate", "max_record_seconds")
+
     def _on_settings_apply(self, new_config: dict):
         model_changed = new_config["model_size"] != self._config["model_size"]
-        device_changed = new_config["device"] != self._config["device"]
-        hotkey_changed = new_config["hotkey"] != self._config["hotkey"]
+        rebuild = any(
+            new_config.get(key, self._config.get(key)) != self._config.get(key)
+            for key in self._REBUILD_KEYS
+        )
+        failure = device_failure()
+
+        if rebuild:
+            # The running engine shares self._config, so nothing is changed
+            # until it is known to be idle. stop_if_idle() checks and stops
+            # atomically and never waits on inference that may be hung.
+            if failure:
+                # Latched: no new work can start, the engine is not rebuilt.
+                busy = self._engine.busy_reason()
+            else:
+                busy = self._engine.stop_if_idle()
+            if busy:
+                log(f"Settings not applied: {busy} in progress.")
+                self._settings_status(
+                    f"Not applied: {busy} in progress. Click Apply again "
+                    f"when it finishes.", "#FF9F0A")
+                return
 
         self._config.update(new_config)
         save_config(self._config)
@@ -222,15 +279,30 @@ class GUIApp:
         self._overlay.set_show_balloon(self._config.get("show_balloon", True))
         self._overlay.set_balloon_font_size(self._config.get("balloon_font_size", 16))
 
+        if failure:
+            # A rebuilt engine would load models in a process whose device
+            # context may hang. Keep the saved settings for the next start,
+            # and do not show them in the tray as if they were active now.
+            self._tray.update_info(
+                device=f"{self._config['device']} (after restart)",
+                model=f"{self._config['model_size']} (after restart)",
+                hotkey=f"{self._config['hotkey']} (after restart)",
+            )
+            if rebuild:
+                log(f"Settings saved; not reloading after {failure['device']} failure.")
+                self._settings_status("Saved. Restart NPU Dictation to apply.", "#FF9F0A")
+            else:
+                self._settings_status("Settings saved.", "#30D158")
+            return
+
         self._tray.update_info(
             device=self._config["device"],
             model=self._config["model_size"],
             hotkey=self._config["hotkey"],
         )
 
-        if model_changed or device_changed or hotkey_changed:
+        if rebuild:
             log("Settings changed — reloading engine...")
-            self._engine.stop()
             self._settings_status("Loading model...", "#FF9F0A")
             self._settings_set_apply(False)
 
@@ -293,7 +365,7 @@ class GUIApp:
 
 def main():
     parser = argparse.ArgumentParser(description="NPU Dictation Engine (GUI)")
-    parser.add_argument("--device", choices=["NPU", "GPU", "CPU"], help="Override device")
+    parser.add_argument("--device", choices=["NPU", "GPU", "CPU", "CUDA"], help="Override device")
     parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), help="Model size")
     parser.add_argument("--language", type=str, help="Language code")
     parser.add_argument("--auto-enter", action="store_true", help="Press Enter after typing")
@@ -317,6 +389,12 @@ def main():
     if not args.device:
         model_info = MODEL_REGISTRY[config["model_size"]]
         preferred = model_info["preferred_device"]
+        
+        if preferred == "GPU":
+            from dictation_engine import has_nvidia_gpu
+            if has_nvidia_gpu():
+                preferred = "CUDA"
+
         if config["device"] != preferred:
             log(f"Auto-selecting {preferred} for {config['model_size']}")
             config["device"] = preferred
