@@ -1659,7 +1659,73 @@ class AudioRecorder:
         return min(rms * 25.0, 1.0)
 
 
-# ---------------------------------------------------------------------------
+def get_input_target():
+    """Where typed keys land: (foreground window, focused control), or None.
+
+    Comparing the pair, not just the window, also catches focus moving to
+    another field of the same window in native apps. Browsers and Electron
+    apps report one handle per window, so a click elsewhere on the same page
+    goes unnoticed.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND),
+                ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND),
+                ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            ]
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        info = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+        thread_id = user32.GetWindowThreadProcessId(hwnd, None)
+        focus = info.hwndFocus if user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)) else None
+        return (hwnd, focus)
+    except Exception:
+        return None
+
+
+def type_draft_text(text: str):
+    """Type a live draft without touching the clipboard.
+
+    type_text() pastes and restores the clipboard 0.5 s later on a thread;
+    drafts arrive about once a second, so a pending restore could land
+    between the next copy and its Ctrl+V and paste the user's clipboard.
+    """
+    if text:
+        _type_text_ctypes(text)
+
+
+def delete_text(count: int):
+    """Delete the specified number of characters, one Backspace each."""
+    if count <= 0:
+        return
+    try:
+        import keyboard
+        for _ in range(count):
+            keyboard.send("backspace")
+            time.sleep(0.001)
+    except ImportError:
+        import ctypes
+        user32 = ctypes.windll.user32
+        KEYEVENTF_KEYUP = 0x0002
+        VK_BACK = 0x08
+        for _ in range(count):
+            user32.keybd_event(VK_BACK, 0, 0, 0)
+            user32.keybd_event(VK_BACK, 0, KEYEVENTF_KEYUP, 0)
+
+
 def type_text(text: str, auto_enter: bool = False):
     """Type text into the currently active window using keyboard simulation."""
     if not text:
@@ -1749,15 +1815,18 @@ def _type_text_ctypes(text: str):
             ]
         _fields_ = [("type", wintypes.DWORD), ("_input", _INPUT)]
 
-    for char in text:
+    # KEYEVENTF_UNICODE takes UTF-16 code units; characters outside the
+    # BMP (e.g. emoji) are sent as their surrogate pair.
+    data = text.encode("utf-16-le")
+    for unit in (int.from_bytes(data[i:i + 2], "little") for i in range(0, len(data), 2)):
         inputs = (INPUT * 2)()
         # Key down
         inputs[0].type = INPUT_KEYBOARD
-        inputs[0]._input.ki.wScan = ord(char)
+        inputs[0]._input.ki.wScan = unit
         inputs[0]._input.ki.dwFlags = KEYEVENTF_UNICODE
         # Key up
         inputs[1].type = INPUT_KEYBOARD
-        inputs[1]._input.ki.wScan = ord(char)
+        inputs[1]._input.ki.wScan = unit
         inputs[1]._input.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
 
         user32.SendInput(2, ctypes.byref(inputs), ctypes.sizeof(INPUT))
@@ -1928,6 +1997,9 @@ class DictationApp:
         self._state = AppState.LOADING
         self._callbacks: list = []
         self._history: list[dict] = []
+        # Live draft already typed into the target, guarded by _output_lock.
+        self._draft_typed_text = ""
+        self._draft_target = None
 
         self._resource_thread = threading.Thread(target=self._monitor_resources, daemon=True)
         self._resource_thread.start()
@@ -2264,6 +2336,17 @@ class DictationApp:
 
     # -- Recording -------------------------------------------------------
 
+    def _forget_draft_locked(self, erase: bool):
+        """Stop tracking the typed draft, first erasing it if asked and keys
+        still land where it was typed. Caller holds _output_lock."""
+        if erase and self._draft_typed_text:
+            if self._draft_target is not None and get_input_target() == self._draft_target:
+                delete_text(len(self._draft_typed_text))
+            else:
+                log("Input focus changed; leaving the draft where it was typed.")
+        self._draft_typed_text = ""
+        self._draft_target = None
+
     def _finish_recording(self, generation=None, audio=None, is_final=True):
         """Consume one recording, whether stopped by the user or its timer."""
         with self._audio_lifecycle_lock:
@@ -2335,8 +2418,28 @@ class DictationApp:
                             elif not text.endswith(' '):
                                 text += ' '
                                 
+                        # Rewrite only what differs from the draft already
+                        # typed, if keys still land where it was typed.
+                        target = get_input_target()
+                        text_to_type = text
+                        if self._draft_typed_text:
+                            if target is not None and target == self._draft_target:
+                                common = os.path.commonprefix([self._draft_typed_text, text])
+                                delete_text(len(self._draft_typed_text) - len(common))
+                                text_to_type = text[len(common):]
+                            else:
+                                log("Input focus changed; leaving the draft where it was typed.")
+
                         if is_final:
-                            type_text(text, auto_enter=self.config["auto_enter"])
+                            if text_to_type:
+                                type_text(text_to_type, auto_enter=self.config["auto_enter"])
+                            elif self.config["auto_enter"]:
+                                # The draft already holds the whole text.
+                                import keyboard
+                                keyboard.press_and_release("enter")
+                            self._draft_typed_text = ""
+                            self._draft_target = None
+
                             self._history.append({
                                 "timestamp": datetime.now().isoformat(),
                                 "text": text,
@@ -2344,7 +2447,12 @@ class DictationApp:
                             })
                             if len(self._history) > self.MAX_HISTORY:
                                 self._history = self._history[-self.MAX_HISTORY:]
-                    
+                        else:
+                            # It's a draft. Type it so the user sees it real-time.
+                            type_draft_text(text_to_type)
+                            self._draft_typed_text = text
+                            self._draft_target = target
+
                     if is_final:
                         if self.config.get("continuous_listening", False):
                             # Still dispatch READY with text so UI shows it,
@@ -2358,7 +2466,12 @@ class DictationApp:
                         self.last_draft_text = text
                         self._set_state(AppState.RECORDING, {"draft_text": text})
                 else:
+                    # An empty draft is often a dropped hallucination
+                    # mid-sentence: keep the typed draft until the final
+                    # decides. An empty final means there was no speech.
                     if is_final:
+                        with self._output_lock:
+                            self._forget_draft_locked(erase=True)
                         self.last_draft_text = ""
                         log("No speech detected.")
                         if self.config.get("continuous_listening", False):
@@ -2375,6 +2488,10 @@ class DictationApp:
                 import traceback
                 log(f"Error during transcription: {e}")
                 log(traceback.format_exc())
+                # Leave any typed draft as the best text we have, but stop
+                # tracking it: the next segment must not backspace over it.
+                with self._output_lock:
+                    self._forget_draft_locked(erase=False)
                 # Latches GPU failures even if shutdown started meanwhile.
                 self._set_state(AppState.ERROR, self._error_payload(e))
         except Exception as exc:
