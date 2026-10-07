@@ -86,6 +86,15 @@ jobs:
         # Resolution only: installing them pulls ~2 GB of CUDA/torch wheels.
         run: uv pip compile pyproject.toml --python-version 3.12 --extra cuda --extra export --quiet -o resolved.txt
 
+      - name: The cuda extra resolves to prebuilt wheels
+        # Resolve `npu-whisper[cuda]` as a user's install would (without
+        # [export], whose transformers cap hides the problem), then require
+        # wheels for exactly those versions: a backtrack to sdist-only
+        # tokenizers 0.13.3 (needs Rust) broke installs before.
+        run: |
+          uv pip compile pyproject.toml --python-version 3.12 --python-platform windows --extra cuda --quiet -o resolved-cuda.txt
+          uv pip compile resolved-cuda.txt --python-version 3.12 --python-platform windows --only-binary tokenizers --only-binary ctranslate2 --quiet -o resolved-cuda-wheels.txt
+
       - name: Smoke test the commands
         shell: pwsh
         run: |
