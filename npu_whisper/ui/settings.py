@@ -290,6 +290,12 @@ class SettingsWindow:
             variable=self._enter_var, **chk_opts,
         ).pack(anchor="w", pady=2)
 
+        self._llm_var = ctk.BooleanVar(value=self._config.get("llm_cleanup", False))
+        ctk.CTkCheckBox(
+            toggles_frame, text="Clean up text with LM Studio (local LLM)",
+            variable=self._llm_var, **chk_opts,
+        ).pack(anchor="w", pady=2)
+
         self._balloon_var = ctk.BooleanVar(value=self._config.get("show_balloon", True))
         ctk.CTkCheckBox(
             toggles_frame, text="Show text balloon after transcription",
@@ -393,6 +399,7 @@ class SettingsWindow:
         new_config["language"] = self._get_selected_lang_code()
         new_config["beep_on_start"] = self._beep_var.get()
         new_config["auto_enter"] = self._enter_var.get()
+        new_config["llm_cleanup"] = self._llm_var.get()
         new_config["show_balloon"] = self._balloon_var.get()
         try:
             new_config["balloon_font_size"] = int(self._font_size_var.get())

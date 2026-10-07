@@ -175,6 +175,32 @@ already listening continuously. A session started by a tap stops by itself
 after `continuous_idle_stop_seconds` (default 120) without speech; `null`
 keeps it on until the next tap.
 
+### LLM cleanup (LM Studio)
+
+With `"llm_cleanup": true` (or `--llm-cleanup`, or **Clean up text with LM
+Studio** in Settings), each final transcription is sent to a local
+OpenAI-compatible server before it is typed. The model fixes punctuation and
+recognition mistakes and drops filler words. Live drafts in continuous
+listening are still typed raw; the cleaned final replaces them.
+
+```json
+{
+  "llm_cleanup": true,
+  "llm_url": "http://localhost:1234/v1",
+  "llm_model": null,
+  "llm_prompt": null,
+  "llm_timeout_seconds": 30,
+  "llm_reasoning_effort": "low"
+}
+```
+
+Start LM Studio's server with a model loaded. `llm_model: null` uses the loaded
+model; `llm_prompt: null` uses the built-in cleanup prompt. If the server is
+off, errors, or takes longer than `llm_timeout_seconds`, the raw transcription
+is typed. The text waits for the model, so pick a fast one: gpt-oss-20b took
+5-17 s per sentence on an RTX 4070 laptop. `llm_url` receives everything you
+dictate; keep it pointed at a server you trust.
+
 Or change settings from the GUI: right-click the system tray icon and select **Settings**.
 
 Changing the model, device, hotkey, chime, sample rate or maximum recording length rebuilds the engine. That is refused while a recording, transcription or model load is in progress: the Settings window says what is busy, nothing is saved, and you click **Apply** again once it finishes. This keeps two models from running on the same device at once and keeps an in-flight dictation from being dropped. If a load or transcription never finishes (for example a hung driver), quit and restart the app instead.

@@ -522,6 +522,8 @@ def main():
     parser.add_argument("--auto-enter", action="store_true", help="Press Enter after typing")
     parser.add_argument("--hotkey", type=str, help="Global hotkey")
     parser.add_argument("--continuous", action="store_true", help="Enable continuous listening")
+    parser.add_argument("--llm-cleanup", action="store_true",
+                        help="Clean up the final text with the LLM server at llm_url (LM Studio)")
     shortcut = parser.add_mutually_exclusive_group()
     shortcut.add_argument("--install-shortcut", action="store_true",
                           help="Add NPU Whisper to the Start Menu, then exit")
@@ -559,6 +561,8 @@ def main():
         config["hotkey"] = args.hotkey
     if args.continuous:
         config["continuous_listening"] = True
+    if args.llm_cleanup:
+        config["llm_cleanup"] = True
 
     validate_config(config)
     if not args.device:
