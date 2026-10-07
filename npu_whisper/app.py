@@ -483,7 +483,34 @@ class GUIApp:
                 log(f"Error stopping {name} during shutdown: {exc}")
 
 
+def _ensure_stdio():
+    """pythonw (the Start Menu shortcut) has no console: sys.stdout/stderr
+    are None and anything writing to them (download progress bars) would
+    raise. app.log still gets every log line."""
+    import os
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
+def _claim_single_instance() -> bool:
+    """One tray app per user session: a second one (say, a Start Menu click
+    while the Startup shortcut already launched one) would hook the same
+    hotkey and record twice. The named mutex dies with the process."""
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p  # a HANDLE, not an int
+    global _instance_mutex
+    _instance_mutex = kernel32.CreateMutexW(None, False, r"Local\npu-whisper-tray")
+    ERROR_ALREADY_EXISTS = 183
+    return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+
+
+_instance_mutex = None
+
+
 def main():
+    _ensure_stdio()
     parser = argparse.ArgumentParser(prog="npu-whisper", description="NPU Dictation Engine (GUI)")
     parser.add_argument("--device", choices=["NPU", "GPU", "CPU", "CUDA"], help="Override device")
     parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), help="Model size")
@@ -491,7 +518,27 @@ def main():
     parser.add_argument("--auto-enter", action="store_true", help="Press Enter after typing")
     parser.add_argument("--hotkey", type=str, help="Global hotkey")
     parser.add_argument("--continuous", action="store_true", help="Enable continuous listening")
+    parser.add_argument("--install-shortcut", action="store_true",
+                        help="Add NPU Whisper to the Start Menu, then exit")
+    parser.add_argument("--autostart", action="store_true",
+                        help="With --install-shortcut: also start with Windows")
+    parser.add_argument("--remove-shortcut", action="store_true",
+                        help="Remove the Start Menu and startup shortcuts, then exit")
     args = parser.parse_args()
+
+    if args.install_shortcut or args.remove_shortcut:
+        from npu_whisper import shortcuts
+        if args.remove_shortcut:
+            shortcuts.remove()
+        else:
+            shortcuts.install(autostart=args.autostart)
+        return
+    if args.autostart:
+        parser.error("--autostart only works with --install-shortcut")
+
+    if not _claim_single_instance():
+        log("npu-whisper is already running (see the tray icon); not starting another.")
+        return
 
     config = load_config()
 
