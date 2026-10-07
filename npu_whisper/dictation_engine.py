@@ -45,7 +45,11 @@ DEFAULT_CONFIG = {
     "max_record_seconds": 60,  # Max recording length
     "sample_rate": 16000,      # Whisper expects 16kHz
     "show_balloon": True,      # Show text balloon under notch after transcription
-    "continuous_listening": False, # Enable VAD continuous listening
+    "continuous_listening": False, # Start in continuous (VAD) listening
+    # Hotkey: holding it is always push-to-talk. A tap either starts
+    # continuous listening (VAD types each sentence; tap again to stop) or,
+    # with "toggle", starts a recording that the next tap stops.
+    "tap_action": "continuous",
 }
 
 # Supported languages (Whisper's top languages + display names)
@@ -230,6 +234,10 @@ def validate_config(config: dict):
     if max_rec is not None and (not isinstance(max_rec, (int, float)) or max_rec <= 0):
         raise ValueError(f"max_record_seconds must be a positive number or null, got '{max_rec}'")
 
+    tap_action = config.get("tap_action", "continuous")
+    if tap_action not in TAP_ACTIONS:
+        raise ValueError(f"tap_action must be one of {TAP_ACTIONS}, got {tap_action!r}")
+
 
 # ---------------------------------------------------------------------------
 # Model setup (export Whisper to OpenVINO IR format)
@@ -388,6 +396,7 @@ def has_nvidia_gpu(return_name: bool = False):
 
 
 VALID_DEVICES = ("CUDA", "NPU", "GPU", "CPU")
+TAP_ACTIONS = ("continuous", "toggle")
 
 
 def detect_devices() -> set:
@@ -1438,8 +1447,9 @@ class AudioRecorder:
                 self._write_pos = (self._write_pos + count) % capacity
                 self._lookback_count = min(capacity, self._lookback_count + count)
                 
-                if self.continuous:
-                    self._data_cv.notify()
+                # The VAD thread, once started, follows the ring buffer even
+                # while paused, so a later session starts from fresh audio.
+                self._data_cv.notify()
 
                 if self.recording and not self.continuous:
                     self.telemetry.setdefault('first_frame', now)
@@ -1464,18 +1474,49 @@ class AudioRecorder:
             self.wait_ready(timeout)
             
             if self.continuous:
-                if self.neural_vad is None:
-                    try:
-                        self.neural_vad = NeuralVAD(sample_rate=self.sample_rate)
-                    except Exception as e:
-                        log(f"Failed to initialize Neural VAD: {e}")
-                self._stop_vad = False
-                self._vad_thread = threading.Thread(target=self._vad_loop, daemon=True)
-                self._vad_thread.start()
-                
+                self._ensure_vad_thread()
+
         except Exception:
             self.close()
             raise
+
+    def _ensure_vad_thread(self):
+        if self.neural_vad is None:
+            try:
+                self.neural_vad = NeuralVAD(sample_rate=self.sample_rate)
+            except Exception as e:
+                log(f"Failed to initialize Neural VAD: {e}")
+        if self._vad_thread is None or not self._vad_thread.is_alive():
+            self._stop_vad = False
+            self._vad_thread = threading.Thread(target=self._vad_loop, daemon=True)
+            self._vad_thread.start()
+
+    def begin_continuous(self, rewind_seconds: float = 0.0):
+        """Turn the push-to-talk recording into continuous VAD listening.
+
+        The push-to-talk audio is dropped; the VAD re-reads the last
+        rewind_seconds of the ring buffer instead, so speech that began
+        while the hotkey was tapped is not lost.
+        """
+        with self._lock:
+            self.recording = False
+            self._frames = []
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            rewind = min(int(rewind_seconds * self.sample_rate), self.capacity - 1)
+            self._read_pos = (self._write_pos - rewind) % self.capacity
+            if self.neural_vad:
+                self.neural_vad.reset_state()
+            self.continuous = True
+            self.paused = False
+        self._ensure_vad_thread()
+
+    def end_continuous(self):
+        """Stop producing segments. Speech in progress is cut and queued."""
+        with self._lock:
+            self.paused = True
+            self.continuous = False
 
     def wait_ready(self, timeout=3.0):
         if not self._audio_ready.wait(timeout):
@@ -1993,6 +2034,11 @@ class ChimePlayer:
             self._tones = {
                 'start': tone([440.0], 130, 0.10),
                 'stop': tone([330.0], 160, 0.08),
+                # Rising pair: continuous listening is on (the tap's own
+                # 'start' already played; this tells the modes apart).
+                'continuous': np.concatenate([tone([440.0], 90, 0.09),
+                                              np.zeros(int(sample_rate * 0.04), dtype=np.float32),
+                                              tone([660.0], 110, 0.09)]),
                 'warning': np.concatenate([warning, np.zeros(int(sample_rate * 0.05), dtype=np.float32), warning]),
             }
             self._stream = sd.OutputStream(
@@ -2084,6 +2130,9 @@ class DictationApp:
         self._loading = 0
         self.whisper = None  # Lazy-loaded
         self.is_recording = False
+        # Continuous (VAD) listening is on: from --continuous at startup or a
+        # hotkey tap. Guarded by _audio_lifecycle_lock.
+        self._continuous = bool(config.get("continuous_listening", False))
         self._model_ready = threading.Event()
         self._load_error: str | None = None
         # Serializes model use (warmup/transcribe) against model replacement
@@ -2304,7 +2353,7 @@ class DictationApp:
                     return
                 # Recording is allowed while a (fallback) model loads; never
                 # hijack the user's recording for the warmup capture.
-                capture_warmup = not self.is_recording and not self.config.get("continuous_listening", False)
+                capture_warmup = not self.is_recording and not self._continuous
                 if capture_warmup:
                     self.recorder.wait_ready()
                     log("Performing real 2-second microphone capture to warm up hardware...")
@@ -2350,7 +2399,7 @@ class DictationApp:
             # busy_reason() or stop_if_idle() (or wait on a thread that does),
             # all of which take _audio_lifecycle_lock. _set_state re-checks
             # _stopping, so a stop that lands here suppresses READY.
-            if self.config.get("continuous_listening", False):
+            if self._continuous:
                 self.is_recording = True
                 self._set_state(AppState.RECORDING)
                 log("Continuous listening mode active. VAD will process speech.")
@@ -2403,7 +2452,7 @@ class DictationApp:
         """
         with self._audio_lifecycle_lock:
             busy = self._busy_reason_locked()
-            if busy == "recording" and self.config.get("continuous_listening", False):
+            if busy == "recording" and self._continuous:
                 # Recording is reported first; look past it.
                 busy = ("transcription" if self._transcribing
                         else "model loading" if self._loading else None)
@@ -2456,7 +2505,9 @@ class DictationApp:
         self._draft_target = None
 
     def _finish_recording(self, generation=None, audio=None, is_final=True):
-        """Consume one recording, whether stopped by the user or its timer."""
+        """Consume one recording, whether stopped by the user or its timer,
+        or (audio given) one VAD segment of continuous listening."""
+        vad_segment = audio is not None
         with self._audio_lifecycle_lock:
             if self._stopping.is_set() or self._transcribing:
                 return
@@ -2476,7 +2527,7 @@ class DictationApp:
             if len(audio) < self.config["sample_rate"] * 0.3:
                 log("Recording too short, ignoring.")
                 if is_final:
-                    if self.config.get("continuous_listening", False) and getattr(self, "is_recording", False):
+                    if self._continuous and self.is_recording:
                         self._set_state(AppState.RECORDING)
                     else:
                         self._set_state(AppState.READY)
@@ -2485,7 +2536,7 @@ class DictationApp:
             # Continuous mode transcribes all the time while the microphone
             # stays open: keep showing RECORDING (live waveform and draft)
             # instead of a "Transcribing..." balloon per sentence.
-            continuous = self.config.get("continuous_listening", False) and self.is_recording
+            continuous = self._continuous and self.is_recording
             if is_final and not continuous:
                 self._set_state(AppState.PROCESSING)
 
@@ -2523,7 +2574,7 @@ class DictationApp:
                         # Append a trailing space in continuous mode so next phrase doesn't stick
                         # e.g., "legal" -> "legal ". If they manually type punctuation later,
                         # Windows handles it naturally, but this prevents "legalFicou".
-                        if self.config.get("continuous_listening", False):
+                        if vad_segment:
                             stripped = text.strip()
                             if stripped and not re.search(r'[.,!?;\:]$', stripped):
                                 text = stripped + '... '
@@ -2585,8 +2636,8 @@ class DictationApp:
                             self._forget_draft_locked(erase=True)
                         self.last_draft_text = ""
                         log("No speech detected.")
-                        if self.config.get("continuous_listening", False):
-                            if getattr(self, "is_recording", False):
+                        if self._continuous:
+                            if self.is_recording:
                                 self._set_state(AppState.RECORDING)
                             else:
                                 self._set_state(AppState.READY)
@@ -2616,123 +2667,148 @@ class DictationApp:
             with self._audio_lifecycle_lock:
                 self._transcribing = False
 
+    # A press longer than this is push-to-talk: recording stops on release.
+    HOLD_SECONDS = 0.4
+
+    @property
+    def continuous_active(self) -> bool:
+        return self._continuous
+
     def toggle_recording(self):
-        """Toggle recording on/off (Supports Tap-to-Toggle and Push-To-Talk)."""
-        import time
-        import threading
-
-        if self._stopping.is_set() or self._transcribing:
+        """Hotkey press. Holding is push-to-talk; a tap starts continuous
+        listening (tap_action "continuous") or starts/stops a recording
+        ("toggle"). Any press while continuous listening is on stops it."""
+        if self._stopping.is_set():
             return
-
-        if self.config.get("continuous_listening", False):
-            with self._audio_lifecycle_lock:
-                if getattr(self, "_hotkey_held", False):
-                    return
-                self._hotkey_held = True
-                
-                if self.is_recording:
-                    log("Pausing continuous listening mode.")
-                    self.is_recording = False
-                    self.recorder.paused = True
-                    self._set_state(AppState.READY)
-                else:
-                    log("Resuming continuous listening mode.")
-                    self.is_recording = True
-                    self.recorder.paused = False
-                    self._set_state(AppState.RECORDING)
-                
-                # Release hotkey immediately for tap
-                self._hotkey_held = False
-            return
-
         if getattr(self, "_hotkey_held", False):
             # Ignore auto-repeat while the key is physically held
             return
 
-        self._hotkey_held = True
         press_time = time.time()
+        if self._continuous:
+            # Allowed while a segment transcribes: stopping must not wait.
+            self._hotkey_held = True
+            threading.Thread(target=self._end_continuous, daemon=True).start()
+            threading.Thread(target=self._watch_key, args=(press_time,), daemon=True).start()
+            return
 
-        press_perf = time.perf_counter()
-
-        def _do_start():
-            t_thread_start = time.perf_counter()
-            log(f"[Telemetry] Thread _do_start spawned in {t_thread_start - press_perf:.3f}s after key press")
-
-
-
-            failure = device_failure()
-            if failure:
-                # Another engine in this process may have hit the failure.
-                log(f"Cannot record: {failure['message']}")
-                self._set_state(AppState.ERROR, self._error_payload(
-                    RestartRequiredError(failure["message"])))
-                return
-
-            if self._load_error:
-                log(f"Cannot record — model failed to load: {self._load_error}")
-                return
-
-            if self._lost_device and self._lost_device == self.config["device"]:
-                log(f"Cannot record — {self._lost_device} was lost and no fallback "
-                    f"device is active yet.")
-                if self.config["beep_on_start"]:
-                    self.chimes.play('warning')
-                return
-
-            if self._mic_warmup:
-                log("Cannot record — microphone warmup in progress, try again in a moment.")
-                if self.config["beep_on_start"]:
-                    self.chimes.play('warning')
-                return
-
-            t_before_rec = time.perf_counter()
-            try:
-                with self._audio_lifecycle_lock:
-                    if self._stopping.is_set() or self._transcribing or self._mic_warmup:
-                        return
-                    try:
-                        self.recorder.wait_ready(timeout=0)
-                    except Exception as e:
-                        log(f"Audio stream not ready ({e}), attempting recovery...")
-                        self.recorder.close()
-                        self.recorder.warmup(timeout=3.0)
-                    self.recorder.start()
-                    self.is_recording = True
-            except Exception as exc:
-                log(f"Cannot start recording: {exc}")
-                self._set_state(AppState.ERROR, {"error": str(exc)})
-                return
-            t_after_rec = time.perf_counter()
-            log(f"[Telemetry] recorder.start() completed in {t_after_rec - t_before_rec:.3f}s")
-
-            if self.config["beep_on_start"]:
-                self.chimes.play('start')
-                log("[Telemetry] Start chime submitted to persistent output stream")
-
-            self._set_state(AppState.RECORDING)
-
-        def _watch_key(started_recording):
-            import keyboard
-            # Wait until the hotkey is physically released
-            while keyboard.is_pressed(self.config["hotkey"]):
-                time.sleep(0.05)
-            
-            self._hotkey_held = False
-            
-            # If we started recording and the user held the key for > 0.4s,
-            # treat it as Push-To-Talk and stop recording upon release.
-            duration = time.time() - press_time
-            if started_recording and duration > 0.4:
-                self._finish_recording()
-
+        if self._transcribing:
+            return
+        self._hotkey_held = True
         if self.is_recording:
-            # Stop recording immediately in a thread
+            # A "toggle" recording: this press stops it.
             threading.Thread(target=self._finish_recording, daemon=True).start()
-            threading.Thread(target=_watch_key, args=(False,), daemon=True).start()
+            threading.Thread(target=self._watch_key, args=(press_time,), daemon=True).start()
         else:
-            # Start recording immediately in a thread
-            threading.Thread(target=_do_start, daemon=True).start()
-            threading.Thread(target=_watch_key, args=(True,), daemon=True).start()
+            starter = threading.Thread(target=self._start_recording,
+                                       args=(time.perf_counter(),), daemon=True)
+            starter.start()
+            threading.Thread(target=self._watch_key, args=(press_time, starter),
+                             daemon=True).start()
+
+    def _start_recording(self, press_perf):
+        """Hotkey press: start a push-to-talk recording right away (a tap may
+        turn it into continuous listening on release)."""
+        t_thread_start = time.perf_counter()
+        log(f"[Telemetry] Thread _start_recording spawned in {t_thread_start - press_perf:.3f}s after key press")
+
+        failure = device_failure()
+        if failure:
+            # Another engine in this process may have hit the failure.
+            log(f"Cannot record: {failure['message']}")
+            self._set_state(AppState.ERROR, self._error_payload(
+                RestartRequiredError(failure["message"])))
+            return
+
+        if self._load_error:
+            log(f"Cannot record — model failed to load: {self._load_error}")
+            return
+
+        if self._lost_device and self._lost_device == self.config["device"]:
+            log(f"Cannot record — {self._lost_device} was lost and no fallback "
+                f"device is active yet.")
+            if self.config["beep_on_start"]:
+                self.chimes.play('warning')
+            return
+
+        if self._mic_warmup:
+            log("Cannot record — microphone warmup in progress, try again in a moment.")
+            if self.config["beep_on_start"]:
+                self.chimes.play('warning')
+            return
+
+        t_before_rec = time.perf_counter()
+        try:
+            with self._audio_lifecycle_lock:
+                if self._stopping.is_set() or self._transcribing or self._mic_warmup:
+                    return
+                try:
+                    self.recorder.wait_ready(timeout=0)
+                except Exception as e:
+                    log(f"Audio stream not ready ({e}), attempting recovery...")
+                    self.recorder.close()
+                    self.recorder.warmup(timeout=3.0)
+                self.recorder.start()
+                self.is_recording = True
+        except Exception as exc:
+            log(f"Cannot start recording: {exc}")
+            self._set_state(AppState.ERROR, {"error": str(exc)})
+            return
+        t_after_rec = time.perf_counter()
+        log(f"[Telemetry] recorder.start() completed in {t_after_rec - t_before_rec:.3f}s")
+
+        if self.config["beep_on_start"]:
+            self.chimes.play('start')
+            log("[Telemetry] Start chime submitted to persistent output stream")
+
+        self._set_state(AppState.RECORDING)
+
+    def _watch_key(self, press_time, starter=None):
+        """Wait for the hotkey release, then settle what a starting press
+        meant: held = push-to-talk (stop and transcribe), tap = tap_action."""
+        import keyboard
+        while keyboard.is_pressed(self.config["hotkey"]):
+            time.sleep(0.05)
+        if starter is None:
+            self._hotkey_held = False
+            return
+        starter.join()
+        if time.time() - press_time > self.HOLD_SECONDS:
+            self._hotkey_held = False
+            self._finish_recording()
+            return
+        try:
+            if self.config.get("tap_action", "continuous") == "continuous":
+                self._begin_continuous(press_time)
+        finally:
+            self._hotkey_held = False
+
+    def _begin_continuous(self, press_time):
+        with self._audio_lifecycle_lock:
+            if self._stopping.is_set() or not self.is_recording or self._transcribing:
+                return  # the start failed, or something already stopped it
+            # Re-read from just before the press: speech may start mid-tap.
+            self.recorder.begin_continuous(rewind_seconds=time.time() - press_time + 0.3)
+            self._continuous = True
+        log("Continuous listening on. Tap the hotkey again to stop.")
+        if self.config["beep_on_start"]:
+            self.chimes.play('continuous')
+        self._set_state(AppState.RECORDING)
+
+    def _end_continuous(self):
+        with self._audio_lifecycle_lock:
+            if not self._continuous:
+                return
+            self._continuous = False
+            self.is_recording = False
+            # Speech in progress is still cut, queued and typed.
+            self.recorder.end_continuous()
+            transcribing = self._transcribing
+        log("Continuous listening off.")
+        if self.config["beep_on_start"]:
+            self.chimes.play('stop')
+        if not transcribing:
+            self._set_state(AppState.READY)
 
     # -- Lifecycle -------------------------------------------------------
 
@@ -2750,54 +2826,50 @@ class DictationApp:
 
         log("Loading model in background (first time may take several minutes)...")
         self._start_loader()
-        
-        if self.config.get("continuous_listening", False):
-            def _continuous_consumer():
-                import queue
-                import traceback
-                log("Agente de escuta contínua iniciado. VAD ativo.")
-                pending = []
-                while not self._stopping.is_set():
-                    busy = self.recorder.consumer_busy
-                    try:
-                        if not pending:
-                            pending.append(self.recorder.segment_queue.get(timeout=0.5))
-                        # Take everything queued meanwhile and skip drafts a
-                        # newer item has already superseded.
-                        while True:
-                            try:
-                                pending.append(self.recorder.segment_queue.get_nowait())
-                            except queue.Empty:
-                                break
-                        pending = [i if isinstance(i, tuple) else (i, True)
-                                   for i in pending if i is not None]
-                        pending = drop_superseded_drafts(pending)
-                        if not pending:
-                            continue
-                        audio_segment, is_final = pending.pop(0)
+        self._start_segment_consumer()
 
-                        if len(audio_segment) > 0:
-                            busy.set()
-                            try:
-                                # Se _transcribing estiver True, _finish_recording retorna.
-                                # Mas queremos esperar até que ele termine.
-                                while getattr(self, "_transcribing", False) and not self._stopping.is_set():
-                                    time.sleep(0.1)
-                                self._finish_recording(audio=audio_segment, is_final=is_final)
-                            finally:
-                                busy.clear()
-                    except queue.Empty:
-                        pass
-                    except Exception as e:
-                        log(f"CRITICAL ERROR in _continuous_consumer: {e}\n{traceback.format_exc()}")
-            
-            threading.Thread(target=_continuous_consumer, daemon=True).start()
-            # Precisamos chamar recorder.warmup() primeiro se não estiver pronto?
-            # warmup é chamado pelo loader, mas podemos iniciar a captura do VAD.
-            # actually recorder.start() does nothing in continuous except returning early,
-            # warmup is enough since VAD loop starts when warmup starts the continuous thread.
-            # Wait, our rewrite_audio.py made warmup() start the _vad_loop!
-            pass
+    def _start_segment_consumer(self):
+        """Transcribe VAD segments. Always running: any tap may start
+        continuous listening."""
+        def _continuous_consumer():
+            import queue
+            import traceback
+            pending = []
+            while not self._stopping.is_set():
+                busy = self.recorder.consumer_busy
+                try:
+                    if not pending:
+                        pending.append(self.recorder.segment_queue.get(timeout=0.5))
+                    # Take everything queued meanwhile and skip drafts a
+                    # newer item has already superseded.
+                    while True:
+                        try:
+                            pending.append(self.recorder.segment_queue.get_nowait())
+                        except queue.Empty:
+                            break
+                    pending = [i if isinstance(i, tuple) else (i, True)
+                               for i in pending if i is not None]
+                    pending = drop_superseded_drafts(pending)
+                    if not pending:
+                        continue
+                    audio_segment, is_final = pending.pop(0)
+
+                    if len(audio_segment) > 0:
+                        busy.set()
+                        try:
+                            # Se _transcribing estiver True, _finish_recording retorna.
+                            # Mas queremos esperar até que ele termine.
+                            while getattr(self, "_transcribing", False) and not self._stopping.is_set():
+                                time.sleep(0.1)
+                            self._finish_recording(audio=audio_segment, is_final=is_final)
+                        finally:
+                            busy.clear()
+                except queue.Empty:
+                    pass
+                except Exception as e:
+                    log(f"CRITICAL ERROR in _continuous_consumer: {e}\n{traceback.format_exc()}")
+        
+        threading.Thread(target=_continuous_consumer, daemon=True).start()
 
     def busy_reason(self) -> str | None:
         """What accelerator/microphone work is in flight, or None if idle."""
@@ -2886,6 +2958,7 @@ class DictationApp:
         log("Loading model in background (first time may take several minutes)...")
         load_thread = threading.Thread(target=self._load_model_background, daemon=True)
         load_thread.start()
+        self._start_segment_consumer()
 
         try:
             keyboard.wait()  # Block forever, handling hotkeys
