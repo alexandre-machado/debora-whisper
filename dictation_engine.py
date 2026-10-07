@@ -1256,6 +1256,18 @@ class NeuralVAD:
         return float(out[0][0])
 
 
+def drop_superseded_drafts(items: list) -> list:
+    """Keep only the segments worth transcribing, in order.
+
+    Items are (audio, is_final) tuples from the VAD queue. A draft followed by
+    any later item is stale: the later draft or final covers newer audio, and
+    transcribing it would only delay that newer item. Finals are never
+    dropped.
+    """
+    return [item for idx, item in enumerate(items)
+            if item[1] or idx == len(items) - 1]
+
+
 class AudioRecorder:
     """Record audio from microphone using sounddevice. Supports PTT and VAD."""
 
@@ -1293,6 +1305,11 @@ class AudioRecorder:
         self._lookback_count = 0
         self._data_cv = threading.Condition(self._lock)
         self.segment_queue = queue.Queue(maxsize=10)
+        # Set by the consumer while it transcribes. An empty queue is not an
+        # idle model: the consumer has already taken the item it is working
+        # on, so gating drafts on the queue alone snapshots audio that is
+        # 1-2s stale by the time the model gets to it.
+        self.consumer_busy = threading.Event()
         self._vad_thread = None
         self._stop_vad = False
         self.neural_vad = None
@@ -1499,8 +1516,11 @@ class AudioRecorder:
                         if is_speaking and not cut_segment:
                             current_time = time.time()
                             if current_time - last_draft_time > 1.0:
-                                if self.segment_queue.empty() and speech_frames > self.min_speech_frames:
-                                    # NPU is free, let's transcribe a draft!
+                                if (self.segment_queue.empty()
+                                        and not self.consumer_busy.is_set()
+                                        and speech_frames > self.min_speech_frames):
+                                    # Model is idle: snapshot the audio now so
+                                    # the draft is as fresh as possible.
                                     with self._lock:
                                         draft_end_pos = (start_read_pos + i + block_len) % self.capacity
                                         if draft_end_pos > speech_start_pos:
@@ -2661,21 +2681,36 @@ class DictationApp:
                 import queue
                 import traceback
                 log("Agente de escuta contínua iniciado. VAD ativo.")
+                pending = []
                 while not self._stopping.is_set():
+                    busy = self.recorder.consumer_busy
                     try:
-                        item = self.recorder.segment_queue.get(timeout=0.5)
-                        if item is not None:
-                            if isinstance(item, tuple):
-                                audio_segment, is_final = item
-                            else:
-                                audio_segment, is_final = item, True
-                            
-                            if len(audio_segment) > 0:
+                        if not pending:
+                            pending.append(self.recorder.segment_queue.get(timeout=0.5))
+                        # Take everything queued meanwhile and skip drafts a
+                        # newer item has already superseded.
+                        while True:
+                            try:
+                                pending.append(self.recorder.segment_queue.get_nowait())
+                            except queue.Empty:
+                                break
+                        pending = [i if isinstance(i, tuple) else (i, True)
+                                   for i in pending if i is not None]
+                        pending = drop_superseded_drafts(pending)
+                        if not pending:
+                            continue
+                        audio_segment, is_final = pending.pop(0)
+
+                        if len(audio_segment) > 0:
+                            busy.set()
+                            try:
                                 # Se _transcribing estiver True, _finish_recording retorna.
                                 # Mas queremos esperar até que ele termine.
                                 while getattr(self, "_transcribing", False) and not self._stopping.is_set():
                                     time.sleep(0.1)
                                 self._finish_recording(audio=audio_segment, is_final=is_final)
+                            finally:
+                                busy.clear()
                     except queue.Empty:
                         pass
                     except Exception as e:
