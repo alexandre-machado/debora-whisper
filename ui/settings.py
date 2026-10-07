@@ -398,9 +398,8 @@ class SettingsWindow:
             new_config["balloon_font_size"] = int(self._font_size_var.get())
         except ValueError:
             new_config["balloon_font_size"] = 16
-        from dictation_engine import MODEL_REGISTRY
-        model_info = MODEL_REGISTRY.get(new_config["model_size"], {})
-        new_config["device"] = model_info.get("preferred_device", "CPU")
+        from dictation_engine import detect_devices, select_device
+        new_config["device"] = select_device(new_config, detect_devices()) or "CPU"
         return new_config
 
     def _apply(self):

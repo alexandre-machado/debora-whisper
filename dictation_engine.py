@@ -32,7 +32,11 @@ TELEMETRY_LOG = LOG_DIR / "telemetry.log"
 CACHE_DIR = CONFIG_DIR / "ov-cache"
 
 DEFAULT_CONFIG = {
-    "device": "NPU",           # NPU, GPU, CPU
+    "device": "NPU",           # Active device; chosen from device_priority at startup
+    # Startup picks the first present device; a lost device falls back to the
+    # next healthy one. RTX first: turbo transcribes 5-7x faster there than on
+    # the NPU (README, "Benchmark"). Edit config.json to reorder.
+    "device_priority": ["CUDA", "NPU", "GPU", "CPU"],
     "model_size": "base",      # tiny, base, small, medium (large not supported on NPU)
     "language": "en",          # Language code or "auto"
     "hotkey": "ctrl+space",    # Global hotkey to toggle recording
@@ -205,9 +209,14 @@ def save_config(config: dict):
 
 def validate_config(config: dict):
     """Validate config values. Raises ValueError on invalid values."""
-    valid_devices = {"NPU", "GPU", "CPU", "CUDA"}
+    valid_devices = set(VALID_DEVICES)
     if config.get("device") not in valid_devices:
         raise ValueError(f"device must be one of {valid_devices}, got '{config.get('device')}'")
+
+    priority = config.get("device_priority")
+    if (not isinstance(priority, list) or not priority
+            or any(d not in valid_devices for d in priority)):
+        raise ValueError(f"device_priority must be a non-empty list of {valid_devices}, got {priority!r}")
 
     valid_models = set(MODEL_REGISTRY.keys())
     if config.get("model_size") not in valid_models:
@@ -377,6 +386,51 @@ def has_nvidia_gpu(return_name: bool = False):
     except Exception:
         return None if return_name else False
 
+
+VALID_DEVICES = ("CUDA", "NPU", "GPU", "CPU")
+
+
+def detect_devices() -> set:
+    """Devices this machine can run inference on. CPU is always present."""
+    found = {"CPU"}
+    if has_nvidia_gpu():
+        found.add("CUDA")
+    try:
+        import openvino as ov
+        # "GPU.0"/"GPU.1" on multi-GPU machines; the app addresses "GPU".
+        found.update(d.split(".")[0] for d in ov.Core().available_devices)
+    except Exception as e:
+        log(f"OpenVINO device query failed: {e}")
+    return found
+
+
+def device_supports_model(device: str, model_key: str) -> bool:
+    # faster-whisper only runs Whisper; Parakeet has no CUDA backend.
+    return device != "CUDA" or MODEL_REGISTRY[model_key]["backend"] == "whisper"
+
+
+def select_device(config: dict, available: set, exclude=()) -> str | None:
+    """First device of config["device_priority"] that is present, runs the
+    configured model and is not excluded (e.g. the device that just failed).
+    """
+    for device in config["device_priority"]:
+        if (device in available and device not in exclude
+                and device_supports_model(device, config["model_size"])):
+            return device
+    return None
+
+
+def apply_device_priority(config: dict):
+    """Set config["device"] to the first present device of device_priority."""
+    chosen = select_device(config, detect_devices())
+    if chosen is None:
+        raise SystemExit(f"No device in device_priority {config['device_priority']} "
+                         f"can run {config['model_size']}")
+    log(f"Device priority {config['device_priority']} -> {chosen} "
+        f"for {config['model_size']} (override with --device)")
+    config["device"] = chosen
+
+
 def _failure_detail(exc: BaseException) -> str:
     """Short identifier of the original error (the deepest cause wins)."""
     chain = list(_exception_chain(exc))
@@ -523,23 +577,37 @@ class FasterWhisperCUDA:
 
     def transcribe(self, audio_data, sample_rate: int = 16000, language: str = "en") -> str:
         import numpy as np
-        
+        start = time.time()
+
         if audio_data.dtype == np.int16:
             audio_data = audio_data.astype(np.float32) / 32768.0
         elif audio_data.dtype != np.float32:
             audio_data = audio_data.astype(np.float32)
 
         ensure_devices_usable()
-        
+
+        # temperature=0.0 disables faster-whisper's temperature fallback.
+        # Dense dictation near 30s has a compression ratio above its 2.4
+        # threshold, so the default re-decoded up to 5 times (0.7s -> 3s on
+        # an RTX 4070) and returned a temperature-1.0 sample. The OpenVINO
+        # path is greedy with no fallback; this matches it.
         segments, info = self.pipeline.transcribe(
             audio_data,
             language=language if language != "auto" else None,
             condition_on_previous_text=False,
-            without_timestamps=True
+            without_timestamps=True,
+            temperature=0.0,
         )
-        
-        text = "".join(segment.text for segment in segments)
-        return text.strip()
+
+        # segments is a lazy generator: decoding happens here.
+        text = "".join(segment.text for segment in segments).strip()
+
+        elapsed = time.time() - start
+        audio_duration = len(audio_data) / sample_rate
+        rtf = elapsed / audio_duration if audio_duration > 0 else 0
+        log(f"Transcribed {audio_duration:.1f}s audio in {elapsed:.1f}s (RTF: {rtf:.2f}) on CUDA")
+
+        return text
 
 
 # ---------------------------------------------------------------------------
@@ -2874,22 +2942,7 @@ def run_setup():
 
     # 4. Create default config
     config = load_config()
-    
-    if has_nvidia_gpu():
-        config["device"] = "CUDA"
-    else:
-        try:
-            import openvino as ov
-            core = ov.Core()
-            devices = core.available_devices
-            if "NPU" in devices:
-                config["device"] = "NPU"
-            elif "GPU" in devices:
-                config["device"] = "GPU"
-            else:
-                config["device"] = "CPU"
-        except Exception:
-            config["device"] = "CPU"
+    config["device"] = select_device(config, detect_devices()) or "CPU"
 
     save_config(config)
 
@@ -2962,20 +3015,9 @@ def main():
     if args.continuous:
         config["continuous_listening"] = True
 
-    # Auto-select device based on model when --device not explicitly set
-    if not args.device:
-        model_info = MODEL_REGISTRY[config["model_size"]]
-        preferred = model_info["preferred_device"]
-        
-        if preferred == "GPU" and has_nvidia_gpu():
-            preferred = "CUDA"
-                
-        if config["device"] != preferred:
-            log(f"Auto-selecting {preferred} for {config['model_size']} "
-                f"(override with --device {config['device']})")
-            config["device"] = preferred
-
     validate_config(config)
+    if not args.device:
+        apply_device_priority(config)
 
     app = DictationApp(config)
     app.run()

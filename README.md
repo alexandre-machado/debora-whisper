@@ -16,7 +16,7 @@ Local voice-to-text dictation for Windows, powered by Intel NPU via OpenVINO. Pr
 - **One-click settings** — language-first model picker with download status badges
 - **Claude Code mode** — auto-paste + Enter for hands-free prompt submission
 - **Audio chimes** — pleasant start/stop feedback
-- **Device fallback** — NPU -> GPU -> CPU when a model fails to load; an NPU DEVICE_LOST moves to the GPU, while a GPU failure stops dictation until the app is restarted
+- **Device priority** — `device_priority` in the config (default RTX -> NPU -> iGPU -> CPU) picks the startup device; a DEVICE_LOST moves to the next healthy device on the list
 
 ## Requirements
 
@@ -103,7 +103,7 @@ Stored at `~/.npu-dictation/config.json`:
 
 ```json
 {
-  "device": "NPU",
+  "device_priority": ["CUDA", "NPU", "GPU", "CPU"],
   "model_size": "base",
   "language": "en",
   "hotkey": "ctrl+space",
@@ -113,6 +113,13 @@ Stored at `~/.npu-dictation/config.json`:
   "sample_rate": 16000
 }
 ```
+
+`device_priority` is the order devices are tried in. At startup the app uses
+the first one present on the machine that can run the model (`CUDA` = NVIDIA
+RTX via faster-whisper, Whisper models only; `GPU` = Intel iGPU). When the
+active device is lost, it falls back to the next healthy one. `-Device` on the
+command line overrides the list for that run. `device` is written by the app
+and records the device last chosen.
 
 Or change settings from the GUI: right-click the system tray icon and select **Settings**.
 
@@ -168,6 +175,42 @@ and `benchmarks/README.md`.
 
 ## Benchmarking
 
+### Benchmark: turbo on NPU vs Intel iGPU vs RTX (2026-10-06)
+
+Whisper turbo on one laptop: Intel Core Ultra (AI Boost NPU, driver
+32.0.100.5540; Arc iGPU) and an NVIDIA RTX 4070 Laptop. OpenVINO 2026.4.1 with
+`OpenVINO/whisper-large-v3-turbo-int8-ov` on NPU/iGPU; faster-whisper 1.2.1
+(`int8_float16`) on the RTX. Same English speech clips on every device, app
+closed, one process per device, median of 5 calls after a warm-up.
+
+| Clip | NPU | Intel iGPU | RTX 4070 |
+|------|-----|------------|----------|
+| 2s | 1.56s | 0.98s | **0.20s** |
+| 5s | 1.59s | 1.03s | **0.21s** |
+| 10s | 1.80s | 1.16s | **0.27s** |
+| 20s | 2.03s | 1.30s | **0.35s** |
+| 26s | 2.13s | 1.60s | **0.39s** |
+| 30s, dense speech | 2.79s | 1.92s | **0.56s** |
+| Model load (cached) | 3.1s | 1.3s | 3.8s |
+| CPU time per call | **0.05–0.23s** | ≈ latency | ≈ latency |
+
+- The RTX is 5–7x faster than the NPU and ~4x faster than the iGPU, which is
+  why `device_priority` puts `CUDA` first.
+- The NPU takes ~1.5–2.8s per call almost regardless of clip length, but
+  leaves the CPU idle; the iGPU and RTX keep a CPU core busy waiting on the
+  device for the whole call.
+- The RTX draws ~54 W while transcribing and ~3.4 W idle with the model
+  loaded. Battery impact was not measured (the test machine's battery is dead).
+- The dense 30s clip took 3.0s on the RTX before faster-whisper's temperature
+  fallback was disabled: its compression ratio (2.53) passed the 2.4
+  threshold, so it re-decoded up to 5 times and returned a temperature-1.0
+  sample. The app now decodes greedily at temperature 0, like the OpenVINO path.
+- All devices produced the same text.
+
+Reproduce with `benchmarks/bench_devices.py` (usage in its docstring).
+
+### Parakeet
+
 `benchmarks/bench_parakeet.py` measures Parakeet pipeline load/compile time
 and per-utterance latency by stage (mel / encoder / decoder), and reports
 which shape bucket was selected. See `benchmarks/README.md` for usage and
@@ -184,7 +227,7 @@ for the exact commands to produce before/after numbers on real NPU hardware.
 OpenVINO compiles the model graph for your specific NPU on first launch. This takes 1-15 minutes depending on model size and is cached for subsequent runs. For Parakeet specifically, this means 4 sequential encoder-graph compiles (one per shape bucket), not 1 — see the architecture notes above and `benchmarks/README.md` for details — so first launch takes proportionally longer than a single-graph model.
 
 ### DEVICE_LOST error
-When the error is attributed to the NPU alone, the GUI falls back to the GPU for the rest of the session. Reboot to reset the NPU.
+When the error is attributed to one device, the GUI falls back to the next healthy device in `device_priority`. After an NPU loss it probes the NPU in the background and moves back if it recovers; otherwise reboot to reset the NPU.
 
 ### GPU failed: restart required
 OpenVINO GPU errors such as `CL_OUT_OF_RESOURCES`, or a device loss that cannot be pinned on the NPU (Parakeet runs its decoder on the GPU, and a loss during its GPU fallback compile is blamed on the GPU even if the NPU failed first), can leave the OpenCL context in a state where further calls hang. The app does not retry or reload after that, on the GPU or on any other device. Recording and transcription stay disabled, and Settings changes are saved but not applied (the tray menu marks them "after restart"), until you quit and restart the app. The original OpenVINO error is written to `~/.npu-dictation/dictation.log`. If the failure repeats, select NPU or CPU in Settings, then restart. Disabling the retry only prevents a hang; it does not fix the driver or memory problem behind the error.

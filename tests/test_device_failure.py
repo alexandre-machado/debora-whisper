@@ -68,6 +68,8 @@ def genai(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "openvino_genai", fake.module)
     fake_ov = types.ModuleType("openvino")
     class Core:
+        available_devices = ["CPU", "GPU", "NPU"]
+
         def get_property(self, device, prop):
             return f"Fake {device}"
     fake_ov.Core = Core
@@ -82,6 +84,9 @@ def genai(monkeypatch, tmp_path):
     fake_fw.WhisperModel = WhisperModel
     monkeypatch.setitem(sys.modules, "faster_whisper", fake_fw)
 
+    # Fallback follows device_priority over the present devices; pin them so
+    # results do not depend on whether this machine has an RTX.
+    monkeypatch.setattr(de, "has_nvidia_gpu", lambda return_name=False: None if return_name else False)
     monkeypatch.setattr(de, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(de, "setup_model", lambda config: tmp_path / "whisper-base")
     return fake

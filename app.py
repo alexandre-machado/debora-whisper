@@ -15,6 +15,7 @@ from dictation_engine import (
     AppState, DictationApp, MODEL_REGISTRY, MODEL_DIR,
     load_config, save_config, validate_config, log, create_model,
     is_model_downloaded, device_failure,
+    apply_device_priority, detect_devices, select_device,
 )
 from ui.tray import TrayManager
 from ui.overlay import OverlayWindow
@@ -204,22 +205,21 @@ class GUIApp:
 
             if data.get("device_lost"):
                 failed_dev = data.get("device_failure")
-                
+                # Next healthy device of config["device_priority"].
+                fallback_dev = select_device(self._config, detect_devices(),
+                                             exclude={failed_dev})
+                if fallback_dev is None:
+                    log(f"{failed_dev} DEVICE_LOST detected — no other device in "
+                        f"{self._config['device_priority']}; restart the app.")
+                    return
+
                 if failed_dev == "NPU":
-                    fallback_dev = "GPU"
-                    from dictation_engine import has_nvidia_gpu
-                    if has_nvidia_gpu():
-                        fallback_dev = "CUDA"
-                        
                     # Schedule an invisible background recovery probe for NPU
                     self._schedule_npu_recovery()
-                else:
-                    # GPU or CUDA failed, fallback to NPU immediately
-                    fallback_dev = "NPU"
-                    # Reset NPU retry counter since we are switching back
-                    if hasattr(self, "_npu_retry_count"):
-                        self._npu_retry_count = 0
-                    
+                elif hasattr(self, "_npu_retry_count"):
+                    # Reset NPU retry counter since we are switching away
+                    self._npu_retry_count = 0
+
                 log(f"{failed_dev} DEVICE_LOST detected — falling back to {fallback_dev} immediately")
                 self._config["device"] = fallback_dev
                 self._tray.update_info(
@@ -508,21 +508,9 @@ def main():
     if args.continuous:
         config["continuous_listening"] = True
 
-    # Auto-select device if not explicitly overridden
-    if not args.device:
-        model_info = MODEL_REGISTRY[config["model_size"]]
-        preferred = model_info["preferred_device"]
-        
-        if preferred == "GPU":
-            from dictation_engine import has_nvidia_gpu
-            if has_nvidia_gpu():
-                preferred = "CUDA"
-
-        if config["device"] != preferred:
-            log(f"Auto-selecting {preferred} for {config['model_size']}")
-            config["device"] = preferred
-
     validate_config(config)
+    if not args.device:
+        apply_device_priority(config)
 
     app = GUIApp(config)
     app.run()
