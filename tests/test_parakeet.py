@@ -299,7 +299,21 @@ class TestModelDownloadStatus:
         model_dir = tmp_path / "whisper-base-openvino"
         model_dir.mkdir()
         (model_dir / "model.xml").write_text("")
+        (model_dir / "model.bin").write_bytes(b"\0")
         assert is_model_downloaded("base") is True
+
+    def test_interrupted_download_is_not_downloaded(self, tmp_path, monkeypatch):
+        """The .xml files arrive first; missing or empty weights mean the
+        download stopped and must resume, not load."""
+        monkeypatch.setattr("npu_whisper.dictation_engine.MODEL_DIR", tmp_path)
+        model_dir = tmp_path / "whisper-base-openvino"
+        model_dir.mkdir()
+        for name in ("encoder", "decoder"):
+            (model_dir / f"{name}.xml").write_text("<net/>")
+        (model_dir / "encoder.bin").write_bytes(b"\0")
+        assert is_model_downloaded("base") is False
+        (model_dir / "decoder.bin").write_bytes(b"")
+        assert is_model_downloaded("base") is False
 
     def test_dir_with_onnx_is_downloaded(self, tmp_path, monkeypatch):
         monkeypatch.setattr("npu_whisper.dictation_engine.MODEL_DIR", tmp_path)

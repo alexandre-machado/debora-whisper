@@ -12,7 +12,7 @@ import argparse
 import customtkinter as ctk
 
 from npu_whisper.dictation_engine import (
-    AppState, DictationApp, MODEL_REGISTRY, MODEL_DIR,
+    AppState, DictationApp, MODEL_REGISTRY,
     load_config, save_config, validate_config, log, create_model,
     is_model_downloaded, device_failure,
     apply_device_priority, detect_devices, select_device,
@@ -77,12 +77,7 @@ class GUIApp:
     def run(self):
         """Start the application."""
         # Check if model exists on disk — show onboarding if not
-        model_info = MODEL_REGISTRY[self._config["model_size"]]
-        model_path = MODEL_DIR / model_info["local_dir"]
-        has_files = model_path.exists() and (
-            any(model_path.glob("*.xml")) or any(model_path.glob("*.onnx"))
-        )
-        needs_setup = not has_files
+        needs_setup = not is_model_downloaded(self._config["model_size"])
 
         if needs_setup:
             def _on_onboarding_done():

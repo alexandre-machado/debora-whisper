@@ -581,9 +581,48 @@ def test_bundled_server_declares_its_own_environment():
     assert "chatterbox-tts" in header and "download.pytorch.org/whl/cu124" in header
 
 
+class _Registry:
+    """winreg stand-in holding the user's saved environment variables."""
+    HKEY_CURRENT_USER = "HKCU"
+
+    def __init__(self, values):
+        self.values = values
+
+    def OpenKey(self, root, path):
+        from contextlib import nullcontext
+        return nullcontext(path)
+
+    def QueryValueEx(self, key, name):
+        if name not in self.values:
+            raise FileNotFoundError(name)
+        return self.values[name], 1
+
+
+def test_saved_variables_are_used_when_the_terminal_predates_them(monkeypatch, tmp_path):
+    """A terminal opened before MODELS_DIR/HF_HOME were set does not pass
+    them on; the app must still use the folders they point to."""
+    import importlib
+    from npu_whisper import paths
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "winreg", _Registry(
+        {"MODELS_DIR": str(tmp_path), "HF_HOME": str(tmp_path / "huggingface")}))
+    monkeypatch.delenv("MODELS_DIR", raising=False)
+    monkeypatch.delenv("HF_HOME", raising=False)
+    try:
+        importlib.reload(paths)
+        assert paths.MODEL_DIR == tmp_path / "npu-whisper" / "models"
+        assert paths.VOICES_DIR == tmp_path / "voices"
+        import os
+        assert os.environ["HF_HOME"] == str(tmp_path / "huggingface")
+    finally:
+        monkeypatch.undo()
+        importlib.reload(paths)
+
+
 def test_paths_follow_models_dir(monkeypatch, tmp_path):
     import importlib
     from npu_whisper import paths
+    monkeypatch.setitem(sys.modules, "winreg", _Registry({}))
     monkeypatch.setenv("MODELS_DIR", str(tmp_path))
     try:
         importlib.reload(paths)

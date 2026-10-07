@@ -181,9 +181,20 @@ def get_models_for_language(lang: str) -> dict:
 def is_model_downloaded(model_key: str) -> bool:
     """Check if model files exist locally."""
     info = MODEL_REGISTRY[model_key]
-    path = MODEL_DIR / info["local_dir"]
-    return path.exists() and (
-        any(path.glob("*.xml")) or any(path.glob("*.onnx")))
+    return model_files_complete(MODEL_DIR / info["local_dir"])
+
+
+def model_files_complete(path: Path) -> bool:
+    """True when path holds a model (Whisper .xml, Parakeet .onnx). Each .xml
+    needs its .bin weights: an interrupted download leaves the .xml files
+    and missing or empty .bin files, which then fail to load."""
+    if not path.exists():
+        return False
+    xmls = list(path.glob("*.xml"))
+    if xmls:
+        return all(x.with_suffix(".bin").is_file() and x.with_suffix(".bin").stat().st_size > 0
+                   for x in xmls)
+    return any(path.glob("*.onnx"))
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +309,7 @@ def setup_model(config: dict, progress_callback=None):
         return None
 
     # Check if model already exists (Whisper uses .xml, Parakeet uses .onnx)
-    has_xml = model_path.exists() and any(model_path.glob("*.xml"))
-    has_onnx = model_path.exists() and any(model_path.glob("*.onnx"))
-    if has_xml or has_onnx:
+    if model_files_complete(model_path):
         log(f"Model already available at {model_path}")
         return model_path
 
@@ -357,9 +366,7 @@ def setup_model(config: dict, progress_callback=None):
         snapshot_download(ov_repo, local_dir=str(model_path), **tqdm_kwargs)
 
         # Verify download
-        has_xml = any(model_path.glob("*.xml"))
-        has_onnx = any(model_path.glob("*.onnx"))
-        if has_xml or has_onnx:
+        if model_files_complete(model_path):
             log(f"Model downloaded to {model_path}")
             return model_path
     except Exception as e:
