@@ -45,6 +45,10 @@ dependencies = [
 # why this is opt-in; the app falls back along device_priority without it.
 cuda = [
     "faster-whisper>=1.0.0",
+    # Every tokenizers >=0.14 caps huggingface_hub <2.0. Left alone, uv takes
+    # hub 2.x and backtracks to tokenizers 0.13.3, which has no wheel for
+    # current Pythons and needs a Rust toolchain to build.
+    "tokenizers>=0.14",
     "nvidia-cublas-cu12",
     "nvidia-cudnn-cu12",
 ]
