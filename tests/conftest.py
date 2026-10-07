@@ -37,6 +37,14 @@ def _no_npu_loss_record():
 
 
 @pytest.fixture(autouse=True)
+def _private_last_recording(tmp_path, monkeypatch):
+    """A DictationApp deletes or overwrites last_recording.wav; never the
+    user's real one."""
+    from debora_whisper import dictation_engine as engine
+    monkeypatch.setattr(engine, "LAST_RECORDING", tmp_path / "last_recording.wav")
+
+
+@pytest.fixture(autouse=True)
 def _reset_device_failure_latch():
     """The fatal device latch is process-wide; isolate it per test."""
     from debora_whisper import dictation_engine

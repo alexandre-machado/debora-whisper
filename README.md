@@ -178,6 +178,13 @@ already listening continuously. A session started by a tap stops by itself
 after `continuous_idle_stop_seconds` (default 120) without speech; `null`
 keeps it on until the next tap.
 
+`save_last_recording: true` keeps the audio of the last transcription in
+`~/.debora/last_recording.wav`, to reproduce a bad transcription. Each new
+transcription overwrites it: in continuous dictation and voice chat that is the
+last finished speech segment, voice chat included. A Claude Code voice session
+can read it, since it has access to `~/.debora`. Turning the option off deletes
+the file. Off by default.
+
 Continuous dictation normally ends a segment after `vad_end_silence_seconds`
 (default 1.5) of silence. When the latest transcription draft covers the most
 recent speech and looks incomplete, it waits up to
