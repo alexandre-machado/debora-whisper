@@ -50,6 +50,9 @@ DEFAULT_CONFIG = {
     # continuous listening (VAD types each sentence; tap again to stop) or,
     # with "toggle", starts a recording that the next tap stops.
     "tap_action": "continuous",
+    # Continuous listening stops by itself after this long without speech
+    # (null: never), so a stray tap does not leave the microphone open.
+    "continuous_idle_stop_seconds": 120,
 }
 
 # Supported languages (Whisper's top languages + display names)
@@ -1380,6 +1383,8 @@ class AudioRecorder:
         self._expected_adc_time = None
         self._stable_callbacks = 0
         self.paused = False
+        # time.time() of the last block the VAD classified as speech.
+        self.last_speech_time = 0.0
 
         # Continuous VAD properties
         self.capacity = int(sample_rate * self.config.get("ring_buffer_seconds", 30))
@@ -1479,6 +1484,17 @@ class AudioRecorder:
         except Exception:
             self.close()
             raise
+
+    def prepare_vad(self):
+        """Load Silero and start the VAD thread (slow on first use).
+
+        Paused unless already continuous: during push-to-talk the thread must
+        not cut segments, or they would be typed and then typed again from
+        begin_continuous()'s rewind."""
+        with self._lock:
+            if not self.continuous:
+                self.paused = True
+        self._ensure_vad_thread()
 
     def _ensure_vad_thread(self):
         if self.neural_vad is None:
@@ -1587,6 +1603,7 @@ class AudioRecorder:
                 block_size = 512
                 for i in range(0, len(new_data), block_size):
                     block = new_data[i:i+block_size]
+                    block_len = len(block)
                     if len(block) < block_size:
                         # Put back leftover frames by winding back read_pos slightly
                         # In practice, we could just ignore or buffer it, but it's easier to just rewind
@@ -1610,8 +1627,9 @@ class AudioRecorder:
                             continue
                     else:
                         # Use Neural VAD if available, fallback to RMS
-                        block_len = len(block)
                         is_speech_now = self._block_is_speech(block, is_speaking)
+                        if is_speech_now:
+                            self.last_speech_time = time.time()
 
                         if is_speech_now:
                             if not is_speaking:
@@ -2133,6 +2151,7 @@ class DictationApp:
         # Continuous (VAD) listening is on: from --continuous at startup or a
         # hotkey tap. Guarded by _audio_lifecycle_lock.
         self._continuous = bool(config.get("continuous_listening", False))
+        self._continuous_since = 0.0
         self._model_ready = threading.Event()
         self._load_error: str | None = None
         # Serializes model use (warmup/transcribe) against model replacement
@@ -2616,8 +2635,11 @@ class DictationApp:
                             self._draft_typed_text = text
                             self._draft_target = target
 
+                    # Re-read rather than reuse `continuous`: a tap may have
+                    # stopped listening while this segment transcribed.
+                    listening = self._continuous and self.is_recording
                     if is_final:
-                        if continuous:
+                        if listening:
                             # The text is already typed; no "Done" balloon
                             # per sentence while the microphone stays open.
                             self._set_state(AppState.RECORDING, {"draft_text": ""})
@@ -2626,7 +2648,8 @@ class DictationApp:
                         self.last_draft_text = ""
                     else:
                         self.last_draft_text = text
-                        self._set_state(AppState.RECORDING, {"draft_text": text})
+                        if listening:
+                            self._set_state(AppState.RECORDING, {"draft_text": text})
                 else:
                     # An empty draft is often a dropped hallucination
                     # mid-sentence: keep the typed draft until the final
@@ -2636,14 +2659,11 @@ class DictationApp:
                             self._forget_draft_locked(erase=True)
                         self.last_draft_text = ""
                         log("No speech detected.")
-                        if self._continuous:
-                            if self.is_recording:
-                                self._set_state(AppState.RECORDING)
-                            else:
-                                self._set_state(AppState.READY)
+                        if self._continuous and self.is_recording:
+                            self._set_state(AppState.RECORDING)
                         else:
                             self._set_state(AppState.READY)
-                    else:
+                    elif self._continuous and self.is_recording:
                         # Draft but no text detected
                         self._set_state(AppState.RECORDING, {"draft_text": ""})
             except Exception as e:
@@ -2784,31 +2804,66 @@ class DictationApp:
             self._hotkey_held = False
 
     def _begin_continuous(self, press_time):
+        # Silero loads (first tap: downloads) outside the lifecycle lock, so
+        # a stop press, Settings or busy_reason() never wait on it. The
+        # push-to-talk capture keeps recording meanwhile.
+        self.recorder.prepare_vad()
         with self._audio_lifecycle_lock:
             if self._stopping.is_set() or not self.is_recording or self._transcribing:
                 return  # the start failed, or something already stopped it
-            # Re-read from just before the press: speech may start mid-tap.
-            self.recorder.begin_continuous(rewind_seconds=time.time() - press_time + 0.3)
-            self._continuous = True
+            try:
+                # Re-read from just before the press: speech may start mid-tap.
+                self.recorder.begin_continuous(rewind_seconds=time.time() - press_time + 0.3)
+            except Exception as e:
+                log(f"Cannot start continuous listening: {e}")
+                self.recorder.end_continuous()  # VAD paused, cuts nothing
+                self.recorder.stop()
+                self.is_recording = False
+                failed = True
+            else:
+                self._continuous = True
+                self._continuous_since = time.time()
+                failed = False
+        if failed:
+            self._set_state(AppState.READY)
+            return
         log("Continuous listening on. Tap the hotkey again to stop.")
         if self.config["beep_on_start"]:
             self.chimes.play('continuous')
         self._set_state(AppState.RECORDING)
+        idle = self.config.get("continuous_idle_stop_seconds")
+        if idle:
+            threading.Thread(target=self._stop_continuous_when_idle,
+                             args=(self._continuous_since, idle), daemon=True).start()
 
-    def _end_continuous(self):
+    def _stop_continuous_when_idle(self, session, idle_seconds, poll=1.0):
+        """A stray tap must not leave the microphone open indefinitely."""
+        while not self._stopping.wait(poll):
+            if not self._continuous or self._continuous_since != session:
+                return
+            last_activity = max(session, self.recorder.last_speech_time)
+            if time.time() - last_activity > idle_seconds:
+                log(f"No speech for {idle_seconds}s; stopping continuous listening.")
+                self._end_continuous(session)
+                return
+
+    def _end_continuous(self, session=None):
+        """Stop continuous listening; with `session`, only that session (a
+        tap may have stopped it and started another since it was checked)."""
         with self._audio_lifecycle_lock:
             if not self._continuous:
                 return
+            if session is not None and self._continuous_since != session:
+                return
             self._continuous = False
             self.is_recording = False
-            # Speech in progress is still cut, queued and typed.
+            # Speech in progress is still cut, queued and typed; its final
+            # sets READY with the text once transcribed.
             self.recorder.end_continuous()
-            transcribing = self._transcribing
         log("Continuous listening off.")
         if self.config["beep_on_start"]:
             self.chimes.play('stop')
-        if not transcribing:
-            self._set_state(AppState.READY)
+        self._set_state(AppState.READY)
 
     # -- Lifecycle -------------------------------------------------------
 
