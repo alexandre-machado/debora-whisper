@@ -13,6 +13,7 @@
 - **UI**: Desktop overlay / system tray.
 
 ## Key Architectural Details
+- **Packaging**: Code lives in the `npu_whisper` package (`app.py`, `dictation_engine.py`, `ui/`). `pyproject.toml` is the single source of dependencies (runtime by default; `cuda`, `export`, `test` extras) and defines the `npu-whisper` (tray app) and `npu-whisper-cli` commands. Users install with `uv tool install`; tagged `v*` releases publish to PyPI via `.github/workflows/release.yml`. The app must never pip-install at runtime.
 - **Hardware Fallback**: Models attempt to load on the requested hardware. If OpenCL/CUDA fails or devices are lost, the engine gracefully falls back (e.g., NPU -> GPU -> CPU).
 - **Parakeet Bucketing**: The Parakeet model requires static input shapes for OpenVINO NPU compilation, so it uses pre-compiled shape buckets for its encoder graph. The decoder runs on the GPU or CPU.
 - **Logging Subsystem**: Logs are split between `~/.npu-dictation/logs/app.log` (startup events, transcription timings, and hardware names) and `~/.npu-dictation/logs/telemetry.log` (background stats like CPU, RAM, VRAM, and audio buffer health).

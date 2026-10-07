@@ -16,8 +16,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-import dictation_engine as de
-from dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
+from npu_whisper import dictation_engine as de
+from npu_whisper.dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
 from tests.test_app_shutdown import GUIApp
 
 CL_ERROR = (
@@ -95,7 +95,7 @@ def genai(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True)
 def isolate_desktop():
     with patch("keyboard.is_pressed", return_value=False), \
-            patch("keyboard.unhook_all"), patch("dictation_engine.type_text") as paste:
+            patch("keyboard.unhook_all"), patch("npu_whisper.dictation_engine.type_text") as paste:
         yield paste
 
 

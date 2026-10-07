@@ -2,7 +2,7 @@
 
 import threading
 import pystray
-from ui.icons import get_icon, get_volume_icon
+from npu_whisper.ui.icons import get_icon, get_volume_icon
 
 
 class TrayManager:

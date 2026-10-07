@@ -27,6 +27,31 @@ Local voice-to-text dictation for Windows, powered by Intel NPU via OpenVINO. Pr
 
 ## Quick Start
 
+### Install as a command (uv)
+
+[uv](https://docs.astral.sh/uv/) installs the app in its own environment and
+fetches a matching Python if you have none:
+
+```powershell
+winget install astral-sh.uv
+
+# NPU / Intel iGPU / CPU only
+uv tool install git+https://github.com/alexandre-machado/npu-whisper
+
+# ...or with the NVIDIA RTX backend (adds ~2 GB of CUDA libraries)
+uv tool install "npu-whisper[cuda] @ git+https://github.com/alexandre-machado/npu-whisper"
+
+npu-whisper-cli --setup   # detect devices, download the model, warm the cache
+npu-whisper               # tray app + overlay
+npu-whisper-cli           # console-only mode
+```
+
+Update with `uv tool upgrade npu-whisper`, remove with `uv tool uninstall npu-whisper`
+(models and config stay in `~/.npu-dictation/`). Once published to PyPI, the
+same works with `uv tool install npu-whisper` or a one-off `uvx npu-whisper`.
+
+### From a source checkout
+
 ```powershell
 # 1. Clone
 git clone https://github.com/Goodsmileduck/npu-whisper.git
@@ -165,7 +190,7 @@ The model runs **100% locally** on your Intel NPU. No internet required after in
 
 NPU only supports static (fixed) input shapes, so the Parakeet encoder can't
 just size itself to each utterance. Instead it's **shape-bucketed**: several
-fixed-size graphs (`ParakeetNPU.MEL_BUCKETS` in `dictation_engine.py`) are
+fixed-size graphs (`ParakeetNPU.MEL_BUCKETS` in `npu_whisper/dictation_engine.py`) are
 compiled and cached up front, and each utterance runs on the smallest bucket
 it fits in, instead of always paying for the longest one. Audio longer than
 the largest bucket is truncated (never crashes), and this is logged, not
@@ -257,8 +282,21 @@ python -m pytest tests/ -q
 
 # Auto-reload during development
 pip install watchfiles
-watchfiles "python app.py" .
+watchfiles "python -m npu_whisper" npu_whisper
 ```
+
+Code lives in the `npu_whisper` package: `app.py` (tray app, `npu-whisper`),
+`dictation_engine.py` (engine and console mode, `npu-whisper-cli`) and `ui/`.
+Dependencies are declared in `pyproject.toml`: runtime by default, plus the
+`cuda` (RTX), `export` (custom model export) and `test` extras.
+
+### Releasing
+
+Bump `__version__` in `npu_whisper/__init__.py`, then push a `vX.Y.Z` tag that
+matches it. The [Release workflow](.github/workflows/release.yml) builds the
+wheel and sdist, installs the wheel with `uv tool install` as a smoke test and
+publishes to PyPI through trusted publishing (the `pypi` environment must be
+registered as a trusted publisher on the PyPI project).
 
 ## License
 

@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
-from dictation_engine import ParakeetNPU, MODEL_DIR, MODEL_REGISTRY, is_model_downloaded
+from npu_whisper.dictation_engine import ParakeetNPU, MODEL_DIR, MODEL_REGISTRY, is_model_downloaded
 
 
 def synthetic_utterance(duration_s: float, sample_rate: int = 16000, seed: int = 0) -> np.ndarray:

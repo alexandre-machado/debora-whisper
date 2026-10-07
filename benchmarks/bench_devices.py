@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
-import dictation_engine as de
+from npu_whisper import dictation_engine as de
 
 speech_wav, dense_wav, device = sys.argv[1:4]
 beam = sys.argv[4] if len(sys.argv) > 4 else "app"
