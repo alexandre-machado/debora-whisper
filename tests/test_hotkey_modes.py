@@ -191,3 +191,34 @@ def test_recent_speech_keeps_continuous_on():
     watcher.join(1)
     assert not watcher.is_alive()
     app.recorder.end_continuous.assert_called_once()
+
+
+def test_vad_stays_paused_during_push_to_talk():
+    """The VAD thread starts on the tap; until begin_continuous it must not
+    cut segments, or speech is typed and then typed again from the rewind."""
+    rec = AudioRecorder(sample_rate=16000, config={})
+    rec._ensure_vad_thread = MagicMock()
+    rec.recording = True
+    rec.prepare_vad()
+    assert rec.paused
+    rec.begin_continuous(rewind_seconds=0.5)
+    assert not rec.paused
+    rec.prepare_vad()  # already continuous: stays live
+    assert not rec.paused
+
+
+def test_failed_switch_leaves_the_vad_paused():
+    app, _ = _app()
+    app.is_recording = True
+    app.recorder.begin_continuous.side_effect = RuntimeError("no VAD")
+    app._begin_continuous(time.time())
+    app.recorder.end_continuous.assert_called_once()
+
+
+def test_idle_watcher_does_not_stop_a_newer_session():
+    app, _ = _app()
+    app._continuous, app.is_recording = True, True
+    app._continuous_since = time.time()
+    app._end_continuous(session=app._continuous_since - 5)  # a stale watcher
+    assert app.continuous_active
+    app.recorder.end_continuous.assert_not_called()

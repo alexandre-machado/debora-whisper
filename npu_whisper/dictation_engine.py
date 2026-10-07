@@ -1486,7 +1486,14 @@ class AudioRecorder:
             raise
 
     def prepare_vad(self):
-        """Load Silero and start the VAD thread (slow on first use)."""
+        """Load Silero and start the VAD thread (slow on first use).
+
+        Paused unless already continuous: during push-to-talk the thread must
+        not cut segments, or they would be typed and then typed again from
+        begin_continuous()'s rewind."""
+        with self._lock:
+            if not self.continuous:
+                self.paused = True
         self._ensure_vad_thread()
 
     def _ensure_vad_thread(self):
@@ -2809,6 +2816,7 @@ class DictationApp:
                 self.recorder.begin_continuous(rewind_seconds=time.time() - press_time + 0.3)
             except Exception as e:
                 log(f"Cannot start continuous listening: {e}")
+                self.recorder.end_continuous()  # VAD paused, cuts nothing
                 self.recorder.stop()
                 self.is_recording = False
                 failed = True
@@ -2836,12 +2844,16 @@ class DictationApp:
             last_activity = max(session, self.recorder.last_speech_time)
             if time.time() - last_activity > idle_seconds:
                 log(f"No speech for {idle_seconds}s; stopping continuous listening.")
-                self._end_continuous()
+                self._end_continuous(session)
                 return
 
-    def _end_continuous(self):
+    def _end_continuous(self, session=None):
+        """Stop continuous listening; with `session`, only that session (a
+        tap may have stopped it and started another since it was checked)."""
         with self._audio_lifecycle_lock:
             if not self._continuous:
+                return
+            if session is not None and self._continuous_since != session:
                 return
             self._continuous = False
             self.is_recording = False
