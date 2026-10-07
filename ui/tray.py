@@ -1,7 +1,6 @@
 """System tray icon manager using pystray."""
 
 import threading
-import time
 import pystray
 from ui.icons import get_icon, get_volume_icon
 
@@ -24,10 +23,16 @@ class TrayManager:
         self._icon: pystray.Icon | None = None
         self._thread: threading.Thread | None = None
         
-        # Animation state
-        self._animating = False
+        # All pystray mutations happen on _render_thread. Setting the icon,
+        # title or menu calls Shell_NotifyIcon, which can block on Explorer;
+        # done from Tk callbacks it kept the main thread inside a callback,
+        # where Tk swallows Ctrl+C's KeyboardInterrupt. Public methods only
+        # record what to show and wake the renderer.
+        self._level = 0.0
         self._anim_frame = 0
-        self._anim_thread: threading.Thread | None = None
+        self._wake = threading.Event()
+        self._running = False
+        self._render_thread: threading.Thread | None = None
 
     def _build_menu(self):
         """Build the right-click context menu with dynamic state text."""
@@ -108,61 +113,64 @@ class TrayManager:
 
         self._thread = threading.Thread(target=self._icon.run, daemon=True)
         self._thread.start()
-        
-        self._check_animation()
 
-    def _animation_loop(self):
-        """Background loop to update the icon for animated states."""
-        while self._animating and self._icon:
-            if not getattr(self._icon, "visible", True):
-                time.sleep(0.1)
-                continue
-                
-            self._anim_frame += 1
-            try:
-                self._icon.icon = get_icon(self._state, self._anim_frame)
-            except Exception:
-                pass
-            time.sleep(0.15)  # 150ms per frame
+        self._running = True
+        self._render_thread = threading.Thread(target=self._render_loop, daemon=True)
+        self._render_thread.start()
 
-    def _check_animation(self):
-        """Start or stop the animation loop based on the current state."""
-        should_animate = self._state in ("loading", "processing")
-        
-        if should_animate and not self._animating:
-            self._animating = True
-            self._anim_frame = 0
-            self._anim_thread = threading.Thread(target=self._animation_loop, daemon=True)
-            self._anim_thread.start()
-        elif not should_animate and self._animating:
-            self._animating = False
-            self._anim_thread = None
+    def _render_loop(self):
+        """Apply state, tooltip and icon frames to pystray. Only Windows calls
+        whose result changed are made: a silent mic or a repeated state costs
+        nothing."""
+        shown_image = shown_title = shown_state = None
+        while self._running:
+            self._wake.clear()
+            state, title = self._state, self._tooltip
+            if state == "recording":
+                image = get_volume_icon(self._level)
+                interval = 0.1
+            elif state in ("loading", "processing"):
+                self._anim_frame += 1
+                image = get_icon(state, self._anim_frame)
+                interval = 0.15
+            else:
+                image = get_icon(state)
+                interval = None  # static: sleep until the next update
+
+            icon = self._icon
+            if icon is not None and getattr(icon, "visible", True):
+                try:
+                    if image is not shown_image:
+                        icon.icon = image
+                        shown_image = image
+                    if title != shown_title:
+                        icon.title = title
+                        shown_title = title
+                    if state != shown_state:
+                        # Rebuild so the dynamic menu text follows the state.
+                        icon.menu = self._build_menu()
+                        icon.update_menu()
+                        shown_state = state
+                except Exception:
+                    pass  # icon torn down underneath us during shutdown
+            else:
+                interval = 0.1  # not shown yet: retry shortly
+
+            self._wake.wait(interval)
 
     def update_state(self, state_name: str, tooltip: str | None = None):
-        """Update tray icon and tooltip for a new state."""
+        """Record a new state/tooltip; the render thread applies it."""
+        if state_name != self._state:
+            self._anim_frame = 0
         self._state = state_name
         if tooltip:
             self._tooltip = tooltip
-
-        self._check_animation()
-
-        if self._icon and getattr(self._icon, "visible", True):
-            try:
-                self._icon.icon = get_icon(self._state, 0)
-                self._icon.title = self._tooltip
-                # Force menu rebuild so dynamic text updates
-                self._icon.menu = self._build_menu()
-                self._icon.update_menu()
-            except Exception:
-                pass
+        self._wake.set()
 
     def update_audio_level(self, level: float):
-        """Update the icon dynamically based on audio volume level."""
-        if self._state == "recording" and self._icon and getattr(self._icon, "visible", True):
-            try:
-                self._icon.icon = get_volume_icon(level)
-            except Exception:
-                pass
+        """Record the mic level; the render thread turns it into icon frames
+        while recording."""
+        self._level = level
 
     def update_info(self, device: str, model: str, hotkey: str):
         """Update the device/model/hotkey shown in the menu."""
@@ -172,7 +180,8 @@ class TrayManager:
 
     def stop(self):
         """Stop the tray icon."""
-        self._animating = False
+        self._running = False
+        self._wake.set()
         if self._icon:
             try:
                 self._icon.stop()
