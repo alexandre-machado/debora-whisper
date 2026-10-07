@@ -566,8 +566,6 @@ def record_device_failure(device: str, exc: BaseException) -> dict:
                 "message": restart_required_message(device, detail),
                 "exception": exc,
             }
-            if device == "NPU":
-                _remember_npu_loss(detail)
         return dict(_device_failure)
 
 
@@ -580,7 +578,7 @@ def _boot_time() -> float | None:
     return time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000
 
 
-def _remember_npu_loss(detail: str):
+def remember_npu_loss(detail: str):
     try:
         NPU_LOST_FILE.parent.mkdir(parents=True, exist_ok=True)
         NPU_LOST_FILE.write_text(json.dumps(
@@ -2420,6 +2418,8 @@ class DictationApp:
                 "cause": cause,
             }
 
+        if kind == "NPU":
+            remember_npu_loss(_failure_detail(exc))
         # Never call into the failed pipeline again: a second generate() on
         # the lost NPU crashed the whole process (access violation).
         self._quarantine_lost_model()
@@ -3059,11 +3059,21 @@ class DictationApp:
         log("Loading model in background (first time may take several minutes)...")
         self._start_loader()
         if self.config.get("voice_chat"):
-            # LLM and TTS load alongside the speech model, ready for the
-            # first reply.
+            # The TTS server (its own process, on the RTX) starts now; the
+            # LLM waits for the speech model: both times its compile on the
+            # iGPU overlapped the NPU's warmup inference, the NPU was lost.
             threading.Thread(target=warm_up, daemon=True,
-                             args=(self.config, log, TTS_SERVER_LOG)).start()
+                             args=(self.config, log, TTS_SERVER_LOG,
+                                   self._wait_speech_model)).start()
         self._start_segment_consumer()
+
+    def _wait_speech_model(self) -> bool:
+        """Block until the speech model is ready (or failed); False if the
+        engine stopped meanwhile."""
+        while not self._model_ready.wait(0.5):
+            if self._stopping.is_set():
+                return False
+        return not self._stopping.is_set()
 
     def _start_segment_consumer(self):
         """Transcribe VAD segments. Always running: any tap may start

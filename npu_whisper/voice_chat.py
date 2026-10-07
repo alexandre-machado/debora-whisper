@@ -312,9 +312,12 @@ def stop_tts_server():
         process.kill()
 
 
-def warm_up(config: dict, log=print, tts_log_path=None):
-    """Start the TTS server and load the LLM ahead of the first reply."""
+def warm_up(config: dict, log=print, tts_log_path=None, before_llm=None):
+    """Start the TTS server and load the LLM ahead of the first reply.
+    before_llm() runs first and returns False to skip the LLM."""
     ensure_tts_server(config, log, tts_log_path)
+    if before_llm is not None and not before_llm():
+        return
     try:
         load_llm(config, log)
     except Exception as e:
@@ -354,6 +357,13 @@ class VoiceChat:
         if time.time() - self._last_turn > HISTORY_IDLE_RESET_SECONDS:
             self._history = []
         prompt = self.config.get("llm_prompt") or DEFAULT_VOICE_CHAT_PROMPT
+        language = self.config.get("language")
+        if language and language != "auto":
+            # A short "Sim." alone does not tell the model the language:
+            # it answered in English.
+            from npu_whisper.dictation_engine import LANGUAGES
+            name = LANGUAGES.get(language, language)
+            prompt += f" The user speaks {name}: reply in {name}."
         recent = self._history[-2 * HISTORY_TURNS:]
         return [{"role": "system", "content": prompt}, *recent,
                 {"role": "user", "content": text}]
@@ -413,6 +423,7 @@ class VoiceChat:
                     state["reply"] = f"{state['reply']} {spoken}".strip()
                     if on_reply:
                         on_reply(state["reply"])
+                    self.log(f"Voice chat: reply {spoken!r}")
                     if not any(c.isalnum() for c in spoken):
                         continue  # an emoji or punctuation: nothing to say
                     audio = None

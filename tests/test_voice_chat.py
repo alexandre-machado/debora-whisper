@@ -110,7 +110,8 @@ def test_reply_is_streamed_and_spoken_sentence_by_sentence(server):
     assert _tts_texts(server) == ["A capital é Canberra.", "Fica no sul! Mais algo?"]
     assert played == [(2400, 24000)] * 2
     assert llm.calls[0] == [
-        {"role": "system", "content": vc.DEFAULT_VOICE_CHAT_PROMPT},
+        {"role": "system", "content": vc.DEFAULT_VOICE_CHAT_PROMPT +
+         " The user speaks Portuguese: reply in Portuguese."},
         {"role": "user", "content": "qual é a capital da austrália"}]
     assert [b["language"] for p, b in server.requests if p == "/tts"] == ["pt"] * 2
 
@@ -129,7 +130,7 @@ def test_emoji_is_shown_but_not_spoken(server):
 
 def test_configured_prompt_is_used(server):
     llm = FakeLLM(["ok"])
-    chat, _ = _chat(server, llm, llm_prompt="Seja breve.")
+    chat, _ = _chat(server, llm, llm_prompt="Seja breve.", language="auto")
     chat.respond("oi")
     assert llm.calls[0][0]["content"] == "Seja breve."
 
@@ -660,3 +661,35 @@ def test_paths_follow_models_dir(monkeypatch, tmp_path):
     finally:
         monkeypatch.undo()
         importlib.reload(paths)
+
+
+def test_llm_loads_only_after_the_speech_model(monkeypatch):
+    """Compiling the LLM on the iGPU during the NPU's warmup lost the NPU."""
+    order = []
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: order.append("tts"))
+    monkeypatch.setattr(vc, "load_llm", lambda *a: order.append("llm"))
+    vc.warm_up({}, before_llm=lambda: order.append("speech model ready") or True)
+    assert order == ["tts", "speech model ready", "llm"]
+
+    order.clear()
+    vc.warm_up({}, before_llm=lambda: False)  # engine stopped meanwhile
+    assert order == ["tts"]
+
+
+def test_engine_waits_for_its_speech_model():
+    app = DictationApp({**DEFAULT_CONFIG})
+    app._model_ready.set()
+    assert app._wait_speech_model()
+    app._model_ready.clear()
+    app._stopping.set()
+    assert not app._wait_speech_model()
+
+
+def test_each_spoken_sentence_is_logged(server):
+    logs = []
+    chat, _ = _chat(server, FakeLLM(["A capital é Canberra. Fica no sul do país."]))
+    chat.log = logs.append
+    chat.respond("capital da austrália")
+    assert [m for m in logs if m.startswith("Voice chat: reply ")] == [
+        "Voice chat: reply 'A capital é Canberra.'",
+        "Voice chat: reply 'Fica no sul do país.'"]

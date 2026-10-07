@@ -676,9 +676,16 @@ def _priority_config(device="NPU"):
             "device_priority": ["CUDA", "NPU", "GPU", "CPU"]}
 
 
+def _lose_npu(engine_device="NPU"):
+    """An NPU DEVICE_LOST on the engine's real error path."""
+    app = _engine({"device": engine_device})
+    return app._error_payload(RuntimeError(
+        "L0 zeFenceHostSynchronize result: ZE_RESULT_ERROR_DEVICE_LOST"))
+
+
 def test_npu_loss_is_remembered_until_windows_restarts(monkeypatch):
     monkeypatch.setattr(de, "_boot_time", lambda: 1000.0)
-    de.record_device_failure("NPU", RuntimeError("[NPU] ZE_RESULT_ERROR_DEVICE_LOST"))
+    assert _lose_npu()["device_failure"] == "NPU"
     assert de.npu_lost_this_boot()["boot"] == 1000.0
 
     monkeypatch.setattr(de, "_boot_time", lambda: 5000.0)  # rebooted
@@ -687,15 +694,15 @@ def test_npu_loss_is_remembered_until_windows_restarts(monkeypatch):
 
 
 def test_gpu_loss_is_not_remembered():
-    de.record_device_failure("GPU", RuntimeError(CL_ERROR))
+    app = _engine({"device": "GPU"})
+    assert app._error_payload(RuntimeError(CL_ERROR))["device_failure"] == "GPU"
     assert not de.NPU_LOST_FILE.exists()
 
 
 def test_next_run_skips_a_lost_npu(monkeypatch):
     monkeypatch.setattr(de, "_boot_time", lambda: 1000.0)
     monkeypatch.setattr(de, "detect_devices", lambda: {"NPU", "GPU", "CPU"})
-    de.record_device_failure("NPU", RuntimeError("[NPU] ZE_RESULT_ERROR_DEVICE_LOST"))
-    de._reset_device_failure_for_tests()  # a new process
+    _lose_npu()
 
     config = _priority_config()
     de.avoid_lost_npu(config)

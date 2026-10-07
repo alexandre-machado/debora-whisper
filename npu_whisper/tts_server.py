@@ -169,12 +169,12 @@ def make_handler(model, default_language: str):
                         wav = model.generate(text, language_id=language)
                 except Exception as e:
                     # Chatterbox fails on text too short to speak ("OK").
-                    log(f"Failed after {time.time() - start:.1f}s on {text[:60]!r}: "
+                    log(f"Failed after {time.time() - start:.1f}s on {text[:300]!r}: "
                         f"{type(e).__name__}: {e}")
                     return self._error(500, f"generation failed: {e}")
             samples = wav.squeeze(0).float().cpu().numpy()
             log(f"{len(samples) / model.sr:.1f}s of audio in {time.time() - start:.1f}s: "
-                f"{text[:60]!r}")
+                f"{text[:300]!r}")
             self._reply(200, to_wav(samples, model.sr), "audio/wav")
 
         def log_message(self, fmt, *args):
