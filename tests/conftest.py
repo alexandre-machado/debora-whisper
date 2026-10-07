@@ -8,6 +8,26 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _private_logs(tmp_path_factory):
+    """Tests log to a temporary folder, never to the user's app.log, and
+    never record a lost NPU for the real app. Not restored afterwards: daemon
+    threads of finished tests may still log."""
+    from npu_whisper import dictation_engine as engine
+    home = tmp_path_factory.mktemp("npu-dictation")
+    engine.LOG_DIR = home / "logs"
+    engine.LOG_FILE = engine.LOG_DIR / "app.log"
+    engine.TELEMETRY_LOG = engine.LOG_DIR / "telemetry.log"
+    engine.TTS_SERVER_LOG = engine.LOG_DIR / "tts_server.log"
+    engine.NPU_LOST_FILE = home / "npu_lost.json"
+
+
+@pytest.fixture(autouse=True)
+def _no_npu_loss_record():
+    from npu_whisper import dictation_engine as engine
+    engine.NPU_LOST_FILE.unlink(missing_ok=True)
+
+
 @pytest.fixture(autouse=True)
 def _reset_device_failure_latch():
     """The fatal device latch is process-wide; isolate it per test."""

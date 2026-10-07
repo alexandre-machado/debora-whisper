@@ -15,7 +15,7 @@ from npu_whisper.dictation_engine import (
     AppState, DictationApp, MODEL_REGISTRY,
     load_config, save_config, validate_config, log, create_model,
     is_model_downloaded, device_failure,
-    apply_device_priority, detect_devices, select_device,
+    apply_device_priority, avoid_lost_npu, detect_devices, rotate_logs, select_device,
 )
 from npu_whisper.ui.tray import TrayManager
 from npu_whisper.ui.overlay import OverlayWindow
@@ -561,8 +561,10 @@ def main():
         config["voice_chat"] = True
 
     validate_config(config)
+    rotate_logs()
     if not args.device:
         apply_device_priority(config)
+    avoid_lost_npu(config)
 
     app = GUIApp(config)
     app.run()

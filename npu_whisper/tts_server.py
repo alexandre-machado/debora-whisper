@@ -31,19 +31,46 @@ from "tts_voice" in config.json, and stops it on exit.
 Endpoints (127.0.0.1 only):
     GET  /health -> {"ok": true, "sample_rate": ...}
     POST /tts    {"text": "...", "language": "pt"} -> audio/wav (16-bit mono)
+
+Log lines look like app.log's: "[YYYY-MM-DD HH:MM:SS] message".
 """
 import argparse
 import io
 import json
+import logging
+import os
 import sys
 import threading
 import time
 import types
+import warnings
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_TEXT_CHARS = 1000
 MAX_BODY_BYTES = 64_000
+
+log = logging.getLogger("tts_server").info
+
+
+def setup_logging():
+    """app.log's line format, without the libraries' noise: deprecation
+    warnings, the HF token hint, per-sentence progress bars and Chatterbox's
+    "forcing EOS token" notes."""
+    # Libraries' INFO lines (each HTTP request to the hub, frame rates) stay
+    # out; their warnings and errors stay in.
+    logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+                        level=logging.WARNING, stream=sys.stdout, force=True)
+    logging.getLogger("tts_server").setLevel(logging.INFO)
+    for name in ("huggingface_hub", "transformers", "diffusers", "chatterbox"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+    os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings("ignore", category=UserWarning)
+    logging.captureWarnings(True)
+    os.environ.setdefault("TQDM_DISABLE", "1")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 
 # Smart App Control blocks one of scikit-learn's DLLs, and nothing here calls
@@ -76,14 +103,14 @@ def load_model(device: str, voice: str | None):
     import torch._dynamo  # noqa: F401
     from chatterbox.mtl_tts import ChatterboxMultilingualTTS
     if device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available; using the CPU (much slower).")
+        log("CUDA not available; using the CPU (much slower).")
         device = "cpu"
     start = time.time()
     model = ChatterboxMultilingualTTS.from_pretrained(device=device)
     _stub_sklearn()
     if voice:
         model.prepare_conditionals(voice)
-    print(f"Chatterbox loaded on {device} in {time.time() - start:.1f}s")
+    log(f"Chatterbox loaded on {device} in {time.time() - start:.1f}s")
     return model
 
 
@@ -141,10 +168,13 @@ def make_handler(model, default_language: str):
                     with torch.inference_mode():
                         wav = model.generate(text, language_id=language)
                 except Exception as e:
+                    # Chatterbox fails on text too short to speak ("OK").
+                    log(f"Failed after {time.time() - start:.1f}s on {text[:60]!r}: "
+                        f"{type(e).__name__}: {e}")
                     return self._error(500, f"generation failed: {e}")
             samples = wav.squeeze(0).float().cpu().numpy()
-            print(f"{len(samples) / model.sr:.1f}s of audio in {time.time() - start:.1f}s: "
-                  f"{text[:60]!r}")
+            log(f"{len(samples) / model.sr:.1f}s of audio in {time.time() - start:.1f}s: "
+                f"{text[:60]!r}")
             self._reply(200, to_wav(samples, model.sr), "audio/wav")
 
         def log_message(self, fmt, *args):
@@ -160,13 +190,16 @@ def main():
     parser.add_argument("--language", default="pt", help="Default language id")
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     args = parser.parse_args()
+    setup_logging()
+    log(f"Starting (pid {os.getpid()}, voice {args.voice or 'default'}, "
+        f"language {args.language})")
     model = load_model(args.device, args.voice)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(model, args.language))
-    print(f"TTS server on http://127.0.0.1:{args.port}")
+    log(f"Listening on http://127.0.0.1:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        log("Stopped.")
 
 
 if __name__ == "__main__":

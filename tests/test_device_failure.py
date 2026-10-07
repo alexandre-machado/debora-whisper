@@ -665,3 +665,62 @@ def test_parakeet_inference_failure_is_attributed_to_gpu_decoder():
     with pytest.raises(de.DeviceFailureError) as info:
         parakeet.transcribe(np.zeros(16000, np.float32))
     assert info.value.device == "GPU"
+
+
+# -- A lost NPU across runs ----------------------------------------------------
+# Loading on an NPU lost in an earlier run hung inside the driver while holding
+# the GIL, which froze the next run (console and Ctrl+C included) until a reboot.
+
+def _priority_config(device="NPU"):
+    return {**DEFAULT_CONFIG, "device": device, "model_size": "turbo",
+            "device_priority": ["CUDA", "NPU", "GPU", "CPU"]}
+
+
+def test_npu_loss_is_remembered_until_windows_restarts(monkeypatch):
+    monkeypatch.setattr(de, "_boot_time", lambda: 1000.0)
+    de.record_device_failure("NPU", RuntimeError("[NPU] ZE_RESULT_ERROR_DEVICE_LOST"))
+    assert de.npu_lost_this_boot()["boot"] == 1000.0
+
+    monkeypatch.setattr(de, "_boot_time", lambda: 5000.0)  # rebooted
+    assert de.npu_lost_this_boot() is None
+    assert not de.NPU_LOST_FILE.exists()
+
+
+def test_gpu_loss_is_not_remembered():
+    de.record_device_failure("GPU", RuntimeError(CL_ERROR))
+    assert not de.NPU_LOST_FILE.exists()
+
+
+def test_next_run_skips_a_lost_npu(monkeypatch):
+    monkeypatch.setattr(de, "_boot_time", lambda: 1000.0)
+    monkeypatch.setattr(de, "detect_devices", lambda: {"NPU", "GPU", "CPU"})
+    de.record_device_failure("NPU", RuntimeError("[NPU] ZE_RESULT_ERROR_DEVICE_LOST"))
+    de._reset_device_failure_for_tests()  # a new process
+
+    config = _priority_config()
+    de.avoid_lost_npu(config)
+    assert config["device"] == "GPU"
+
+
+def test_healthy_npu_is_kept(monkeypatch):
+    monkeypatch.setattr(de, "_boot_time", lambda: 1000.0)
+    config = _priority_config()
+    de.avoid_lost_npu(config)
+    assert config["device"] == "NPU"
+
+
+def test_large_logs_are_rotated(tmp_path, monkeypatch):
+    # Its own folder: threads of other tests may still write the shared one.
+    for name in ("LOG_FILE", "TELEMETRY_LOG", "TTS_SERVER_LOG"):
+        monkeypatch.setattr(de, name, tmp_path / getattr(de, name).name)
+    de.LOG_FILE.write_bytes(b"x" * (de.LOG_MAX_BYTES + 1))
+    de.TELEMETRY_LOG.write_bytes(b"small")
+    de.rotate_logs()
+    assert not de.LOG_FILE.exists()
+    assert (tmp_path / "app.log.1").stat().st_size == de.LOG_MAX_BYTES + 1
+    assert de.TELEMETRY_LOG.read_bytes() == b"small"
+
+
+def test_tests_never_write_the_real_app_log():
+    from npu_whisper import paths
+    assert paths.LOG_DIR not in de.LOG_FILE.parents

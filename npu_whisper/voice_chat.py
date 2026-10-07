@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 import wave
@@ -41,6 +42,9 @@ TTS_MAX_RESPONSE_BYTES = 50_000_000
 # (Chatterbox loads in ~15 s; uv builds its environment on the very first run).
 TTS_STARTUP_SECONDS = 180
 TTS_SERVER_SCRIPT = Path(__file__).with_name("tts_server.py")
+# Shorter sentences wait for the next one: "Opa!" alone sounds clipped, and
+# Chatterbox cannot speak a bare "OK" at all.
+TTS_MIN_CHARS = 16
 
 # A sentence ends at . ! ? … (or a line break) followed by whitespace.
 _SENTENCE_END = re.compile(r"(?<=[.!?…])\s+|\n+")
@@ -153,6 +157,11 @@ def generate_reply(messages: list[dict], config: dict, on_text, stop: threading.
 # ---------------------------------------------------------------------------
 # TTS server
 # ---------------------------------------------------------------------------
+class TTSRejected(Exception):
+    """The TTS server answered but could not speak this text (Chatterbox
+    fails on very short text such as "OK"): skip it, keep the voice on."""
+
+
 def synthesize(text: str, config: dict):
     """(float32 samples, sample rate) for text from config["tts_url"]."""
     import numpy as np
@@ -165,8 +174,15 @@ def synthesize(text: str, config: dict):
     request = urllib.request.Request(
         url.rstrip("/") + "/tts", data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"})
-    with _opener().open(request, timeout=config["tts_timeout_seconds"]) as response:
-        raw = response.read(TTS_MAX_RESPONSE_BYTES + 1)
+    try:
+        with _opener().open(request, timeout=config["tts_timeout_seconds"]) as response:
+            raw = response.read(TTS_MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        try:
+            message = json.loads(e.read(4096))["error"]
+        except Exception:
+            message = e.reason
+        raise TTSRejected(f"HTTP {e.code}: {message}") from None
     if len(raw) > TTS_MAX_RESPONSE_BYTES:
         raise ValueError(f"TTS response larger than {TTS_MAX_RESPONSE_BYTES} bytes")
     with wave.open(io.BytesIO(raw)) as w:
@@ -355,21 +371,30 @@ class VoiceChat:
         # Unbounded: after an interrupt nobody takes clips, and the renderer
         # must still be able to finish.
         clips: queue.Queue = queue.Queue()
-        state = {"reply": "", "llm_error": None, "buffer": ""}
+        # buffer: the sentence being written; short: finished sentences too
+        # short to send alone.
+        state = {"reply": "", "llm_error": None, "buffer": "", "short": "", "tokens": False}
         start = time.time()
 
         def on_text(chunk):
-            if not state["reply"] and not state["buffer"]:
+            if not state["tokens"]:
+                state["tokens"] = True
                 self.log(f"Voice chat: first token after {time.time() - start:.1f}s")
             done, state["buffer"] = split_sentences(state["buffer"] + chunk)
             for sentence in done:
-                sentences.put(sentence)
+                sentence = f"{state['short']} {sentence}".strip()
+                if len(speakable(sentence)) < TTS_MIN_CHARS:
+                    state["short"] = sentence
+                else:
+                    state["short"] = ""
+                    sentences.put(sentence)
 
         def write():
             try:
                 self._llm(messages, on_text, stop)
-                if state["buffer"].strip() and not stop.is_set():
-                    sentences.put(state["buffer"])
+                rest = f"{state['short']} {state['buffer']}".strip()
+                if rest and not stop.is_set():
+                    sentences.put(rest)
             except Exception as e:
                 state["llm_error"] = e
             finally:
@@ -388,6 +413,8 @@ class VoiceChat:
                     state["reply"] = f"{state['reply']} {spoken}".strip()
                     if on_reply:
                         on_reply(state["reply"])
+                    if not any(c.isalnum() for c in spoken):
+                        continue  # an emoji or punctuation: nothing to say
                     audio = None
                     if tts_ok is None:
                         tts_ok = wait_tts_server(self.config)
@@ -396,6 +423,8 @@ class VoiceChat:
                     if tts_ok:
                         try:
                             audio = synthesize(spoken, self.config)
+                        except TTSRejected as e:
+                            self.log(f"Voice chat: TTS skipped {spoken[:40]!r} ({e})")
                         except Exception as e:
                             # Keep showing the text even without a voice.
                             tts_ok = False

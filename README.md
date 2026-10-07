@@ -233,7 +233,8 @@ Changing the model, device, hotkey, chime, sample rate or maximum recording leng
 | Path | Purpose |
 |------|---------|
 | `~/.npu-dictation/config.json` | User configuration |
-| `~/.npu-dictation/logs/` | `app.log`, `telemetry.log`, `tts_server.log` |
+| `~/.npu-dictation/logs/` | `app.log`, `telemetry.log`, `tts_server.log`, all with `[YYYY-MM-DD HH:MM:SS] message` lines; at startup a log over 5 MB moves to `<name>.1` |
+| `~/.npu-dictation/npu_lost.json` | An NPU lost to DEVICE_LOST; until Windows restarts, startup skips the NPU (delete it to try anyway) |
 | `~/.npu-dictation/models/` | Downloaded model files |
 | `~/.npu-dictation/ov-cache/` | OpenVINO compilation cache (do not delete) |
 | `~/.npu-dictation/voices/` | Voices for `tts_voice` by name |
@@ -335,10 +336,10 @@ for the exact commands to produce before/after numbers on real NPU hardware.
 OpenVINO compiles the model graph for your specific NPU on first launch. This takes 1-15 minutes depending on model size and is cached for subsequent runs. For Parakeet specifically, this means 4 sequential encoder-graph compiles (one per shape bucket), not 1 — see the architecture notes above and `benchmarks/README.md` for details — so first launch takes proportionally longer than a single-graph model.
 
 ### DEVICE_LOST error
-When the error is attributed to one device, the GUI falls back to the next healthy device in `device_priority`. After an NPU loss it probes the NPU in the background and moves back if it recovers; otherwise reboot to reset the NPU.
+When the error is attributed to one device, the GUI falls back to the next healthy device in `device_priority`. After an NPU loss it probes the NPU in the background and moves back if it recovers; otherwise reboot to reset the NPU. Until the reboot, later runs start on the next device instead: loading a model on a lost NPU can hang inside the driver and freeze the whole app, Ctrl+C included.
 
 ### GPU failed: restart required
-OpenVINO GPU errors such as `CL_OUT_OF_RESOURCES`, or a device loss that cannot be pinned on the NPU (Parakeet runs its decoder on the GPU, and a loss during its GPU fallback compile is blamed on the GPU even if the NPU failed first), can leave the OpenCL context in a state where further calls hang. The app does not retry or reload after that, on the GPU or on any other device. Recording and transcription stay disabled, and Settings changes are saved but not applied (the tray menu marks them "after restart"), until you quit and restart the app. The original OpenVINO error is written to `~/.npu-dictation/dictation.log`. If the failure repeats, select NPU or CPU in Settings, then restart. Disabling the retry only prevents a hang; it does not fix the driver or memory problem behind the error.
+OpenVINO GPU errors such as `CL_OUT_OF_RESOURCES`, or a device loss that cannot be pinned on the NPU (Parakeet runs its decoder on the GPU, and a loss during its GPU fallback compile is blamed on the GPU even if the NPU failed first), can leave the OpenCL context in a state where further calls hang. The app does not retry or reload after that, on the GPU or on any other device. Recording and transcription stay disabled, and Settings changes are saved but not applied (the tray menu marks them "after restart"), until you quit and restart the app. The original OpenVINO error is written to `~/.npu-dictation/logs/app.log`. If the failure repeats, select NPU or CPU in Settings, then restart. Disabling the retry only prevents a hang; it does not fix the driver or memory problem behind the error.
 
 ### Hotkey doesn't work
 - PowerShell must run as **Administrator** (the `keyboard` library requires elevated privileges)

@@ -29,6 +29,10 @@ os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 LOG_FILE = LOG_DIR / "app.log"
 TELEMETRY_LOG = LOG_DIR / "telemetry.log"
 TTS_SERVER_LOG = LOG_DIR / "tts_server.log"
+# At startup a larger log moves to <name>.1, replacing the previous one.
+LOG_MAX_BYTES = 5_000_000
+# An NPU lost to DEVICE_LOST, kept until Windows restarts (see npu_lost_this_boot).
+NPU_LOST_FILE = CONFIG_DIR / "npu_lost.json"
 
 DEFAULT_CONFIG = {
     "device": "NPU",           # Active device; chosen from device_priority at startup
@@ -220,6 +224,16 @@ def log(msg: str):
             f.write(line + "\n")
     except Exception:
         pass
+
+
+def rotate_logs():
+    """Keep each log under LOG_MAX_BYTES plus one older file."""
+    for path in (LOG_FILE, TELEMETRY_LOG, TTS_SERVER_LOG):
+        try:
+            if path.stat().st_size > LOG_MAX_BYTES:
+                os.replace(path, path.with_name(path.name + ".1"))
+        except OSError:
+            pass  # missing, or open in another process
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +566,60 @@ def record_device_failure(device: str, exc: BaseException) -> dict:
                 "message": restart_required_message(device, detail),
                 "exception": exc,
             }
+            if device == "NPU":
+                _remember_npu_loss(detail)
         return dict(_device_failure)
+
+
+def _boot_time() -> float | None:
+    """When Windows last started (seconds since the epoch), or None."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_uint64
+    return time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000
+
+
+def _remember_npu_loss(detail: str):
+    try:
+        NPU_LOST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        NPU_LOST_FILE.write_text(json.dumps(
+            {"time": time.time(), "boot": _boot_time(), "detail": detail}), encoding="utf-8")
+    except Exception as e:
+        log(f"Cannot record the NPU failure in {NPU_LOST_FILE}: {e}")
+
+
+def npu_lost_this_boot() -> dict | None:
+    """The NPU failure recorded since Windows last started, or None.
+
+    A lost NPU stays lost until a reboot: in the next run, loading a model
+    on it hung inside the driver while holding the GIL, which froze the whole
+    app, console and Ctrl+C included."""
+    try:
+        record = json.loads(NPU_LOST_FILE.read_text(encoding="utf-8"))
+        boot = _boot_time()
+        if boot is not None and record.get("boot") is not None \
+                and abs(record["boot"] - boot) < 120:
+            return record
+    except (OSError, ValueError, AttributeError):
+        return None
+    try:
+        NPU_LOST_FILE.unlink()  # from before the last reboot
+    except OSError:
+        pass
+    return None
+
+
+def avoid_lost_npu(config: dict):
+    """Move config["device"] off an NPU lost earlier in this boot."""
+    if config["device"] != "NPU" or not (lost := npu_lost_this_boot()):
+        return
+    when = datetime.fromtimestamp(lost["time"]).strftime("%H:%M")
+    chosen = select_device(config, detect_devices(), exclude={"NPU"}) or "CPU"
+    log(f"The NPU failed at {when} ({lost.get('detail')}) and stays unusable until "
+        f"Windows restarts; using {chosen} instead. To try the NPU anyway, delete "
+        f"{NPU_LOST_FILE}.")
+    config["device"] = chosen
 
 
 def device_failure() -> dict | None:
@@ -3258,8 +3325,10 @@ def main():
         config["voice_chat"] = True
 
     validate_config(config)
+    rotate_logs()
     if not args.device:
         apply_device_priority(config)
+    avoid_lost_npu(config)
 
     app = DictationApp(config)
     app.run()
