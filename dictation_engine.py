@@ -112,11 +112,17 @@ MODEL_REGISTRY = {
     },
     "turbo": {
         "repo": "openai/whisper-large-v3-turbo",
-        "ov_repo": "FluidInference/whisper-large-v3-turbo-int4-ov-npu",
+        # The FluidInference int4 NPU export hung the NPU (DEVICE_LOST)
+        # within a few dozen real-speech inferences, even outside the app,
+        # and OpenVINO 2026 refuses to load it (no beam_idx input). The
+        # official int8 export ran 80/80 on NPU on both 2025.4 and 2026.4.
+        # New local_dir so existing installs download it instead of reusing
+        # the int4 files.
+        "ov_repo": "OpenVINO/whisper-large-v3-turbo-int8-ov",
         "description": "809M params, 2.3% WER. Best multilingual quality.",
         "preferred_device": "GPU",
         "backend": "whisper",
-        "local_dir": "whisper-turbo-openvino",
+        "local_dir": "whisper-turbo-int8-openvino",
         "languages": "all",
     },
     "parakeet": {
