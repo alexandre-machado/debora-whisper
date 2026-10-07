@@ -174,7 +174,7 @@ class GUIApp:
             self._settings_status("Model ready.", "#30D158")
             self._settings_set_apply(True)
             
-            if self._engine.config.get("continuous_listening", False):
+            if getattr(self._engine, "continuous_active", False):
                 # Transition back to recording visually
                 self._root.after(1500, lambda: self._update_ui(AppState.RECORDING, {}) if getattr(self._engine, "is_recording", False) else None)
 

@@ -64,7 +64,16 @@ cd npu-whisper
 .\Start-Dictation.ps1
 ```
 
-Press **Ctrl+Space** to start recording, press again to stop. Transcribed text is pasted at your cursor.
+**Ctrl+Space** works two ways:
+
+- **Hold** it while you speak (push-to-talk): recording stops when you let go
+  and the whole utterance is transcribed and pasted at your cursor.
+- **Tap** it to start continuous listening: voice activity detection types each
+  sentence as you finish it (a rising two-note chime confirms). Tap again to
+  stop; a sentence in progress is still typed.
+
+Set `"tap_action": "toggle"` to make a tap start a recording that the next tap
+stops instead.
 
 ## Models
 
@@ -106,7 +115,7 @@ Launches with a Dynamic Island overlay at the top of your screen and a system tr
 .\Start-Dictation.ps1 -CLI
 ```
 
-Console-only, no GUI. Press Ctrl+Space to toggle recording.
+Console-only, no GUI. Same hotkey gestures as the GUI.
 
 ### Claude Code Mode
 
@@ -132,6 +141,7 @@ Stored at `~/.npu-dictation/config.json`:
   "model_size": "base",
   "language": "en",
   "hotkey": "ctrl+space",
+  "tap_action": "continuous",
   "auto_enter": false,
   "beep_on_start": true,
   "max_record_seconds": 60,
@@ -145,6 +155,11 @@ RTX via faster-whisper, Whisper models only; `GPU` = Intel iGPU). When the
 active device is lost, it falls back to the next healthy one. `-Device` on the
 command line overrides the list for that run. `device` is written by the app
 and records the device last chosen.
+
+`tap_action` is what a short hotkey press does: `continuous` (default) starts
+continuous listening, `toggle` starts a recording that the next press stops.
+Holding the hotkey is always push-to-talk. `--continuous` starts the app
+already listening continuously.
 
 Or change settings from the GUI: right-click the system tray icon and select **Settings**.
 

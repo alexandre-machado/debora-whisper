@@ -110,7 +110,8 @@ class TestStateTransitions:
         assert states[-1] == AppState.ERROR
 
     def test_recording_state_transitions(self):
-        config = {**DEFAULT_CONFIG, "beep_on_start": False}
+        # A tap that starts a recording the next tap stops.
+        config = {**DEFAULT_CONFIG, "beep_on_start": False, "tap_action": "toggle"}
         app = DictationApp(config)
         app.whisper = MagicMock()
         app.whisper.transcribe = MagicMock(return_value="hello world")
