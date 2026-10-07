@@ -46,7 +46,19 @@ npu-whisper               # tray app + overlay
 npu-whisper-cli           # console-only mode
 ```
 
-Update with `uv tool upgrade npu-whisper`, remove with `uv tool uninstall npu-whisper`
+To launch it from the Start Menu (no console window), optionally also at sign-in:
+
+```powershell
+npu-whisper --install-shortcut              # Start Menu entry "NPU Whisper"
+npu-whisper --install-shortcut --autostart  # ...and start with Windows
+```
+
+Only one tray app runs at a time; launching a second one exits quietly. The
+shortcut points at the Python of the current install: after reinstalling
+(`uv tool install --reinstall`, a new Python), run `--install-shortcut` again.
+
+Update with `uv tool upgrade npu-whisper`. To remove, run
+`npu-whisper --remove-shortcut` first, then `uv tool uninstall npu-whisper`
 (models and config stay in `~/.npu-dictation/`). Once published to PyPI, the
 same works with `uv tool install npu-whisper` or a one-off `uvx npu-whisper`.
 
