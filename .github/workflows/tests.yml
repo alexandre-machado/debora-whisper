@@ -91,5 +91,6 @@ jobs:
         run: |
           npu-whisper-cli --help
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          npu-whisper --help
+          # pystray connects to X at import time; Linux runners have no display.
+          if ($IsLinux) { xvfb-run -a npu-whisper --help } else { npu-whisper --help }
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
