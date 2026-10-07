@@ -171,7 +171,9 @@ and records the device last chosen.
 `tap_action` is what a short hotkey press does: `continuous` (default) starts
 continuous listening, `toggle` starts a recording that the next press stops.
 Holding the hotkey is always push-to-talk. `--continuous` starts the app
-already listening continuously.
+already listening continuously. A session started by a tap stops by itself
+after `continuous_idle_stop_seconds` (default 120) without speech; `null`
+keeps it on until the next tap.
 
 Or change settings from the GUI: right-click the system tray icon and select **Settings**.
 
