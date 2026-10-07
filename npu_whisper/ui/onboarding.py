@@ -31,11 +31,11 @@ class OnboardingWindow:
         self._win.protocol("WM_DELETE_WINDOW", lambda: None)  # Prevent closing
 
         self._win.update_idletasks()
-        from ui.glass import apply_acrylic
+        from npu_whisper.ui.glass import apply_acrylic
         apply_acrylic(self._win)
 
         # Set title bar icon — prevent CTkToplevel from overriding at 200ms
-        from ui.icons import render_app_icon
+        from npu_whisper.ui.icons import render_app_icon
         from PIL import ImageTk
         self._icon_photo = ImageTk.PhotoImage(render_app_icon(32))
         self._win._iconbitmap_method_called = True
@@ -84,7 +84,7 @@ class OnboardingWindow:
 
     def _run_setup(self):
         """Run model download + cache warmup in background thread."""
-        from dictation_engine import setup_model, create_model, MODEL_REGISTRY, log
+        from npu_whisper.dictation_engine import setup_model, create_model, MODEL_REGISTRY, log
         import numpy as np
 
         # Phase 1: Download

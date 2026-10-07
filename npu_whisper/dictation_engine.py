@@ -2,7 +2,7 @@
 NPU Dictation Engine - Local voice-to-text using OpenVINO on Intel NPU
 Supports Whisper (via openvino_genai) and Parakeet TDT (via OpenVINO + onnxruntime).
 
-Usage: python dictation_engine.py [--setup] [--device NPU|GPU|CPU] [--model base|small|medium|parakeet]
+Usage: npu-whisper-cli [--setup] [--device NPU|GPU|CPU] [--model base|small|medium|parakeet]
 """
 
 import sys
@@ -392,9 +392,16 @@ VALID_DEVICES = ("CUDA", "NPU", "GPU", "CPU")
 
 def detect_devices() -> set:
     """Devices this machine can run inference on. CPU is always present."""
+    import importlib.util
     found = {"CPU"}
     if has_nvidia_gpu():
-        found.add("CUDA")
+        # faster-whisper ships in the optional [cuda] extra; without it CUDA
+        # would be picked first and then fail to load instead of falling back.
+        if importlib.util.find_spec("faster_whisper") is not None:
+            found.add("CUDA")
+        else:
+            log("NVIDIA GPU found but faster-whisper is not installed; "
+                "install the [cuda] extra to use it")
     try:
         import openvino as ov
         # "GPU.0"/"GPU.1" on multi-GPU machines; the app addresses "GPU".
@@ -851,7 +858,7 @@ class ParakeetNPU:
                 f"Parakeet vocab.txt at {vocab_path} produced zero valid entries "
                 f"(expected '<token> <index>' pairs per line, e.g. '▁the 42'). "
                 f"The file is empty, truncated, or in an unexpected format. "
-                f"Re-run setup: python dictation_engine.py --model parakeet --setup"
+                f"Re-run setup: npu-whisper-cli --model parakeet --setup"
             )
 
         # Derive BLANK_IDX / VOCAB_SIZE from the loaded vocab instead of
@@ -894,7 +901,7 @@ class ParakeetNPU:
             raise RuntimeError(
                 f"Could not determine decoder_joint-model.onnx's output width to "
                 f"validate the vocab.txt-derived VOCAB_SIZE ({self.VOCAB_SIZE}): {e}. "
-                f"Re-run setup: python dictation_engine.py --model parakeet --setup"
+                f"Re-run setup: npu-whisper-cli --model parakeet --setup"
             ) from e
 
         # At least one duration logit must remain after the vocab+blank
@@ -908,7 +915,7 @@ class ParakeetNPU:
                 f"means vocab.txt is truncated, stale, or paired with a decoder "
                 f"model from a different export. Refusing to start transcription "
                 f"with mismatched constants. Re-run setup: "
-                f"python dictation_engine.py --model parakeet --setup"
+                f"npu-whisper-cli --model parakeet --setup"
             )
         log(
             f"  Vocab constants validated against decoder output width "
@@ -929,7 +936,7 @@ class ParakeetNPU:
         if not preproc_path.exists():
             raise FileNotFoundError(
                 f"nemo128.onnx not found at {preproc_path}. "
-                f"Re-run setup: python dictation_engine.py --model parakeet --setup"
+                f"Re-run setup: npu-whisper-cli --model parakeet --setup"
             )
         try:
             import onnxruntime as ort
@@ -2891,33 +2898,19 @@ class DictationApp:
 # Setup / Install dependencies
 # ---------------------------------------------------------------------------
 def run_setup():
-    """Interactive setup: install dependencies and export model."""
-    import subprocess
+    """Interactive setup: detect devices and download the model.
 
+    Dependencies come from the installer (pip/uv or Start-Dictation.ps1),
+    never from here: an installed or frozen app has no requirements.txt.
+    """
     log("=" * 60)
     log("NPU Dictation Engine - Setup")
     log("=" * 60)
 
     # 1. Check Python version
     log(f"Python: {sys.version}")
-    
-    # 2. Install pip dependencies
-    requirements_file = Path(__file__).parent / "requirements.txt"
-    if requirements_file.exists():
-        log("\nInstalling dependencies from requirements.txt...")
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", str(requirements_file), "--quiet"],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            log(f"  WARNING: pip install failed: {result.stderr[:500]}")
-        else:
-            log("  Dependencies installed successfully.")
-    else:
-        log(f"\nWARNING: requirements.txt not found at {requirements_file}")
-        log("  Install manually: pip install -r requirements.txt")
 
-    # 3. Check NPU availability
+    # 2. Check NPU availability
     log("\nChecking available devices...")
     try:
         import openvino as ov
@@ -2940,13 +2933,13 @@ def run_setup():
     if has_nvidia_gpu():
         log("  [OK] CUDA detected (NVIDIA GPU)")
 
-    # 4. Create default config
+    # 3. Create default config
     config = load_config()
     config["device"] = select_device(config, detect_devices()) or "CPU"
 
     save_config(config)
 
-    # 5. Download model
+    # 4. Download model
     log(f"\nDownloading {config['model_size']} model for {config['device']}...")
     model_path = None
     try:
@@ -2954,9 +2947,9 @@ def run_setup():
         log(f"Model ready at: {model_path}")
     except Exception as e:
         log(f"Model download failed: {e}")
-        log("You can retry later with: python dictation_engine.py --setup")
+        log("You can retry later with: npu-whisper-cli --setup")
 
-    # 6. Warm the OpenVINO cache by running a dummy inference
+    # 5. Warm the OpenVINO cache by running a dummy inference
     #    This triggers NPU compilation during setup so the first real use is fast.
     if model_path:
         log(f"\nWarming OpenVINO cache on {config['device']} (first compile may take 5-15 min)...")
@@ -2976,8 +2969,8 @@ def run_setup():
     log("\n" + "=" * 60)
     log("Setup complete!")
     log(f"Config file: {CONFIG_FILE}")
-    log(f"Start dictating: python dictation_engine.py")
-    log(f"Or use the PowerShell launcher: .\\Start-Dictation.ps1")
+    log("Start dictating: npu-whisper (tray app) or npu-whisper-cli")
+    log("From a source checkout: .\\Start-Dictation.ps1")
     log("=" * 60)
 
 
@@ -2985,7 +2978,7 @@ def run_setup():
 # CLI
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="NPU Dictation Engine")
+    parser = argparse.ArgumentParser(prog="npu-whisper-cli", description="NPU Dictation Engine")
     parser.add_argument("--setup", action="store_true", help="Run first-time setup")
     parser.add_argument("--device", choices=["NPU", "GPU", "CPU", "CUDA"], help="Override device")
     parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), help="Model size")

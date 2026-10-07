@@ -4,7 +4,7 @@ import time
 from unittest.mock import MagicMock, patch
 import pytest
 
-from dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
+from npu_whisper.dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
 
 
 class TestTranscriptionThreading:
@@ -30,7 +30,7 @@ class TestTranscriptionThreading:
 
         finished = threading.Event()
         app.add_callback(lambda s, d: finished.set() if s.value == 'ready' else None)
-        with patch('keyboard.is_pressed', return_value=False), patch('dictation_engine.type_text'):
+        with patch('keyboard.is_pressed', return_value=False), patch('npu_whisper.dictation_engine.type_text'):
             start = time.time()
             app.toggle_recording()
             elapsed = time.time() - start
@@ -59,7 +59,7 @@ class TestTranscriptionThreading:
         app.whisper.transcribe.side_effect = transcribe
         states = []
         app.add_callback(lambda state, data: states.append(state))
-        with patch('dictation_engine.type_text') as paste, patch('keyboard.unhook_all'):
+        with patch('npu_whisper.dictation_engine.type_text') as paste, patch('keyboard.unhook_all'):
             worker = threading.Thread(target=app._finish_recording)
             worker.start()
             try:

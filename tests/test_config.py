@@ -1,7 +1,7 @@
 """Tests for config validation."""
 import pytest
 
-from dictation_engine import validate_config, DEFAULT_CONFIG
+from npu_whisper.dictation_engine import validate_config, DEFAULT_CONFIG
 
 
 class TestConfigValidation:

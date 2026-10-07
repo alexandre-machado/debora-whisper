@@ -1,4 +1,4 @@
-# Unit-test dependencies. Keep shared version ranges aligned with requirements.txt.
+# Unit-test dependencies. Keep shared version ranges aligned with pyproject.toml.
 # Inference and audio hardware are mocked: no OpenVINO, torch or model downloads.
 # onnxruntime is imported by patch targets in the Parakeet regression tests.
 pytest>=7.0,<9.0

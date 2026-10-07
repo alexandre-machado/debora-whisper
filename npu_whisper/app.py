@@ -4,24 +4,24 @@ Entry point for tray-icon mode. Wires the engine, system tray, overlay,
 settings dialog, onboarding wizard, and transcription history together.
 
 Usage:
-    python app.py [--device NPU|GPU|CPU] [--model base|small|medium|turbo|parakeet]
+    npu-whisper [--device NPU|GPU|CPU] [--model base|small|medium|turbo|parakeet]
 """
 
 import sys
 import argparse
 import customtkinter as ctk
 
-from dictation_engine import (
+from npu_whisper.dictation_engine import (
     AppState, DictationApp, MODEL_REGISTRY, MODEL_DIR,
     load_config, save_config, validate_config, log, create_model,
     is_model_downloaded, device_failure,
     apply_device_priority, detect_devices, select_device,
 )
-from ui.tray import TrayManager
-from ui.overlay import OverlayWindow
-from ui.settings import SettingsWindow
-from ui.history import HistoryWindow
-from ui.onboarding import OnboardingWindow
+from npu_whisper.ui.tray import TrayManager
+from npu_whisper.ui.overlay import OverlayWindow
+from npu_whisper.ui.settings import SettingsWindow
+from npu_whisper.ui.history import HistoryWindow
+from npu_whisper.ui.onboarding import OnboardingWindow
 
 
 class GUIApp:
@@ -36,7 +36,7 @@ class GUIApp:
         self._root.withdraw()  # No visible root window
 
         # Set app icon on root — inherited by all toplevel windows
-        from ui.icons import render_app_icon
+        from npu_whisper.ui.icons import render_app_icon
         from PIL import ImageTk
         self._icon_photo = ImageTk.PhotoImage(render_app_icon(32))
         self._root.iconphoto(True, self._icon_photo)
@@ -131,7 +131,7 @@ class GUIApp:
     def _on_hardware_event(self):
         """Called by the tray manager when the PC wakes up or a device changes."""
         import threading
-        from dictation_engine import log
+        from npu_whisper.dictation_engine import log
         
         if getattr(self, "_hw_event_timer", None):
             self._hw_event_timer.cancel()
@@ -238,12 +238,12 @@ class GUIApp:
         elif self._npu_retry_count == 1:
             delay = 60000
         else:
-            from dictation_engine import log
+            from npu_whisper.dictation_engine import log
             log("NPU recovery retries exhausted. Staying on fallback device.")
             return
             
         self._npu_retry_count += 1
-        from dictation_engine import log
+        from npu_whisper.dictation_engine import log
         log(f"Scheduling background NPU recovery probe in {delay//1000}s (Attempt {self._npu_retry_count}/2)...")
         
         def _probe_thread():
@@ -255,8 +255,8 @@ class GUIApp:
         threading.Thread(target=_probe_thread, daemon=True).start()
 
     def _run_npu_recovery_probe(self):
-        from dictation_engine import setup_model, create_model, MODEL_REGISTRY
-        from dictation_engine import log
+        from npu_whisper.dictation_engine import setup_model, create_model, MODEL_REGISTRY
+        from npu_whisper.dictation_engine import log
         import numpy as np
         
         if self._engine.config["device"] == "NPU":
@@ -484,7 +484,7 @@ class GUIApp:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NPU Dictation Engine (GUI)")
+    parser = argparse.ArgumentParser(prog="npu-whisper", description="NPU Dictation Engine (GUI)")
     parser.add_argument("--device", choices=["NPU", "GPU", "CPU", "CUDA"], help="Override device")
     parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), help="Model size")
     parser.add_argument("--language", type=str, help="Language code")

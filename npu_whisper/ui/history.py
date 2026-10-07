@@ -27,11 +27,11 @@ class HistoryWindow:
         self._win.attributes("-topmost", True)
 
         self._win.update_idletasks()
-        from ui.glass import apply_acrylic
+        from npu_whisper.ui.glass import apply_acrylic
         apply_acrylic(self._win)
 
         # Set title bar icon — prevent CTkToplevel from overriding at 200ms
-        from ui.icons import render_app_icon
+        from npu_whisper.ui.icons import render_app_icon
         from PIL import ImageTk
         self._icon_photo = ImageTk.PhotoImage(render_app_icon(32))
         self._win._iconbitmap_method_called = True

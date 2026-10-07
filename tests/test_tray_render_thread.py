@@ -16,11 +16,11 @@ def _tray_class():
         import pystray  # noqa: F401
     except ImportError:
         with patch.dict(sys.modules, {"pystray": MagicMock()}):
-            sys.modules.pop("ui.tray", None)
-            from ui.tray import TrayManager
-        sys.modules.pop("ui.tray", None)
+            sys.modules.pop("npu_whisper.ui.tray", None)
+            from npu_whisper.ui.tray import TrayManager
+        sys.modules.pop("npu_whisper.ui.tray", None)
         return TrayManager
-    from ui.tray import TrayManager
+    from npu_whisper.ui.tray import TrayManager
     return TrayManager
 
 

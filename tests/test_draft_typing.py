@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-import dictation_engine as de
-from dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
+from npu_whisper import dictation_engine as de
+from npu_whisper.dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
 
 AUDIO = np.zeros(16000, dtype=np.float32)
 

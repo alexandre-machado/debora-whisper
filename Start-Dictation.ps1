@@ -41,9 +41,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$EnginePath = Join-Path $ScriptDir "dictation_engine.py"
-$AppPath = Join-Path $ScriptDir "app.py"
-$RequirementsPath = Join-Path $ScriptDir "requirements.txt"
+$PyProjectPath = Join-Path $ScriptDir "pyproject.toml"
+# `python -m npu_whisper` must resolve to this checkout even from another cwd,
+# a venv created before the package layout, or the system-Python fallback.
+$env:PYTHONPATH = if ($env:PYTHONPATH) { "$ScriptDir;$env:PYTHONPATH" } else { $ScriptDir }
 $VenvDir = Join-Path (Join-Path $env:USERPROFILE ".npu-dictation") "venv"
 
 # ---------------------------------------------------------------------------
@@ -156,9 +157,9 @@ function Invoke-Setup {
 
     # 3. Install project dependencies
     Write-Host ""
-    Write-Host "Step 3: Installing Python dependencies..." -ForegroundColor Yellow
-    if (-not (Test-Path $RequirementsPath)) {
-        Write-Host "  ERROR: requirements.txt not found at $RequirementsPath" -ForegroundColor Red
+    Write-Host "Step 3: Installing npu-whisper and its dependencies..." -ForegroundColor Yellow
+    if (-not (Test-Path $PyProjectPath)) {
+        Write-Host "  ERROR: pyproject.toml not found at $PyProjectPath" -ForegroundColor Red
         exit 1
     }
     & $venvPython -m pip install --upgrade pip
@@ -166,7 +167,9 @@ function Invoke-Setup {
         Write-Host "  ERROR: Failed to upgrade pip." -ForegroundColor Red
         exit 1
     }
-    & $venvPython -m pip install -r $RequirementsPath
+    # Editable install from this checkout, with the RTX (CUDA) and model
+    # export extras, so the launcher always runs the code next to it.
+    & $venvPython -m pip install -e "${ScriptDir}[cuda,export]"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  ERROR: Failed to install Python dependencies." -ForegroundColor Red
         exit 1
@@ -184,7 +187,7 @@ function Invoke-Setup {
     Write-Host "  This will take several minutes on first run." -ForegroundColor Yellow
     Write-Host ""
     
-    & $venvPython $EnginePath --setup
+    & $venvPython -m npu_whisper.dictation_engine --setup
 
     Write-Host ""
     Write-Host "Setup complete! Start dictating with:" -ForegroundColor Green
@@ -212,13 +215,6 @@ function Start-Dictation {
     if ($Hotkey)    { $engineArgs += "--hotkey", $Hotkey }
     if ($Continuous){ $engineArgs += "--continuous" }
 
-    # Check if engine file exists
-    if (-not (Test-Path $EnginePath)) {
-        Write-Host "ERROR: dictation_engine.py not found at $EnginePath" -ForegroundColor Red
-        Write-Host "Make sure both files are in the same directory." -ForegroundColor Yellow
-        exit 1
-    }
-
     # Check if model is set up
     $configFile = Join-Path (Join-Path $env:USERPROFILE ".npu-dictation") "config.json"
     if (-not (Test-Path $configFile)) {
@@ -238,9 +234,9 @@ function Start-Dictation {
 
     # Launch engine: GUI mode by default, -CLI for console-only mode
     if ($CLI) {
-        & $python $EnginePath @engineArgs
+        & $python -m npu_whisper.dictation_engine @engineArgs
     } else {
-        & $python $AppPath @engineArgs
+        & $python -m npu_whisper @engineArgs
     }
 }
 
