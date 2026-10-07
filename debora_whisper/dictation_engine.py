@@ -533,18 +533,42 @@ VALID_DEVICES = ("CUDA", "NPU", "GPU", "CPU")
 TAP_ACTIONS = ("continuous", "toggle")
 
 
+def import_faster_whisper():
+    """faster_whisper.WhisperModel, or RuntimeError saying why it won't load."""
+    try:
+        import av  # noqa: F401
+    except Exception as e:
+        # faster-whisper imports PyAV at load time but only uses it to decode
+        # audio files; the app passes numpy arrays. Windows Smart App Control
+        # has blocked PyAV's unsigned DLLs ("An Application Control policy
+        # has blocked this file"), which made CUDA unusable.
+        import types
+        log(f"PyAV unavailable ({e}); faster-whisper runs without it.")
+        sys.modules["av"] = types.ModuleType("av")
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as e:
+        raise RuntimeError(f"faster-whisper cannot be loaded: {e}") from e
+    return WhisperModel
+
+
 def detect_devices() -> set:
     """Devices this machine can run inference on. CPU is always present."""
     import importlib.util
     found = {"CPU"}
     if has_nvidia_gpu():
-        # faster-whisper ships in the optional [cuda] extra; without it CUDA
-        # would be picked first and then fail to load instead of falling back.
-        if importlib.util.find_spec("faster_whisper") is not None:
-            found.add("CUDA")
-        else:
+        # faster-whisper ships in the optional [cuda] extra; without it (or
+        # if Windows blocks its DLLs) CUDA would be picked first and then fail
+        # to load instead of falling back.
+        if importlib.util.find_spec("faster_whisper") is None:
             log("NVIDIA GPU found but faster-whisper is not installed; "
                 "install the [cuda] extra to use it")
+        else:
+            try:
+                import_faster_whisper()
+                found.add("CUDA")
+            except RuntimeError as e:
+                log(f"NVIDIA GPU found but {e}; skipping CUDA")
     try:
         import openvino as ov
         # "GPU.0"/"GPU.1" on multi-GPU machines; the app addresses "GPU".
@@ -774,11 +798,8 @@ class FasterWhisperCUDA:
             except Exception as e:
                 log(f"Warning: Failed to inject NVIDIA DLL paths: {e}")
 
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError:
-            raise RuntimeError("faster-whisper is not installed. Please install it to use CUDA backend.")
-            
+        WhisperModel = import_faster_whisper()
+
         log(f"Loading faster-whisper pipeline on CUDA ({self.model_size})...")
         
         # compute_type="int8_float16" gives the best performance/VRAM tradeoff on RTX.
