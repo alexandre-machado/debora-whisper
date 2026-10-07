@@ -175,31 +175,54 @@ already listening continuously. A session started by a tap stops by itself
 after `continuous_idle_stop_seconds` (default 120) without speech; `null`
 keeps it on until the next tap.
 
-### LLM cleanup (LM Studio)
+### Voice chat (OpenVINO LLM + Chatterbox)
 
-With `"llm_cleanup": true` (or `--llm-cleanup`, or **Clean up text with LM
-Studio** in Settings), each final transcription is sent to a local
-OpenAI-compatible server before it is typed. The model fixes punctuation and
-recognition mistakes and drops filler words. Live drafts in continuous
-listening are still typed raw; the cleaned final replaces them.
+With `"voice_chat": true` (or `--voice-chat`, or **Voice chat** in Settings),
+nothing is typed: each final transcription goes to a local LLM, and its reply
+is spoken by a local TTS server and shown in the overlay. The reply streams and
+plays sentence by sentence. The conversation keeps the last 8 turns and starts
+over after 10 minutes of silence. In continuous listening the microphone is
+muted while the reply plays; a hotkey press cuts the reply short.
 
 ```json
 {
-  "llm_cleanup": true,
-  "llm_url": "http://localhost:1234/v1",
-  "llm_model": null,
+  "voice_chat": true,
+  "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
+  "llm_device": "GPU",
   "llm_prompt": null,
-  "llm_timeout_seconds": 30,
-  "llm_reasoning_effort": "low"
+  "tts_voice": null,
+  "tts_url": "http://127.0.0.1:8765",
+  "tts_timeout_seconds": 60,
+  "tts_server_command": null
 }
 ```
 
-Start LM Studio's server with a model loaded. `llm_model: null` uses the loaded
-model; `llm_prompt: null` uses the built-in cleanup prompt. If the server is
-off, errors, or takes longer than `llm_timeout_seconds`, the raw transcription
-is typed. The text waits for the model, so pick a fast one: gpt-oss-20b took
-5-17 s per sentence on an RTX 4070 laptop. `llm_url` receives everything you
-dictate; keep it pointed at a server you trust.
+The LLM runs inside the app with OpenVINO GenAI, the same runtime as Whisper:
+no LLM server to install. `llm_model` is a Hugging Face repo with an OpenVINO
+export (downloaded on first use into the Hugging Face cache) or a local
+directory. On a Core Ultra 9 185H, the default answers in under a second at
+~15 tokens/s on the Arc iGPU (`"llm_device": "GPU"`); if the device fails it
+loads on the CPU. Qwen3's thinking is turned off. `llm_prompt: null` uses the
+built-in voice-assistant prompt.
+
+The TTS is Chatterbox Multilingual on an NVIDIA GPU, served by
+`npu_whisper/tts_server.py`. It needs torch 2.6 with CUDA, so it never runs in
+the app's environment: the script declares its own dependencies and the app
+starts it with `uv run --script` (uv builds that environment on the first run,
+a few GB, and caches it). It is started only when nothing answers at
+`tts_url`, stopped when the app exits, and logs to
+`~/.npu-dictation/logs/tts_server.log`. `tts_server_command` replaces that
+command line (a list of arguments).
+
+`tts_voice` clones a voice from ~10 s of clean speech: a WAV path, or a name
+looked up as `<name>.wav` in the voices folder (see File Paths). `null` uses
+Chatterbox's own voice.
+
+Where each part runs best on a Core Ultra laptop with an 8 GB RTX: Whisper on
+the NPU (`--device NPU`), the LLM on the Arc iGPU, Chatterbox alone on the RTX.
+Whisper on CUDA next to Chatterbox can run out of video memory. If the TTS
+server is down, the reply is only shown. `tts_url` receives everything the
+LLM says; keep it pointed at a server you trust.
 
 Or change settings from the GUI: right-click the system tray icon and select **Settings**.
 
@@ -210,10 +233,15 @@ Changing the model, device, hotkey, chime, sample rate or maximum recording leng
 | Path | Purpose |
 |------|---------|
 | `~/.npu-dictation/config.json` | User configuration |
+| `~/.npu-dictation/logs/` | `app.log`, `telemetry.log`, `tts_server.log` |
 | `~/.npu-dictation/models/` | Downloaded model files |
 | `~/.npu-dictation/ov-cache/` | OpenVINO compilation cache (do not delete) |
-| `~/.npu-dictation/dictation.log` | Runtime log |
-| `~/.npu-dictation/venv/` | Python virtual environment |
+| `~/.npu-dictation/voices/` | Voices for `tts_voice` by name |
+
+With the `MODELS_DIR` environment variable set (a shared models folder), the
+models and cache move to `$MODELS_DIR/npu-whisper/` and the voices to
+`$MODELS_DIR/voices/`. Models taken from the Hugging Face cache (the voice
+chat LLM, faster-whisper on CUDA, Chatterbox) follow `HF_HOME`.
 
 ## How It Works
 
