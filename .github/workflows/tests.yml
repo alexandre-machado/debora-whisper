@@ -63,6 +63,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
+    env:
+      # uv's own Python builds ship tkinter; Ubuntu's system python3 does not.
+      UV_PYTHON_PREFERENCE: only-managed
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
