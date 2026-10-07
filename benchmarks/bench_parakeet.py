@@ -141,7 +141,7 @@ def main():
         model_dir = MODEL_DIR / MODEL_REGISTRY["parakeet"]["local_dir"]
     if not model_dir.exists():
         print(f"ERROR: model dir not found: {model_dir}")
-        print("Run: python dictation_engine.py --model parakeet --setup")
+        print("Run: npu-whisper-cli --model parakeet --setup")
         sys.exit(1)
 
     print(f"Loading ParakeetNPU from {model_dir} on {args.device} "

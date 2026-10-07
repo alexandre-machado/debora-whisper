@@ -392,9 +392,16 @@ VALID_DEVICES = ("CUDA", "NPU", "GPU", "CPU")
 
 def detect_devices() -> set:
     """Devices this machine can run inference on. CPU is always present."""
+    import importlib.util
     found = {"CPU"}
     if has_nvidia_gpu():
-        found.add("CUDA")
+        # faster-whisper ships in the optional [cuda] extra; without it CUDA
+        # would be picked first and then fail to load instead of falling back.
+        if importlib.util.find_spec("faster_whisper") is not None:
+            found.add("CUDA")
+        else:
+            log("NVIDIA GPU found but faster-whisper is not installed; "
+                "install the [cuda] extra to use it")
     try:
         import openvino as ov
         # "GPU.0"/"GPU.1" on multi-GPU machines; the app addresses "GPU".

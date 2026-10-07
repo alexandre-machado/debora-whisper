@@ -42,6 +42,9 @@ param(
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PyProjectPath = Join-Path $ScriptDir "pyproject.toml"
+# `python -m npu_whisper` must resolve to this checkout even from another cwd,
+# a venv created before the package layout, or the system-Python fallback.
+$env:PYTHONPATH = if ($env:PYTHONPATH) { "$ScriptDir;$env:PYTHONPATH" } else { $ScriptDir }
 $VenvDir = Join-Path (Join-Path $env:USERPROFILE ".npu-dictation") "venv"
 
 # ---------------------------------------------------------------------------

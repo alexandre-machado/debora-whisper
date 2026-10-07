@@ -48,3 +48,22 @@ def test_invalid_priority_is_rejected(priority):
     config = {**_cfg(), "device_priority": priority}
     with pytest.raises(ValueError):
         de.validate_config(config)
+
+
+@pytest.mark.parametrize("has_backend", [True, False])
+def test_cuda_requires_the_cuda_extra(monkeypatch, has_backend):
+    # A plain install on an NVIDIA box has no faster-whisper: CUDA must not be
+    # offered, or the default priority would pick it and fail to load.
+    import importlib.util
+    import sys
+    import types
+    monkeypatch.setattr(de, "has_nvidia_gpu", lambda return_name=False: True)
+    monkeypatch.setitem(sys.modules, "openvino", types.SimpleNamespace(
+        Core=lambda: types.SimpleNamespace(available_devices=["CPU", "NPU"])))
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: (
+        (object() if has_backend else None) if name == "faster_whisper"
+        else real_find_spec(name, *a)))
+    devices = de.detect_devices()
+    assert ("CUDA" in devices) is has_backend
+    assert de.select_device(_cfg(), devices) == ("CUDA" if has_backend else "NPU")

@@ -15,16 +15,20 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false  # uv build runs build-backend code
 
       - name: Set up uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Check the tag matches __version__
         shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}  # via env, never interpolated into the script
         run: |
           $version = (Select-String -Path npu_whisper/__init__.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
-          if ("v$version" -ne "${{ github.ref_name }}") {
-            Write-Error "Tag ${{ github.ref_name }} does not match __version__ $version"
+          if ("v$version" -ne $env:TAG) {
+            Write-Error "Tag $env:TAG does not match __version__ $version"
             exit 1
           }
 
@@ -36,6 +40,8 @@ jobs:
         run: |
           uv tool install --python 3.12 (Get-ChildItem dist/*.whl).FullName
           npu-whisper-cli --help
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npu-whisper --help
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Upload dist
