@@ -18,7 +18,10 @@ ICON_PATH = CONFIG_DIR / "npu-whisper.ico"
 
 
 def _programs_dir() -> Path:
-    return Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        raise RuntimeError("APPDATA is not set; cannot locate the Start Menu.")
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
 
 
 def shortcut_paths() -> dict:
@@ -46,24 +49,36 @@ def _write_icon() -> Path | None:
         return None
 
 
+# -I: the app's own environment only. Without it, a npu_whisper.py (or any
+# module it imports) in the working directory would shadow the installed one.
+SHORTCUT_ARGS = "-I -m npu_whisper"
+
 # Values reach PowerShell as environment variables, never spliced into the
 # script, so paths with quotes or `$` cannot change what it runs.
 _CREATE_LNK = (
     "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:NPW_LNK);"
     "$s.TargetPath = $env:NPW_TARGET;"
-    "$s.Arguments = '-m npu_whisper';"
-    "$s.WorkingDirectory = $env:USERPROFILE;"
+    "$s.Arguments = $env:NPW_ARGS;"
+    "$s.WorkingDirectory = $env:NPW_WORKDIR;"
     "$s.Description = 'Local voice dictation (npu-whisper)';"
     "if ($env:NPW_ICON) { $s.IconLocation = $env:NPW_ICON };"
     "$s.Save()"
 )
 
 
+def _powershell() -> str:
+    """By absolute path, so a powershell.exe on PATH or in the cwd is never run."""
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    return str(Path(root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+
+
 def _create_lnk(path: Path, target: Path, icon: Path | None):
     path.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "NPW_LNK": str(path), "NPW_TARGET": str(target),
+           "NPW_ARGS": SHORTCUT_ARGS, "NPW_WORKDIR": str(CONFIG_DIR),
            "NPW_ICON": str(icon) if icon else ""}
-    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _CREATE_LNK],
+    subprocess.run([_powershell(), "-NoProfile", "-NonInteractive", "-Command", _CREATE_LNK],
                    env=env, check=True, capture_output=True, text=True)
 
 

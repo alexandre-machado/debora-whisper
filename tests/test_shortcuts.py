@@ -34,7 +34,7 @@ def test_install_creates_a_console_less_start_menu_shortcut(appdata):
     target, args, icon = _lnk(paths["start_menu"])
     assert target.lower() == str(shortcuts.gui_python()).lower()
     assert target.lower().endswith("pythonw.exe")
-    assert args == "-m npu_whisper"
+    assert args == "-I -m npu_whisper"
     assert icon.lower().startswith(str(shortcuts.ICON_PATH).lower())
 
 
@@ -55,15 +55,39 @@ def test_paths_with_quotes_do_not_break_the_script(tmp_path, monkeypatch):
     assert shortcuts.shortcut_paths()["start_menu"].exists()
 
 
+def test_missing_appdata_is_a_clear_error(monkeypatch):
+    monkeypatch.delenv("APPDATA", raising=False)
+    with pytest.raises(RuntimeError, match="APPDATA"):
+        shortcuts.shortcut_paths()
+
+
 def test_second_tray_app_is_refused():
     import ctypes
+    import uuid
     from npu_whisper import app
+    # A name of its own, so a running tray app does not fail this test.
+    name = "Local\\npu-whisper-test-" + uuid.uuid4().hex
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
     handles = []
     try:
-        assert app._claim_single_instance() is True
+        assert app._claim_single_instance(name) is True
         handles.append(app._instance_mutex)
-        assert app._claim_single_instance() is False
+        assert app._claim_single_instance(name) is False
         handles.append(app._instance_mutex)
     finally:
         for h in handles:
-            ctypes.windll.kernel32.CloseHandle(h)
+            kernel32.CloseHandle(h)
+
+
+@pytest.mark.parametrize("argv", [
+    ["--install-shortcut", "--remove-shortcut"],
+    ["--autostart"],
+    ["--remove-shortcut", "--autostart"],
+])
+def test_conflicting_shortcut_flags_are_rejected(argv, monkeypatch):
+    from npu_whisper import app
+    monkeypatch.setattr(sys, "argv", ["npu-whisper", *argv])
+    with pytest.raises(SystemExit) as e:
+        app.main()
+    assert e.value.code == 2
