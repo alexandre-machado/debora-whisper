@@ -329,7 +329,7 @@ def test_voice_chat_off_types_the_text(typed):
     with patch.object(app.voice_chat, "respond") as respond:
         _say(app, "ola tudo bem")
     respond.assert_not_called()
-    assert typed == ["ola tudo bem... "]
+    assert typed == ["ola tudo bem "]
 
 
 def test_drafts_are_shown_not_typed_or_sent(typed):
@@ -698,7 +698,7 @@ def test_transcription_waits_while_the_llm_compiles(typed):
         app.whisper.transcribe.assert_not_called()
     worker.join(5)
     app.whisper.transcribe.assert_called_once()
-    assert typed == ["ola... "]
+    assert typed == ["ola "]
 
 
 def test_switching_off_stops_the_reply_and_forgets_the_conversation():
@@ -712,7 +712,7 @@ def test_switching_off_stops_the_reply_and_forgets_the_conversation():
 
 
 def test_sentence_typed_as_dictation_goes_to_the_llm_after_the_switch(typed):
-    app = _app(continuous_listening=True)
+    app = _app(continuous_listening=True, inline_drafts=True)
     app.is_recording = True
     _say(app, "ola tudo", is_final=False)  # typed as a dictation draft
     app.config["voice_chat"] = True

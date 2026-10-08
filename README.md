@@ -155,6 +155,7 @@ Stored at `~/.npu-dictation/config.json`:
   "hotkey": "ctrl+space",
   "tap_action": "continuous",
   "auto_enter": false,
+  "inline_drafts": false,
   "beep_on_start": true,
   "max_record_seconds": 60,
   "sample_rate": 16000
@@ -175,6 +176,24 @@ already listening continuously. A session started by a tap stops by itself
 after `continuous_idle_stop_seconds` (default 120) without speech; `null`
 keeps it on until the next tap.
 
+Continuous dictation normally ends a segment after `vad_end_silence_seconds`
+(default 1.5) of silence. When the latest transcription draft covers the most
+recent speech and looks incomplete, it waits up to
+`vad_incomplete_silence_seconds` (default 3.0) instead. These are total seconds
+since the last speech, not an extra delay per draft. A final `.`, `?` or `!`
+uses the normal wait; no final punctuation, commas, colons, semicolons and
+ellipses use the longer wait. This is a punctuation heuristic, not semantic
+understanding. Without a usable draft the normal timeout applies. Set both
+values equal to disable the extension. Manual stop and the segment duration
+limit still apply; push-to-talk and voice chat keep their existing behavior.
+
+In continuous dictation, drafts appear in the overlay and each finished
+sentence is pasted once. `inline_drafts: true` also types drafts into the
+target window and rewrites them in place with Shift+Left and Backspace. That
+only works where the editor leaves the typed text and caret alone; editors
+with autocomplete, auto-closing brackets, autocorrect or slow input handling
+(browsers, Word, IDEs) can garble the result.
+
 ### Voice chat (OpenVINO LLM + Chatterbox)
 
 With `"voice_chat": true` (or `--voice-chat`, or **Voice chat** in Settings),
@@ -184,7 +203,7 @@ plays sentence by sentence. The conversation keeps the last 8 turns and starts
 over after 10 minutes of silence. In continuous listening the microphone is
 muted while the reply plays; a hotkey press cuts the reply short. A sentence
 ends after 0.8 s of silence (`voice_chat_end_silence_seconds`; dictation
-waits 1.5 s), and the reply's sentences play back to back on one audio stream.
+waits 1.5–3 s), and the reply's sentences play back to back on one audio stream.
 
 Switch it on or off while the app runs, from **Voice chat** in the tray menu
 or in Settings: no restart. Switching on starts the TTS server and loads the

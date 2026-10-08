@@ -50,7 +50,8 @@ def screen():
 
 def _app(**config):
     app = DictationApp({**DEFAULT_CONFIG, "beep_on_start": False,
-                        "continuous_listening": True, **config})
+                        "continuous_listening": True, "inline_drafts": True,
+                        **config})
     app.recorder = MagicMock()
     app.whisper = MagicMock()
     app._model_ready.set()
@@ -66,7 +67,7 @@ def _say(app, text, is_final):
     app._finish_recording(audio=AUDIO, is_final=is_final)
 
 
-def test_draft_is_corrected_in_place_without_clipboard(screen):
+def test_draft_is_corrected_in_place(screen):
     app = _app()
     _say(app, "Olá tudo", is_final=False)
     _say(app, "Olá tudo bem", is_final=False)
@@ -74,9 +75,20 @@ def test_draft_is_corrected_in_place_without_clipboard(screen):
 
     assert screen.text == "Olá, tudo bem? "
     assert screen.drafted == ["Olá tudo... ", " bem... "]
-    # Only the differing tail goes through the clipboard paste.
+    # Only the differing tail is sent as final text.
     assert screen.pasted == [", tudo bem? "]
     assert app._draft_typed_text == ""
+
+
+def test_drafts_stay_in_overlay_by_default(screen):
+    app = _app(inline_drafts=DEFAULT_CONFIG["inline_drafts"])
+    _say(app, "Olá tudo", is_final=False)
+    assert app.last_draft_text == "Olá tudo... "
+    _say(app, "Olá, tudo bem?", is_final=True)
+
+    assert screen.drafted == []
+    assert screen.pasted == ["Olá, tudo bem? "]
+    assert screen.text == "Olá, tudo bem? "
 
 
 def test_final_equal_to_draft_still_presses_auto_enter(screen):
@@ -87,6 +99,27 @@ def test_final_equal_to_draft_still_presses_auto_enter(screen):
     assert screen.text == "Pronto. "
     assert screen.pasted == []
     assert screen.enters == 1
+
+
+@pytest.mark.parametrize("draft", ["Olá, tudo", "Olá, tudo bem?"])
+def test_console_logs_complete_final_even_if_only_tail_or_nothing_is_typed(screen, capsys, draft):
+    app = _app()
+    _say(app, draft, is_final=False)
+    assert "Final transcription:" not in capsys.readouterr().out
+
+    _say(app, "Olá, tudo bem?", is_final=True)
+
+    assert screen.text == "Olá, tudo bem? "
+    output = capsys.readouterr().out
+    assert output.count("Final transcription:") == 1
+    assert "Final transcription: Olá, tudo bem?" in output
+    assert "Final transcription: Olá, tudo bem?" in de.LOG_FILE.read_text(encoding="utf-8")
+
+
+def test_final_log_is_not_truncated(screen, capsys):
+    text = "Uma frase longa. " * 10
+    _say(_app(), text, is_final=True)
+    assert f"Final transcription: {text.strip()}" in capsys.readouterr().out
 
 
 def test_focus_change_leaves_old_draft_and_types_full_text(screen):
@@ -120,6 +153,51 @@ def test_empty_draft_keeps_typed_draft(screen):
 
     assert screen.text == "Além disso... "
     assert app._draft_typed_text == "Além disso... "
+
+
+def test_endpoint_receives_raw_draft_before_display_ellipses(screen):
+    app = _app()
+    app.whisper.transcribe.return_value = "Minha ideia é"
+    app._finish_recording(audio=AUDIO, is_final=False, segment_id=7, audio_end=16000)
+    app.recorder.endpoint.update.assert_called_once_with(7, 16000, "Minha ideia é")
+    assert screen.text == "Minha ideia é... "
+
+
+def test_hallucination_feedback_is_empty(screen):
+    app = _app()
+    app.whisper.transcribe.return_value = "Obrigado."
+    app._finish_recording(audio=AUDIO, is_final=False, segment_id=7, audio_end=16000)
+    app.recorder.endpoint.update.assert_called_once_with(7, 16000, "")
+
+
+def test_final_does_not_change_endpoint(screen):
+    app = _app()
+    app.whisper.transcribe.return_value = "Minha ideia é"
+    app._finish_recording(audio=AUDIO, is_final=True, segment_id=7, audio_end=16000)
+    app.recorder.endpoint.update.assert_not_called()
+
+
+def test_segment_consumer_preserves_draft_identity_and_position(monkeypatch, screen):
+    from types import SimpleNamespace
+    from npu_whisper.vad_endpoint import VadSegment
+
+    app = _app()
+    app.recorder = de.AudioRecorder(config=app.config)
+    segment_id = app.recorder.endpoint.start()
+    app.recorder.segment_queue.put(VadSegment(AUDIO, False, segment_id, len(AUDIO)))
+    app.whisper.transcribe.return_value = "Minha ideia é"
+    finish = app._finish_recording
+
+    def consume(**kwargs):
+        finish(**kwargs)
+        app._stopping.set()
+
+    app._finish_recording = consume
+    # Run the actual consumer synchronously, stopping after this draft.
+    monkeypatch.setattr(de.threading, "Thread", lambda target, **kw: SimpleNamespace(start=target))
+    app._start_segment_consumer()
+    assert app.recorder.endpoint.incomplete
+    assert screen.text == "Minha ideia é... "
 
 
 def test_empty_final_erases_draft(screen):
@@ -208,6 +286,63 @@ def test_unicode_typing_sends_utf16_units(monkeypatch):
     ctypes.windll.user32.SendInput.side_effect = send_input
     monkeypatch.setattr(de.time, "sleep", lambda s: None)
 
-    de.type_draft_text("é👍")
+    de._type_text_ctypes("é👍")
 
     assert units == [0xE9, 0xD83D, 0xDC4D]
+
+
+@pytest.fixture
+def clipboard(monkeypatch):
+    import pyperclip
+    import keyboard
+
+    state = {"text": "user clipboard", "pasted": [], "pending": False}
+    monkeypatch.setattr(pyperclip, "paste", lambda: state["text"])
+    monkeypatch.setattr(pyperclip, "copy", lambda text: state.update(text=text))
+
+    def key(name):
+        if name == "ctrl+v":
+            state["pending"] = True
+
+    def wait(seconds):
+        # Model a target that reads the clipboard after Ctrl+V returns.
+        if state["pending"]:
+            state["pasted"].append(state["text"])
+            state["pending"] = False
+
+    monkeypatch.setattr(keyboard, "press_and_release", key)
+    monkeypatch.setattr(de.time, "sleep", wait)
+    return state
+
+
+def test_drafts_and_final_paste_before_restoring_clipboard(clipboard):
+    with patch.object(de, "_type_text_ctypes") as unicode_keys, \
+            patch.object(de.threading, "Thread") as background:
+        for text, final in [("Olá, tudo... ", False), (" bem? ", False), ("fim", True)]:
+            (de.type_text if final else de.type_draft_text)(text)
+            assert clipboard["pasted"][-1] == text
+            assert clipboard["text"] == "user clipboard"
+
+    unicode_keys.assert_not_called()
+    background.assert_not_called()
+    assert clipboard["pasted"] == ["Olá, tudo... ", " bem? ", "fim"]
+
+
+def test_paste_does_not_overwrite_new_user_copy(clipboard, monkeypatch):
+    def wait(seconds):
+        if seconds == 0.5:
+            clipboard["text"] = "new user copy"
+
+    monkeypatch.setattr(de.time, "sleep", wait)
+    de.type_draft_text("Olá")
+    assert clipboard["text"] == "new user copy"
+
+
+def test_failed_paste_restores_clipboard_and_releases_lock(clipboard):
+    with patch("keyboard.press_and_release", side_effect=RuntimeError("paste failed")):
+        with pytest.raises(RuntimeError, match="paste failed"):
+            de.type_draft_text("Olá")
+
+    assert clipboard["text"] == "user clipboard"
+    assert de._clipboard_lock.acquire(blocking=False)
+    de._clipboard_lock.release()

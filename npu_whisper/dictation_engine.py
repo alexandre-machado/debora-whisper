@@ -18,6 +18,7 @@ from pathlib import Path
 from datetime import datetime
 
 from npu_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
+from npu_whisper.vad_endpoint import AdaptiveEndpoint, VadSegment
 from npu_whisper.voice_chat import (VoiceChat, download_llm, ensure_tts_server, is_http_url,
                                     llm_loaded, load_llm)
 
@@ -46,11 +47,19 @@ DEFAULT_CONFIG = {
     "language": "en",          # Language code or "auto"
     "hotkey": "ctrl+space",    # Global hotkey to toggle recording
     "auto_enter": False,       # Press Enter after pasting (useful for Claude Code)
+    # Continuous drafts: shown in the overlay only, or also typed into the
+    # target and rewritten with Shift+Left. Rewriting assumes the editor
+    # leaves text and caret alone, which autocomplete, auto-closing pairs,
+    # autocorrect and slow targets (browsers, Word, IDEs) do not.
+    "inline_drafts": False,
     "beep_on_start": True,     # Audio feedback when recording starts/stops
     "max_record_seconds": 60,  # Max recording length
     "sample_rate": 16000,      # Whisper expects 16kHz
     "show_balloon": True,      # Show text balloon under notch after transcription
     "continuous_listening": False, # Start in continuous (VAD) listening
+    "vad_end_silence_seconds": 1.5,
+    # Total silence allowed when the latest draft lacks sentence-ending punctuation.
+    "vad_incomplete_silence_seconds": 3.0,
     # Hotkey: holding it is always push-to-talk. A tap either starts
     # continuous listening (VAD types each sentence; tap again to stop) or,
     # with "toggle", starts a recording that the next tap stops.
@@ -283,6 +292,12 @@ def validate_config(config: dict):
     max_rec = config.get("max_record_seconds")
     if max_rec is not None and (not isinstance(max_rec, (int, float)) or max_rec <= 0):
         raise ValueError(f"max_record_seconds must be a positive number or null, got '{max_rec}'")
+
+    for key in ("vad_end_silence_seconds", "vad_incomplete_silence_seconds"):
+        seconds = config.get(key, DEFAULT_CONFIG[key])
+        if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+                or not 0 < seconds < float("inf")):
+            raise ValueError(f"{key} must be a finite positive number, got {seconds!r}")
 
     tap_action = config.get("tap_action", "continuous")
     if tap_action not in TAP_ACTIONS:
@@ -1474,7 +1489,8 @@ class NeuralVAD:
 def drop_superseded_drafts(items: list) -> list:
     """Keep only the segments worth transcribing, in order.
 
-    Items are (audio, is_final) tuples from the VAD queue. A draft followed by
+    Items start with (audio, is_final), optionally followed by VAD metadata.
+    A draft followed by
     any later item is stale: the later draft or final covers newer audio, and
     transcribing it would only delay that newer item. Finals are never
     dropped.
@@ -1530,6 +1546,7 @@ class AudioRecorder:
         # on, so gating drafts on the queue alone snapshots audio that is
         # 1-2s stale by the time the model gets to it.
         self.consumer_busy = threading.Event()
+        self.endpoint = AdaptiveEndpoint()
         self._vad_thread = None
         self._stop_vad = False
         self.neural_vad = None
@@ -1555,6 +1572,8 @@ class AudioRecorder:
             seconds = self.config.get("voice_chat_end_silence_seconds", 0.8)
         else:
             seconds = self.config.get("vad_end_silence_seconds", 1.5)
+            if self.endpoint.incomplete:
+                seconds = max(seconds, self.config.get("vad_incomplete_silence_seconds", 3.0))
         return int(self.sample_rate * seconds)
 
     def warmup(self, timeout=3.0):
@@ -1673,12 +1692,14 @@ class AudioRecorder:
         with self._lock:
             self.paused = True
             self.continuous = False
+            self.endpoint.finish()
 
     def set_muted(self, muted: bool):
         """Mute or unmute the VAD. Unmuting skips everything heard while
         muted, so the reply's tail is not cut as a segment."""
         with self._lock:
             self.muted = muted
+            self.endpoint.finish()
             if not muted:
                 self._read_pos = self._write_pos
                 if self.neural_vad:
@@ -1724,6 +1745,8 @@ class AudioRecorder:
         silence_frames = 0
         speech_frames = 0
         last_draft_time = 0.0
+        segment_id = 0
+        extension_logged = False
         
         log("VAD thread started.")
         try:
@@ -1769,6 +1792,7 @@ class AudioRecorder:
                         # Speech in progress is dropped, not cut: it may be
                         # the reply's own audio.
                         is_speaking = False
+                        self.endpoint.finish()
                         continue
                     
                     if is_paused:
@@ -1778,6 +1802,7 @@ class AudioRecorder:
                                 log("VAD: Cutting segment due to pause.")
                             else:
                                 is_speaking = False
+                                self.endpoint.finish()
                                 if self.neural_vad: self.neural_vad.reset_state()
                         else:
                             continue
@@ -1790,6 +1815,7 @@ class AudioRecorder:
                         if is_speech_now:
                             if not is_speaking:
                                 is_speaking = True
+                                segment_id = self.endpoint.start()
                                 speech_start_pos = (start_read_pos + i - self.lookback_frames) % self.capacity
                                 silence_frames = 0
                                 speech_frames = self.lookback_frames + block_len
@@ -1797,6 +1823,8 @@ class AudioRecorder:
                             else:
                                 silence_frames = 0
                                 speech_frames += block_len
+                            self.endpoint.speech(speech_frames)
+                            extension_logged = False
                         else:
                             if is_speaking:
                                 silence_frames += block_len
@@ -1820,17 +1848,27 @@ class AudioRecorder:
                                                 self._buffer[speech_start_pos:],
                                                 self._buffer[:draft_end_pos]
                                             ))
-                                    self.segment_queue.put((draft_audio.flatten(), False))
+                                    self.segment_queue.put(VadSegment(
+                                        draft_audio.flatten(), False, segment_id, speech_frames))
                                     last_draft_time = current_time
 
                         # End of speech conditions
-                        if is_speaking and silence_frames > self.end_silence_frames:
+                        silence_limit = self.end_silence_frames
+                        base_limit = int(self.sample_rate * self.config.get("vad_end_silence_seconds", 1.5))
+                        if (is_speaking and not extension_logged
+                                and not self.config.get("voice_chat")
+                                and silence_limit > base_limit and silence_frames > base_limit):
+                            log(f"VAD: Incomplete draft; allowing {silence_limit / self.sample_rate:g}s "
+                                "of total silence.")
+                            extension_logged = True
+                        if is_speaking and silence_frames > silence_limit:
                             if speech_frames >= self.min_speech_frames:
                                 cut_segment = True
                                 log("VAD: Cutting segment due to natural silence.")
                             else:
                                 # Too short, discard
                                 is_speaking = False
+                                self.endpoint.finish()
                                 if self.neural_vad: self.neural_vad.reset_state()
                                 
                         elif is_speaking and speech_frames >= self.max_segment_frames:
@@ -1840,10 +1878,18 @@ class AudioRecorder:
                             
                     if cut_segment:
                         is_speaking = False
+                        self.endpoint.finish()
                         if self.neural_vad: self.neural_vad.reset_state()
                         # Extract segment
                         with self._lock:
-                            end_pos = (start_read_pos + i + block_len + self.trailing_frames) % self.capacity
+                            # Cap the trailing silence to prevent Whisper from dropping words or hallucinating spaces.
+                            # We keep up to 1.0s of the silence (which may contain quiet speech) plus trailing_frames.
+                            max_silence_keep = int(self.sample_rate * 1.0)
+                            extract_frames = speech_frames
+                            if silence_frames > max_silence_keep:
+                                extract_frames -= (silence_frames - max_silence_keep)
+                            extract_frames += self.trailing_frames
+                            end_pos = (speech_start_pos + extract_frames) % self.capacity
                             if end_pos > speech_start_pos:
                                 audio = self._buffer[speech_start_pos:end_pos].copy()
                             else:
@@ -1852,7 +1898,8 @@ class AudioRecorder:
                                     self._buffer[:end_pos]
                                 ))
                             
-                        self.segment_queue.put((audio.flatten(), True))
+                        self.segment_queue.put(VadSegment(
+                            audio.flatten(), True, segment_id, speech_frames))
         except Exception as e:
             import traceback
             log(f"CRITICAL ERROR in VAD loop: {e}\n{traceback.format_exc()}")
@@ -1931,6 +1978,7 @@ class AudioRecorder:
         with self._lock:
             self.recording = False
             self._stop_vad = True
+            self.endpoint.finish()
             self._data_cv.notify_all()
             if self._timer:
                 self._timer.cancel()
@@ -2020,33 +2068,45 @@ def same_input_target(a, b) -> bool:
 
 
 def type_draft_text(text: str):
-    """Type a live draft without touching the clipboard.
-
-    type_text() pastes and restores the clipboard 0.5 s later on a thread;
-    drafts arrive about once a second, so a pending restore could land
-    between the next copy and its Ctrl+V and paste the user's clipboard.
-    """
-    if text:
-        _type_text_ctypes(text)
+    """Paste live drafts through the same serialized path as final text."""
+    type_text(text)
 
 
 def delete_text(count: int):
-    """Delete the specified number of characters, one Backspace each."""
+    """Delete the specified number of characters using Shift+Left selection."""
     if count <= 0:
         return
     try:
         import keyboard
+        keyboard.press("shift")
         for _ in range(count):
-            keyboard.send("backspace")
+            keyboard.send("left")
             time.sleep(0.001)
+        keyboard.release("shift")
+        keyboard.send("backspace")
     except ImportError:
         import ctypes
         user32 = ctypes.windll.user32
         KEYEVENTF_KEYUP = 0x0002
         VK_BACK = 0x08
+        VK_SHIFT = 0x10
+        VK_LEFT = 0x25
+        
+        # Press Shift
+        user32.keybd_event(VK_SHIFT, 0, 0, 0)
+        # Press Left Arrow `count` times
         for _ in range(count):
-            user32.keybd_event(VK_BACK, 0, 0, 0)
-            user32.keybd_event(VK_BACK, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_LEFT, 0, 0, 0)
+            user32.keybd_event(VK_LEFT, 0, KEYEVENTF_KEYUP, 0)
+            time.sleep(0.001)
+        # Release Shift
+        user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+        # Press Backspace
+        user32.keybd_event(VK_BACK, 0, 0, 0)
+        user32.keybd_event(VK_BACK, 0, KEYEVENTF_KEYUP, 0)
+
+
+_clipboard_lock = threading.Lock()
 
 
 def type_text(text: str, auto_enter: bool = False):
@@ -2059,31 +2119,31 @@ def type_text(text: str, auto_enter: bool = False):
         import pyperclip
         import keyboard
 
-        # Save current clipboard
-        try:
-            old_clipboard = pyperclip.paste()
-        except Exception:
-            old_clipboard = ""
-
-        # Copy transcribed text and paste
-        pyperclip.copy(text)
-        time.sleep(0.05)
-        keyboard.press_and_release("ctrl+v")
-        time.sleep(0.1)
-
-        if auto_enter:
-            keyboard.press_and_release("enter")
-
-        # Restore clipboard after a short delay
-        def restore():
-            time.sleep(0.5)
+        # Complete restoration before another draft/final uses the clipboard.
+        # A detached restore can otherwise overwrite the next text before
+        # its Ctrl+V is processed. Unicode key packets are only a fallback:
+        # live text should reach the target as one paste, not individual keys.
+        with _clipboard_lock:
             try:
-                pyperclip.copy(old_clipboard)
+                old_clipboard = pyperclip.paste()
             except Exception:
-                pass
+                old_clipboard = None
 
-        threading.Thread(target=restore, daemon=True).start()
-        log(f"Typed: {text[:80]}{'...' if len(text) > 80 else ''}")
+            pyperclip.copy(text)
+            try:
+                time.sleep(0.05)
+                keyboard.press_and_release("ctrl+v")
+                time.sleep(0.1)
+                if auto_enter:
+                    keyboard.press_and_release("enter")
+            finally:
+                time.sleep(0.5)
+                try:
+                    # Don't overwrite something the user copied meanwhile.
+                    if old_clipboard is not None and pyperclip.paste() == text:
+                        pyperclip.copy(old_clipboard)
+                except Exception:
+                    pass
 
     except ImportError:
         # Fallback: use ctypes SendInput on Windows
@@ -2684,7 +2744,8 @@ class DictationApp:
         self._draft_typed_text = ""
         self._draft_target = None
 
-    def _finish_recording(self, generation=None, audio=None, is_final=True):
+    def _finish_recording(self, generation=None, audio=None, is_final=True,
+                          segment_id=None, audio_end=None):
         """Consume one recording, whether stopped by the user or its timer,
         or (audio given) one VAD segment of continuous listening."""
         vad_segment = audio is not None
@@ -2748,6 +2809,10 @@ class DictationApp:
                     log(f"Ignoring hallucination: '{text}'")
                     text = ""
 
+                if (vad_segment and not is_final and segment_id is not None
+                        and not self.config.get("voice_chat")):
+                    self.recorder.endpoint.update(segment_id, audio_end, text)
+
                 if text.strip() and self.config.get("voice_chat"):
                     # Voice chat types nothing: the text goes to the LLM.
                     self._voice_chat_turn(text.strip(), audio, is_final)
@@ -2767,7 +2832,7 @@ class DictationApp:
                         # Windows handles it naturally, but this prevents "legalFicou".
                         if vad_segment:
                             stripped = text.strip()
-                            if stripped and not re.search(r'[.,!?;\:]$', stripped):
+                            if not is_final and stripped and not re.search(r'[.,!?;\:]$', stripped):
                                 text = stripped + '... '
                             elif not text.endswith(' '):
                                 text += ' '
@@ -2793,6 +2858,7 @@ class DictationApp:
                                 keyboard.press_and_release("enter")
                             self._draft_typed_text = ""
                             self._draft_target = None
+                            log(f"Final transcription: {text.strip()}")
 
                             self._history.append({
                                 "timestamp": datetime.now().isoformat(),
@@ -2801,7 +2867,7 @@ class DictationApp:
                             })
                             if len(self._history) > self.MAX_HISTORY:
                                 self._history = self._history[-self.MAX_HISTORY:]
-                        else:
+                        elif self.config.get("inline_drafts"):
                             # It's a draft. Type it so the user sees it real-time.
                             type_draft_text(text_to_type)
                             self._draft_typed_text = text
@@ -3192,7 +3258,8 @@ class DictationApp:
                     pending = drop_superseded_drafts(pending)
                     if not pending:
                         continue
-                    audio_segment, is_final = pending.pop(0)
+                    segment = pending.pop(0)
+                    audio_segment, is_final = segment[:2]
 
                     if len(audio_segment) > 0:
                         busy.set()
@@ -3201,7 +3268,10 @@ class DictationApp:
                             # Mas queremos esperar até que ele termine.
                             while getattr(self, "_transcribing", False) and not self._stopping.is_set():
                                 time.sleep(0.1)
-                            self._finish_recording(audio=audio_segment, is_final=is_final)
+                            metadata = ({"segment_id": segment.segment_id,
+                                         "audio_end": segment.audio_end}
+                                        if isinstance(segment, VadSegment) else {})
+                            self._finish_recording(audio=audio_segment, is_final=is_final, **metadata)
                         finally:
                             busy.clear()
                 except queue.Empty:
