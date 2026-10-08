@@ -313,6 +313,10 @@ class SettingsWindow:
         if self._status_label and self._win and self._win.winfo_exists():
             self._status_label.configure(text=text, text_color=color)
 
+    def set_voice_chat(self, enabled: bool):
+        """Follow a switch made from the tray, so Apply does not undo it."""
+        self._voice_chat_var.set(enabled)
+
     def set_apply_enabled(self, enabled: bool):
         """Enable/disable the Apply button during model loading."""
         if self._apply_btn and self._win and self._win.winfo_exists():

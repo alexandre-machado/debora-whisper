@@ -780,7 +780,7 @@ def test_healthy_npu_is_kept(monkeypatch):
 
 def test_large_logs_are_rotated(tmp_path, monkeypatch):
     # Its own folder: threads of other tests may still write the shared one.
-    for name in ("LOG_FILE", "TELEMETRY_LOG", "TTS_SERVER_LOG"):
+    for name in ("LOG_FILE", "TELEMETRY_LOG", "TTS_SERVER_LOG", "LLM_SERVER_LOG"):
         monkeypatch.setattr(de, name, tmp_path / getattr(de, name).name)
     de.LOG_FILE.write_bytes(b"x" * (de.LOG_MAX_BYTES + 1))
     de.TELEMETRY_LOG.write_bytes(b"small")

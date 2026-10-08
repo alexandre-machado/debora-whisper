@@ -38,22 +38,24 @@ def run(model_path: str, backend: str, model_size: str, language: str, sample_ra
 
 def probe_command(config: dict, model_path) -> list[str]:
     from npu_whisper.dictation_engine import MODEL_REGISTRY
-    return [sys.executable, "-m", "npu_whisper.npu_probe", str(model_path),
+    from npu_whisper.processes import python_executable
+    return [python_executable(), "-m", "npu_whisper.npu_probe", str(model_path),
             MODEL_REGISTRY[config["model_size"]]["backend"], config["model_size"],
             config.get("language", "en"), str(config["sample_rate"])]
 
 
 def probe_npu(config: dict, model_path, timeout=NPU_PROBE_TIMEOUT, command=None):
     """Return if the NPU runs the model again; raise RuntimeError otherwise."""
+    from npu_whisper.processes import NO_WINDOW, kill_tree
     process = subprocess.Popen(
         command or probe_command(config, model_path),
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        creationflags=NO_WINDOW)
     try:
         output, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         # Not waited for: a process stuck in the driver may never exit.
-        process.kill()
+        kill_tree(process)
         raise RuntimeError(f"no answer in {timeout}s (the NPU driver is probably "
                            f"hung); probe process {process.pid} killed") from None
     if process.returncode != 0:

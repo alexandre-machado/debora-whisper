@@ -9,8 +9,12 @@ class TrayManager:
     """Manages the system tray icon and context menu."""
 
     def __init__(self, on_toggle, on_quit, on_settings=None, on_history=None, on_hardware_event=None,
-                 device="NPU", model="base", hotkey="ctrl+alt+d"):
+                 device="NPU", model="base", hotkey="ctrl+alt+d",
+                 on_voice_chat=None, voice_chat_on=None):
         self._on_toggle = on_toggle
+        # on_voice_chat() switches voice chat; voice_chat_on() ticks the item.
+        self._on_voice_chat = on_voice_chat
+        self._voice_chat_on = voice_chat_on or (lambda: False)
         self._on_quit = on_quit
         self._on_settings = on_settings
         self._on_history = on_history
@@ -45,6 +49,11 @@ class TrayManager:
             ),
             pystray.Menu.SEPARATOR,
         ]
+
+        if self._on_voice_chat:
+            items.append(pystray.MenuItem(
+                "Voice chat", lambda: self._on_voice_chat(),
+                checked=lambda _: self._voice_chat_on()))
 
         if self._on_history:
             items.append(pystray.MenuItem("History", lambda: self._on_history()))

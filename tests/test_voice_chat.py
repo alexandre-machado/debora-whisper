@@ -244,89 +244,9 @@ def test_split_sentences(buffer, done, rest):
     assert vc.split_sentences(buffer) == (done, rest)
 
 
-# --- The OpenVINO model ------------------------------------------------------
+# --- The LLM model files ---------------------------------------------------
 
-class FakePipeline:
-    """openvino_genai.LLMPipeline stand-in: records where it loaded and
-    streams .tokens through the streamer."""
-    fail_on = set()
-    tokens = ["Olá", "!", " Tudo", " bem."]
-
-    def __init__(self, path, device, **properties):
-        if device in self.fail_on:
-            raise RuntimeError(f"{device} is not available")
-        self.path, self.device, self.properties = path, device, properties
-        self.prompts = []
-
-    def get_tokenizer(self):
-        tokenizer = MagicMock()
-        tokenizer.apply_chat_template.side_effect = \
-            lambda messages, add_generation_prompt, extra_context: json.dumps(
-                [messages, extra_context])
-        return tokenizer
-
-    def generate(self, prompt, config, streamer):
-        self.prompts.append((prompt, config))
-        for token in self.tokens:
-            if streamer(token) == "CANCEL":
-                return
-
-
-@pytest.fixture
-def genai(monkeypatch, tmp_path):
-    module = MagicMock()
-    module.LLMPipeline = FakePipeline
-    module.StreamingStatus.CANCEL, module.StreamingStatus.RUNNING = "CANCEL", "RUNNING"
-    monkeypatch.setitem(sys.modules, "openvino_genai", module)
-    monkeypatch.setattr(vc, "_llm", None)
-    monkeypatch.setattr(vc.paths, "CACHE_DIR", tmp_path / "cache")
-    FakePipeline.fail_on = set()
-    return module
-
-
-def _llm_cfg(tmp_path, **extra):
-    return {**DEFAULT_CONFIG, "llm_model": str(tmp_path), **extra}
-
-
-def test_reply_streams_from_the_openvino_model(genai, tmp_path):
-    out = []
-    vc.generate_reply([{"role": "user", "content": "oi"}], _llm_cfg(tmp_path),
-                      out.append, threading.Event(), log=lambda m: None)
-    assert "".join(out) == "Olá! Tudo bem."
-    pipe = vc._llm[1]
-    assert pipe.device == "GPU" and pipe.path == str(tmp_path)
-    assert pipe.properties == {"CACHE_DIR": str(tmp_path / "cache")}
-    prompt, config = pipe.prompts[0]
-    assert json.loads(prompt)[1] == {"enable_thinking": False}
-    assert config.max_new_tokens == vc.LLM_MAX_TOKENS
-    assert config.apply_chat_template is False  # already templated above
-
-
-def test_model_loads_once_per_process(genai, tmp_path):
-    config = _llm_cfg(tmp_path)
-    assert vc.load_llm(config, log=lambda m: None) is vc.load_llm(config, log=lambda m: None)
-
-
-def test_model_falls_back_to_the_cpu(genai, tmp_path):
-    FakePipeline.fail_on = {"GPU"}
-    assert vc.load_llm(_llm_cfg(tmp_path), log=lambda m: None).device == "CPU"
-
-
-def test_model_that_loads_nowhere_fails_the_reply(genai, tmp_path, server):
-    FakePipeline.fail_on = {"GPU", "CPU"}
-    chat = vc.VoiceChat(_cfg(server, llm_model=str(tmp_path)), log=lambda m: None,
-                        play=lambda *a: None)
-    assert chat.respond("oi") == ""
-
-
-def test_stop_cancels_the_generation(genai, tmp_path):
-    stop, out = threading.Event(), []
-    vc.generate_reply([], _llm_cfg(tmp_path), lambda t: out.append(t) or stop.set(), stop,
-                      log=lambda m: None)
-    assert out == ["Olá"]
-
-
-def test_hub_model_is_downloaded_once(genai, monkeypatch):
+def test_hub_model_is_downloaded_once(monkeypatch):
     calls = []
 
     def snapshot_download(repo, local_files_only=False):
@@ -663,19 +583,6 @@ def test_paths_follow_models_dir(monkeypatch, tmp_path):
         importlib.reload(paths)
 
 
-def test_llm_loads_only_after_the_speech_model(monkeypatch):
-    """Compiling the LLM on the iGPU during the NPU's warmup lost the NPU."""
-    order = []
-    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: order.append("tts"))
-    monkeypatch.setattr(vc, "load_llm", lambda *a: order.append("llm"))
-    vc.warm_up({}, before_llm=lambda: order.append("speech model ready") or True)
-    assert order == ["tts", "speech model ready", "llm"]
-
-    order.clear()
-    vc.warm_up({}, before_llm=lambda: False)  # engine stopped meanwhile
-    assert order == ["tts"]
-
-
 def test_engine_waits_for_its_speech_model():
     app = DictationApp({**DEFAULT_CONFIG})
     app._model_ready.set()
@@ -693,3 +600,164 @@ def test_each_spoken_sentence_is_logged(server):
     assert [m for m in logs if m.startswith("Voice chat: reply ")] == [
         "Voice chat: reply 'A capital é Canberra.'",
         "Voice chat: reply 'Fica no sul do país.'"]
+
+
+# --- Switching voice chat while running ---------------------------------------
+
+@pytest.fixture
+def loader(monkeypatch):
+    """The engine's LLM loading, recorded instead of run."""
+    calls = []
+    monkeypatch.setattr(de, "ensure_tts_server", lambda *a: calls.append("tts"))
+    monkeypatch.setattr(de, "download_llm", lambda *a: calls.append("download"))
+    monkeypatch.setattr(de, "llm_loaded", lambda config: False)
+
+    def load_llm(config, log, log_path, stop):
+        calls.append(("llm", de._inference_gate.locked()))
+        return object()
+
+    monkeypatch.setattr(de, "load_llm", load_llm)
+    return calls
+
+
+def _notices(app):
+    notices = []
+    app.add_callback(lambda s, d: d.get("notice") and notices.append(d["notice"]))
+    return notices
+
+
+def _wait_for(condition, timeout=5):
+    deadline = time.time() + timeout
+    while not condition():
+        assert time.time() < deadline
+        time.sleep(0.02)
+
+
+def test_switching_on_loads_the_llm_in_the_background(loader):
+    app = _app()
+    notices = _notices(app)
+    app.set_voice_chat(True)
+    _wait_for(lambda: "Voice chat ready" in notices)
+    assert app.config["voice_chat"] is True
+    # Downloaded first, then compiled with every transcription held back.
+    assert loader == ["tts", "download", ("llm", True)]
+    assert notices == ["Voice chat: loading the LLM...", "Voice chat ready"]
+
+
+def test_the_llm_waits_for_the_speech_model(loader):
+    """Compiling the LLM on the iGPU during the NPU's warmup lost the NPU."""
+    app = _app()
+    app._model_ready.clear()
+    app.set_voice_chat(True)
+    time.sleep(0.3)
+    assert loader == ["tts"]
+    app._model_ready.set()
+    _wait_for(lambda: len(loader) == 3)
+
+
+def test_a_loaded_llm_is_ready_at_once(loader, monkeypatch):
+    monkeypatch.setattr(de, "llm_loaded", lambda config: True)
+    app = _app()
+    notices = _notices(app)
+    app.set_voice_chat(True)
+    _wait_for(lambda: notices)
+    assert notices == ["Voice chat ready"]
+    assert loader == ["tts"]
+
+
+def test_failed_llm_load_is_told(loader, monkeypatch):
+    monkeypatch.setattr(de, "load_llm", MagicMock(side_effect=RuntimeError("no GPU")))
+    app = _app()
+    notices = _notices(app)
+    app.set_voice_chat(True)
+    _wait_for(lambda: len(notices) == 2)
+    assert notices[-1] == "Voice chat: the LLM did not load (see app.log)"
+
+
+def test_transcription_waits_while_the_llm_compiles(typed):
+    app = _app()
+    app.whisper.transcribe.return_value = "ola"
+    with de._inference_gate:
+        worker = threading.Thread(target=app._finish_recording,
+                                  kwargs={"audio": AUDIO, "is_final": True})
+        worker.start()
+        time.sleep(0.3)
+        app.whisper.transcribe.assert_not_called()
+    worker.join(5)
+    app.whisper.transcribe.assert_called_once()
+    assert typed == ["ola... "]
+
+
+def test_switching_off_stops_the_reply_and_forgets_the_conversation():
+    app = _app(voice_chat=True)
+    app.voice_chat._history = [{"role": "user", "content": "oi"}]
+    with patch.object(app.voice_chat, "interrupt") as interrupt:
+        app.set_voice_chat(False)
+    interrupt.assert_called_once()
+    assert app.voice_chat._history == []
+    assert app.config["voice_chat"] is False
+
+
+def test_sentence_typed_as_dictation_goes_to_the_llm_after_the_switch(typed):
+    app = _app(continuous_listening=True)
+    app.is_recording = True
+    _say(app, "ola tudo", is_final=False)  # typed as a dictation draft
+    app.config["voice_chat"] = True
+    with patch.object(app.voice_chat, "respond", return_value="Oi!") as respond:
+        _say(app, "ola tudo bem")
+    respond.assert_called_once()
+    assert typed == [("draft", "ola tudo... "), ("delete", len("ola tudo... "))]
+
+
+def _gui(**config):
+    from npu_whisper.app import GUIApp
+    gui = GUIApp.__new__(GUIApp)
+    gui._config = {**DEFAULT_CONFIG, **config}
+    gui._engine = MagicMock()
+    gui._engine.stop_if_idle.return_value = None
+    gui._overlay, gui._tray = MagicMock(), MagicMock()
+    gui._settings_win = MagicMock(is_open=True)
+    gui._settings_status, gui._settings_set_apply = MagicMock(), MagicMock()
+    return gui
+
+
+def test_tray_item_switches_without_a_new_engine():
+    gui = _gui()
+    engine = gui._engine
+    with patch.dict(gui._set_voice_chat.__globals__, {"save_config": MagicMock()}) as g:
+        gui._set_voice_chat(True)
+        g["save_config"].assert_called_once()
+    assert gui._config["voice_chat"] is True
+    engine.set_voice_chat.assert_called_once_with(True)
+    gui._settings_win.set_voice_chat.assert_called_once_with(True)
+    assert gui._engine is engine
+
+
+def test_settings_switch_voice_chat_without_a_new_engine():
+    gui = _gui()
+    engine = gui._engine
+    factory = MagicMock()
+    with patch.dict(gui._on_settings_apply.__globals__,
+                    {"save_config": MagicMock(), "DictationApp": factory}):
+        gui._on_settings_apply({**gui._config, "voice_chat": True})
+    engine.set_voice_chat.assert_called_once_with(True)
+    engine.stop_if_idle.assert_not_called()
+    factory.assert_not_called()
+
+
+def test_rebuilt_engine_starts_voice_chat_itself():
+    gui = _gui()
+    old = gui._engine
+    with patch.dict(gui._on_settings_apply.__globals__,
+                    {"save_config": MagicMock(), "DictationApp": MagicMock(),
+                     "is_model_downloaded": lambda size: True}):
+        gui._on_settings_apply({**gui._config, "voice_chat": True, "hotkey": "ctrl+alt+v"})
+    old.set_voice_chat.assert_not_called()
+
+
+def test_notice_shows_in_the_balloon_without_changing_state():
+    gui = _gui()
+    gui._update_ui(de.AppState.RECORDING, {"notice": "Voice chat ready"})
+    gui._overlay.show_notice.assert_called_once_with("Voice chat ready")
+    gui._overlay.show_recording.assert_not_called()
+    gui._tray.update_state.assert_not_called()

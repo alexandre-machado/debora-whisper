@@ -515,6 +515,11 @@ class OverlayWindow:
         if self._show_balloon and text.strip():
             self._show_balloon_popup(text)
 
+    def show_notice(self, text: str):
+        """A passing message in the balloon; the pill keeps its state."""
+        if self._show_balloon and text.strip():
+            self._show_balloon_popup(text)
+
     def show_error(self):
         """Red dot — error state."""
         self._cancel_timers()

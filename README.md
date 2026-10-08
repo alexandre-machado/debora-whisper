@@ -184,6 +184,12 @@ plays sentence by sentence. The conversation keeps the last 8 turns and starts
 over after 10 minutes of silence. In continuous listening the microphone is
 muted while the reply plays; a hotkey press cuts the reply short.
 
+Switch it on or off while the app runs, from **Voice chat** in the tray menu
+or in Settings: no restart. Switching on starts the TTS server and loads the
+LLM in the background (the overlay says "Voice chat ready"); a sentence spoken
+meanwhile waits for it. Switching off cuts the reply in progress; both stay
+loaded until the app exits, so switching back is instant.
+
 ```json
 {
   "voice_chat": true,
@@ -197,8 +203,13 @@ muted while the reply plays; a hotkey press cuts the reply short.
 }
 ```
 
-The LLM runs inside the app with OpenVINO GenAI, the same runtime as Whisper:
-no LLM server to install. `llm_model` is a Hugging Face repo with an OpenVINO
+The LLM runs with OpenVINO GenAI, the same runtime as Whisper, in a process
+of its own (`npu_whisper/llm_server.py`, started by the app with its own
+Python: nothing to install). Loading it holds Python's GIL for the whole
+compile, which froze the app when it ran inside it. While it compiles on the
+iGPU no transcription runs: both times the two overlapped, the NPU was lost.
+A load that takes over 10 minutes is killed. It logs to
+`~/.npu-dictation/logs/llm_server.log`. `llm_model` is a Hugging Face repo with an OpenVINO
 export (downloaded on first use into the Hugging Face cache) or a local
 directory. On a Core Ultra 9 185H, the default answers in under a second at
 ~15 tokens/s on the Arc iGPU (`"llm_device": "GPU"`); if the device fails it
@@ -233,7 +244,7 @@ Changing the model, device, hotkey, chime, sample rate or maximum recording leng
 | Path | Purpose |
 |------|---------|
 | `~/.npu-dictation/config.json` | User configuration |
-| `~/.npu-dictation/logs/` | `app.log`, `telemetry.log`, `tts_server.log`, all with `[YYYY-MM-DD HH:MM:SS] message` lines; at startup a log over 5 MB moves to `<name>.1` |
+| `~/.npu-dictation/logs/` | `app.log`, `telemetry.log`, `tts_server.log`, `llm_server.log`; the first three with `[YYYY-MM-DD HH:MM:SS] message` lines; at startup a log over 5 MB moves to `<name>.1` |
 | `~/.npu-dictation/npu_lost.json` | An NPU lost to DEVICE_LOST: startup uses the next device and probes the NPU in the background (cleared when a probe passes or Windows restarts) |
 | `~/.npu-dictation/models/` | Downloaded model files |
 | `~/.npu-dictation/ov-cache/` | OpenVINO compilation cache (do not delete) |

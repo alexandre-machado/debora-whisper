@@ -67,6 +67,8 @@ class GUIApp:
             device=config["device"],
             model=config["model_size"],
             hotkey=config["hotkey"],
+            on_voice_chat=self._toggle_voice_chat,
+            voice_chat_on=lambda: bool(self._config.get("voice_chat")),
         )
 
         # Lazy-created windows
@@ -152,6 +154,10 @@ class GUIApp:
 
     def _update_ui(self, state: AppState, data: dict):
         """Update tray icon and overlay from the main thread."""
+        if data.get("notice"):
+            self._overlay.show_notice(data["notice"])
+            self._settings_status(data["notice"], "gray60")
+            return
         state_name = state.value
 
         if state == AppState.LOADING:
@@ -351,6 +357,22 @@ class GUIApp:
         self._config["pos_y"] = pos_y
         save_config(self._config)
 
+    # -- Voice chat --------------------------------------------------------
+
+    def _toggle_voice_chat(self):
+        """Tray item (on the tray's thread)."""
+        self._root.after(0, self._set_voice_chat, not self._config.get("voice_chat"))
+
+    def _set_voice_chat(self, enabled: bool):
+        """Switch voice chat on the running engine; no restart, no rebuild.
+        The LLM loads in its own process, so even a hung load cannot freeze
+        the app."""
+        self._config["voice_chat"] = enabled
+        save_config(self._config)
+        self._engine.set_voice_chat(enabled)
+        if self._settings_win and self._settings_win.is_open:
+            self._settings_win.set_voice_chat(enabled)
+
     # -- Settings ----------------------------------------------------------
 
     def _show_settings(self):
@@ -366,6 +388,8 @@ class GUIApp:
 
     def _on_settings_apply(self, new_config: dict):
         model_changed = new_config["model_size"] != self._config["model_size"]
+        voice_chat = new_config.get("voice_chat", self._config.get("voice_chat"))
+        voice_chat_changed = bool(voice_chat) != bool(self._config.get("voice_chat"))
         rebuild = any(
             new_config.get(key, self._config.get(key)) != self._config.get(key)
             for key in self._REBUILD_KEYS
@@ -390,6 +414,9 @@ class GUIApp:
 
         self._config.update(new_config)
         save_config(self._config)
+        if voice_chat_changed and not (rebuild and not failure):
+            # A rebuilt engine starts voice chat itself; this one switches now.
+            self._engine.set_voice_chat(bool(voice_chat))
 
         # Update balloon settings immediately (no engine restart needed)
         self._overlay.set_show_balloon(self._config.get("show_balloon", True))

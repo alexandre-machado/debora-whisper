@@ -1,0 +1,247 @@
+"""The voice chat's LLM runs in npu_whisper/llm_server.py's process: its
+compile holds the GIL, which froze the app when it ran inside it."""
+import io
+import json
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from npu_whisper import llm_server
+from npu_whisper import voice_chat as vc
+from npu_whisper.dictation_engine import DEFAULT_CONFIG
+
+ROOT = Path(__file__).parent.parent
+
+# openvino_genai stand-in for the real process. FAKE_FAIL_ON: devices that
+# fail to load; FAKE_LOAD_SECONDS: load time; FAKE_TOKEN_SECONDS: per token.
+FAKE_GENAI = '''
+import json, os, time
+
+class StreamingStatus:
+    RUNNING, CANCEL = "RUNNING", "CANCEL"
+
+class GenerationConfig:
+    pass
+
+class _Tokenizer:
+    def apply_chat_template(self, messages, add_generation_prompt, extra_context):
+        return json.dumps([messages, extra_context])
+
+class LLMPipeline:
+    def __init__(self, path, device, **properties):
+        time.sleep(float(os.environ.get("FAKE_LOAD_SECONDS", "0")))
+        if device in os.environ.get("FAKE_FAIL_ON", "").split(","):
+            raise RuntimeError(device + " is not available")
+
+    def get_tokenizer(self):
+        return _Tokenizer()
+
+    def generate(self, prompt, config, streamer):
+        print("native noise on stdout", flush=True)
+        for token in ["Olá", "!", " Tudo", " bem."]:
+            time.sleep(float(os.environ.get("FAKE_TOKEN_SECONDS", "0")))
+            if streamer(token) == "CANCEL":
+                return
+'''
+
+
+# --- The server, in this process ---------------------------------------------
+
+class FakePipeline:
+    fail_on = set()
+
+    def __init__(self, path, device, **properties):
+        if device in self.fail_on:
+            raise RuntimeError(f"{device} is not available")
+        self.path, self.device, self.properties = path, device, properties
+        self.prompts = []
+
+    def get_tokenizer(self):
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.side_effect = \
+            lambda messages, add_generation_prompt, extra_context: json.dumps(
+                [messages, extra_context])
+        return tokenizer
+
+    def generate(self, prompt, config, streamer):
+        self.prompts.append((prompt, config))
+        for token in ["Olá", "!", " Tudo", " bem."]:
+            if streamer(token) == "CANCEL":
+                return
+
+
+@pytest.fixture
+def genai(monkeypatch):
+    module = MagicMock()
+    module.LLMPipeline = FakePipeline
+    module.StreamingStatus.CANCEL, module.StreamingStatus.RUNNING = "CANCEL", "RUNNING"
+    monkeypatch.setitem(sys.modules, "openvino_genai", module)
+    FakePipeline.fail_on = set()
+    return module
+
+
+def _serve(*requests):
+    out = io.StringIO()
+    stdin = io.StringIO("".join(json.dumps(r) + "\n" for r in requests))
+    code = llm_server.serve("model", "GPU", "cache", stdin, out)
+    time.sleep(0.2)  # the worker answers after stdin is read
+    return code, [json.loads(line) for line in out.getvalue().splitlines()]
+
+
+def test_server_says_where_it_loaded_and_streams_the_reply(genai):
+    code, out = _serve({"id": 1, "messages": [{"role": "user", "content": "oi"}],
+                        "max_new_tokens": 400})
+    assert code == 0
+    assert out[0]["ready"] == "GPU"
+    assert [m["text"] for m in out if "text" in m] == ["Olá", "!", " Tudo", " bem."]
+    assert out[-1] == {"id": 1, "done": True}
+
+
+def test_server_templates_without_thinking(genai):
+    pipes = []
+    genai.LLMPipeline = lambda *a, **k: pipes.append(FakePipeline(*a, **k)) or pipes[-1]
+    _serve({"id": 1, "messages": [], "max_new_tokens": 400})
+    prompt, config = pipes[0].prompts[0]
+    assert json.loads(prompt)[1] == {"enable_thinking": False}
+    assert config.max_new_tokens == 400
+    assert config.apply_chat_template is False  # already templated
+    assert pipes[0].properties == {"CACHE_DIR": "cache"}
+
+
+def test_server_falls_back_to_the_cpu(genai):
+    FakePipeline.fail_on = {"GPU"}
+    _, out = _serve()
+    assert out[0] == {"log": "cannot load the LLM on GPU: GPU is not available"}
+    assert out[1]["ready"] == "CPU"
+
+
+def test_server_that_loads_nowhere_says_why_and_exits(genai):
+    FakePipeline.fail_on = {"GPU", "CPU"}
+    code, out = _serve()
+    assert code == 1
+    assert out[-1] == {"failed": "GPU: GPU is not available; CPU: CPU is not available"}
+
+
+def test_cancelled_reply_stops(genai):
+    cancelled, out = threading.Event(), []
+    cancelled.set()
+    llm_server.generate(FakePipeline("m", "GPU"), {"id": 3, "messages": [],
+                                                   "max_new_tokens": 9},
+                        cancelled, out.append)
+    assert out == [{"id": 3, "done": True}]
+
+
+# --- The client, with a real process -------------------------------------------
+
+@pytest.fixture
+def llm(monkeypatch, tmp_path):
+    """A real llm_server process over the fake openvino_genai."""
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "openvino_genai.py").write_text(FAKE_GENAI, encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(fake), str(ROOT)]))
+    for name in ("FAKE_FAIL_ON", "FAKE_LOAD_SECONDS", "FAKE_TOKEN_SECONDS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(vc, "_llm", None)
+    monkeypatch.setattr(vc.paths, "CACHE_DIR", tmp_path / "cache")
+    (tmp_path / "model").mkdir()
+    logs = []
+    yield {**DEFAULT_CONFIG, "llm_model": str(tmp_path / "model")}, logs
+    vc.stop_llm()
+
+
+def _reply(config, logs, stop=None):
+    out = []
+    vc.generate_reply([{"role": "user", "content": "oi"}], config, out.append,
+                      stop or threading.Event(), log=logs.append)
+    return out
+
+
+def test_reply_streams_from_the_llm_process(llm):
+    config, logs = llm
+    assert "".join(_reply(config, logs)) == "Olá! Tudo bem."
+    assert vc._llm.device == "GPU"
+    assert vc._llm.process.pid != os.getpid()
+    assert any("loaded on GPU" in m for m in logs)
+    # Native output on stdout goes to the log file, never into a reply.
+    assert "Voice chat: LLM process: native noise on stdout" not in logs
+
+
+def test_one_process_serves_every_reply(llm):
+    config, logs = llm
+    _reply(config, logs)
+    first = vc._llm
+    assert "".join(_reply(config, logs)) == "Olá! Tudo bem."
+    assert vc._llm is first
+    assert vc.llm_loaded(config)
+
+
+def test_llm_falls_back_to_the_cpu(llm, monkeypatch):
+    config, logs = llm
+    monkeypatch.setenv("FAKE_FAIL_ON", "GPU")
+    _reply(config, logs)
+    assert vc._llm.device == "CPU"
+
+
+def test_llm_that_loads_nowhere_fails_the_reply(llm, monkeypatch):
+    config, logs = llm
+    monkeypatch.setenv("FAKE_FAIL_ON", "GPU,CPU")
+    with pytest.raises(RuntimeError, match="CPU is not available"):
+        _reply(config, logs)
+    assert not vc.llm_loaded(config)
+
+
+def test_stop_cancels_the_reply(llm, monkeypatch):
+    config, logs = llm
+    monkeypatch.setenv("FAKE_TOKEN_SECONDS", "0.3")
+    stop, out = threading.Event(), []
+    vc.generate_reply([], config, lambda t: out.append(t) or stop.set(), stop,
+                      log=logs.append)
+    assert out == ["Olá"]
+    # The process is still there for the next reply.
+    monkeypatch.setenv("FAKE_TOKEN_SECONDS", "0")
+    assert vc._llm.running
+
+
+def test_stop_while_loading_returns_at_once(llm, monkeypatch):
+    config, logs = llm
+    monkeypatch.setenv("FAKE_LOAD_SECONDS", "30")
+    stop = threading.Event()
+    threading.Timer(0.5, stop.set).start()
+    start = time.time()
+    assert _reply(config, logs, stop) == []
+    assert time.time() - start < 5
+
+
+def test_hung_load_is_killed(llm, monkeypatch):
+    config, logs = llm
+    monkeypatch.setenv("FAKE_LOAD_SECONDS", "60")
+    process = vc.start_llm(config, logs.append)
+    with pytest.raises(RuntimeError, match="did not load in 1s; process killed"):
+        process.wait_loaded(timeout=1)
+    process.process.wait(10)
+    assert not process.running
+
+
+def test_crashed_process_is_started_again(llm):
+    config, logs = llm
+    _reply(config, logs)
+    first = vc._llm
+    from npu_whisper.processes import kill_tree
+    kill_tree(first.process)
+    first.process.wait(10)
+    assert "".join(_reply(config, logs)) == "Olá! Tudo bem."
+    assert vc._llm is not first
+
+
+def test_process_exits_when_the_app_closes_its_stdin(llm):
+    config, logs = llm
+    _reply(config, logs)
+    process = vc._llm.process
+    vc.stop_llm()
+    assert process.poll() is not None

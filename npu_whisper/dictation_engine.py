@@ -18,7 +18,8 @@ from pathlib import Path
 from datetime import datetime
 
 from npu_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
-from npu_whisper.voice_chat import VoiceChat, is_http_url, warm_up
+from npu_whisper.voice_chat import (VoiceChat, download_llm, ensure_tts_server, is_http_url,
+                                    llm_loaded, load_llm)
 
 # Disable HuggingFace symlinks on Windows to avoid WinError 1314
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
@@ -29,6 +30,7 @@ os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 LOG_FILE = LOG_DIR / "app.log"
 TELEMETRY_LOG = LOG_DIR / "telemetry.log"
 TTS_SERVER_LOG = LOG_DIR / "tts_server.log"
+LLM_SERVER_LOG = LOG_DIR / "llm_server.log"
 # At startup a larger log moves to <name>.1, replacing the previous one.
 LOG_MAX_BYTES = 5_000_000
 # An NPU lost to DEVICE_LOST, until a recovery probe or a reboot (npu_lost_this_boot).
@@ -228,7 +230,7 @@ def log(msg: str):
 
 def rotate_logs():
     """Keep each log under LOG_MAX_BYTES plus one older file."""
-    for path in (LOG_FILE, TELEMETRY_LOG, TTS_SERVER_LOG):
+    for path in (LOG_FILE, TELEMETRY_LOG, TTS_SERVER_LOG, LLM_SERVER_LOG):
         try:
             if path.stat().st_size > LOG_MAX_BYTES:
                 os.replace(path, path.with_name(path.name + ".1"))
@@ -420,6 +422,11 @@ class RestartRequiredError(RuntimeError):
 
 _device_failure_lock = threading.Lock()
 _device_failure: dict | None = None
+
+# Held by a transcription and by the LLM's compile (in its own process, on
+# the Arc iGPU): both times that compile overlapped an NPU inference, the
+# NPU was lost. Process-wide, so an engine rebuilt by Settings honours it.
+_inference_gate = threading.Lock()
 
 
 def _exception_chain(exc: BaseException):
@@ -2313,7 +2320,9 @@ class DictationApp:
         # Live draft already typed into the target, guarded by _output_lock.
         self._draft_typed_text = ""
         self._draft_target = None
-        self.voice_chat = VoiceChat(config, log=log, tts_log_path=TTS_SERVER_LOG)
+        self.voice_chat = VoiceChat(config, log=log, tts_log_path=TTS_SERVER_LOG,
+                                    llm_log_path=LLM_SERVER_LOG)
+        self._voice_chat_loading = threading.Lock()
 
         self._resource_thread = threading.Thread(target=self._monitor_resources, daemon=True)
         self._resource_thread.start()
@@ -2707,13 +2716,19 @@ class DictationApp:
                         f"Model not ready after {self.MODEL_WAIT_SECONDS}s; "
                         f"recording discarded")
                 ensure_devices_usable()
-                with self._model_lock:
-                    self.ensure_model()
-                    text = self.whisper.transcribe(
-                        audio,
-                        sample_rate=self.config["sample_rate"],
-                        language=self.config["language"],
-                    )
+                if not _inference_gate.acquire(blocking=False):
+                    log("Waiting for the LLM to load before transcribing...")
+                    _inference_gate.acquire()
+                try:
+                    with self._model_lock:
+                        self.ensure_model()
+                        text = self.whisper.transcribe(
+                            audio,
+                            sample_rate=self.config["sample_rate"],
+                            language=self.config["language"],
+                        )
+                finally:
+                    _inference_gate.release()
                 t_lower = text.strip().lower()
                 hallucinations = {"obrigado.", "obrigada.", "obrigado", "obrigada", "obrigado!", "obrigada!", "obrigado por assistir.", "obrigada por assistir.", 
 "thank you.", "thank you", "thanks for watching.", "obrigado por assistir"}
@@ -2844,6 +2859,10 @@ class DictationApp:
         if self._stopping.is_set():
             return
         log(f"Voice chat: {text!r}")
+        # Voice chat was switched on mid-sentence: what was typed of it as
+        # dictation goes, the sentence goes to the LLM instead.
+        with self._output_lock:
+            self._forget_draft_locked(erase=True)
         self._set_state(AppState.PROCESSING)
         # The microphone must not hear the reply.
         self.recorder.set_muted(True)
@@ -3070,13 +3089,64 @@ class DictationApp:
         log("Loading model in background (first time may take several minutes)...")
         self._start_loader()
         if self.config.get("voice_chat"):
-            # The TTS server (its own process, on the RTX) starts now; the
-            # LLM waits for the speech model: both times its compile on the
-            # iGPU overlapped the NPU's warmup inference, the NPU was lost.
-            threading.Thread(target=warm_up, daemon=True,
-                             args=(self.config, log, TTS_SERVER_LOG,
-                                   self._wait_speech_model)).start()
+            self._warm_up_voice_chat()
         self._start_segment_consumer()
+
+    def set_voice_chat(self, enabled: bool):
+        """Switch voice chat while running. On: the TTS server and the LLM
+        load in the background. Off: the reply in progress stops. Both stay
+        loaded either way, so switching back is instant."""
+        self.config["voice_chat"] = bool(enabled)
+        if enabled:
+            log("Voice chat on.")
+            self._warm_up_voice_chat()
+        else:
+            log("Voice chat off: dictation types again.")
+            self.voice_chat.interrupt()
+            self.voice_chat.reset()
+
+    def _warm_up_voice_chat(self):
+        """Start the TTS server and load the LLM ahead of the first reply,
+        in the background (the caller may be the Tk thread)."""
+        threading.Thread(target=self._load_voice_chat, daemon=True).start()
+
+    def _load_voice_chat(self):
+        if not self._voice_chat_loading.acquire(blocking=False):
+            return  # already loading
+        try:
+            # The TTS server (its own process, on the RTX) starts now.
+            ensure_tts_server(self.config, log, TTS_SERVER_LOG)
+            if llm_loaded(self.config):
+                self._notice("Voice chat ready")
+                return
+            self._notice("Voice chat: loading the LLM...")
+            # The LLM waits for the speech model's warmup inference, then
+            # keeps every transcription waiting while it compiles.
+            if not self._wait_speech_model():
+                return
+            download_llm(self.config, log)  # a first download takes minutes: not gated
+            with _inference_gate:
+                if load_llm(self.config, log, LLM_SERVER_LOG, stop=self._stopping) is None:
+                    return
+            if self.config.get("voice_chat"):
+                self._notice("Voice chat ready")
+                if self.config["beep_on_start"]:
+                    self.chimes.play('start')
+        except Exception as e:
+            log(f"Voice chat: LLM not available ({e})")
+            self._notice("Voice chat: the LLM did not load (see app.log)")
+        finally:
+            self._voice_chat_loading.release()
+
+    def _notice(self, text: str):
+        """A passing message for the user; the state does not change."""
+        if self._stopping.is_set():
+            return
+        for cb in self._callbacks:
+            try:
+                cb(self._state, {"notice": text})
+            except Exception:
+                pass
 
     def _wait_speech_model(self) -> bool:
         """Block until the speech model is ready (or failed); False if the

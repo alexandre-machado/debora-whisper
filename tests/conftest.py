@@ -19,6 +19,7 @@ def _private_logs(tmp_path_factory):
     engine.LOG_FILE = engine.LOG_DIR / "app.log"
     engine.TELEMETRY_LOG = engine.LOG_DIR / "telemetry.log"
     engine.TTS_SERVER_LOG = engine.LOG_DIR / "tts_server.log"
+    engine.LLM_SERVER_LOG = engine.LOG_DIR / "llm_server.log"
     engine.NPU_LOST_FILE = home / "npu_lost.json"
 
 

@@ -1,5 +1,5 @@
 """Voice chat: each final transcription goes to a local LLM (OpenVINO GenAI,
-in this process) and its reply is spoken aloud by the Chatterbox TTS server
+in npu_whisper/llm_server.py's process) and its reply is spoken aloud by the Chatterbox TTS server
 (npu_whisper/tts_server.py, in its own uv environment).
 
 The reply is streamed and spoken sentence by sentence: the first sentence
@@ -24,6 +24,7 @@ import wave
 from pathlib import Path
 
 from npu_whisper import paths
+from npu_whisper.processes import NO_WINDOW, kill_tree, python_executable
 
 DEFAULT_VOICE_CHAT_PROMPT = (
     "You are a voice assistant. The user talks to you through a speech "
@@ -77,11 +78,10 @@ def split_sentences(buffer: str) -> tuple[list[str], str]:
 
 
 # ---------------------------------------------------------------------------
-# LLM (OpenVINO GenAI)
+# LLM (OpenVINO GenAI, in npu_whisper/llm_server.py's process)
 # ---------------------------------------------------------------------------
-_llm_lock = threading.Lock()
-_generate_lock = threading.Lock()
-_llm = None  # ((model, device), LLMPipeline): one per process, kept across engine rebuilds
+# A first compile on the Arc iGPU, without the cache, can take minutes.
+LLM_LOAD_TIMEOUT = 600
 
 
 def _model_path(model: str, log) -> str:
@@ -95,63 +95,185 @@ def _model_path(model: str, log) -> str:
         return snapshot_download(model)
 
 
-def load_llm(config: dict, log=print):
-    """The LLMPipeline for llm_model on llm_device (CPU if that fails),
-    loaded once and reused."""
+def download_llm(config: dict, log=print) -> str:
+    """The local directory of llm_model, downloaded on first use."""
+    return _model_path(config["llm_model"], log)
+
+
+def llm_command(model_dir: str, device: str) -> list[str]:
+    return [python_executable(), "-m", "npu_whisper.llm_server", model_dir, device,
+            str(paths.CACHE_DIR)]
+
+
+class LLMProcess:
+    """llm_server.py running one model; replies stream back over its stdout."""
+
+    def __init__(self, key, command: list[str], log=print, log_path=None):
+        self.key, self.log = key, log
+        self.device: str | None = None
+        self.error: str | None = None
+        self.loaded = threading.Event()  # ready, failed or exited
+        self._replies: dict[int, queue.Queue] = {}
+        self._next_id = 0
+        self._send_lock = threading.Lock()
+        output = open(log_path, "ab") if log_path else subprocess.DEVNULL
+        try:
+            self.process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=output,
+                encoding="utf-8", errors="replace", bufsize=1,
+                env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"},
+                creationflags=NO_WINDOW)
+        finally:
+            if log_path:
+                output.close()
+        self._start = time.time()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    @property
+    def running(self) -> bool:
+        return self.process.poll() is None and self.error is None
+
+    def _read(self):
+        for line in self.process.stdout:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                message = None
+            if not isinstance(message, dict):
+                if line.strip():
+                    self.log(f"Voice chat: LLM process: {line.strip()}")
+            elif "log" in message:
+                self.log(f"Voice chat: {message['log']}")
+            elif "ready" in message:
+                self.device = message["ready"]
+                self.log(f"Voice chat: {self.key[0]} loaded on {self.device} in "
+                         f"{time.time() - self._start:.1f}s (process {self.process.pid})")
+                self.loaded.set()
+            elif "failed" in message:
+                self.error = message["failed"]
+            elif (replies := self._replies.get(message.get("id"))) is not None:
+                replies.put(message)
+        code = self.process.wait()
+        if self.error is None:
+            self.error = f"the LLM process exited (code {code})"
+        self.loaded.set()
+        for replies in list(self._replies.values()):
+            replies.put({"error": self.error})
+
+    def wait_loaded(self, stop: threading.Event | None = None,
+                    timeout=LLM_LOAD_TIMEOUT) -> bool:
+        """True once loaded, False if stop was set first; raises if it
+        failed or took longer than timeout (then it is killed)."""
+        deadline = time.time() + timeout
+        while not self.loaded.wait(0.2):
+            if stop is not None and stop.is_set():
+                return False
+            if time.time() > deadline:
+                self.error = f"the LLM did not load in {timeout}s; process killed"
+                kill_tree(self.process)
+                raise RuntimeError(self.error)
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        return True
+
+    def _send(self, message: dict):
+        try:
+            with self._send_lock:
+                self.process.stdin.write(json.dumps(message) + "\n")
+                self.process.stdin.flush()
+        except (OSError, ValueError):
+            raise RuntimeError(self.error or "the LLM process is gone") from None
+
+    def generate(self, messages: list[dict], on_text, stop: threading.Event):
+        """Stream the reply into on_text(chunk) until it ends or stop is set."""
+        with self._send_lock:
+            self._next_id += 1
+            rid = self._next_id
+        replies = self._replies[rid] = queue.Queue()
+        try:
+            self._send({"id": rid, "messages": messages, "max_new_tokens": LLM_MAX_TOKENS})
+            while True:
+                try:
+                    message = replies.get(timeout=0.1)
+                except queue.Empty:
+                    message = None
+                if stop.is_set():
+                    # The process drops the rest at its next token.
+                    self._send({"cancel": rid})
+                    return
+                if message is None:
+                    continue
+                if "error" in message:
+                    raise RuntimeError(message["error"])
+                if message.get("done"):
+                    return
+                on_text(message["text"])
+        finally:
+            self._replies.pop(rid, None)
+
+    def stop(self):
+        """Close its stdin (it exits on its own), else kill it."""
+        try:
+            self.process.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.process.wait(5)
+        except subprocess.TimeoutExpired:
+            kill_tree(self.process)
+
+
+_llm_lock = threading.Lock()
+_llm: LLMProcess | None = None  # one per app process, kept across engine rebuilds
+
+
+def start_llm(config: dict, log=print, log_path=None) -> LLMProcess:
+    """The process serving llm_model on llm_device, started unless one
+    already runs (or loads) it."""
     global _llm
     key = (config["llm_model"], config["llm_device"])
     with _llm_lock:
-        if _llm is not None and _llm[0] == key:
-            return _llm[1]
-        import openvino_genai as ov_genai
-        path = _model_path(config["llm_model"], log)
+        if _llm is not None and _llm.key == key and _llm.running:
+            return _llm
+        if _llm is not None:
+            _llm.stop()
+        path = download_llm(config, log)
         paths.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        errors = []
-        for device in dict.fromkeys([config["llm_device"], "CPU"]):
-            start = time.time()
-            try:
-                pipe = ov_genai.LLMPipeline(path, device, CACHE_DIR=str(paths.CACHE_DIR))
-            except Exception as e:
-                errors.append(f"{device}: {str(e).splitlines()[0] if str(e) else e}")
-                log(f"Voice chat: cannot load the LLM on {device} ({errors[-1]})")
-                continue
-            log(f"Voice chat: {config['llm_model']} loaded on {device} "
-                f"in {time.time() - start:.1f}s")
-            _llm = (key, pipe)
-            return pipe
-        raise RuntimeError("; ".join(errors))
+        _llm = LLMProcess(key, llm_command(path, config["llm_device"]), log, log_path)
+        atexit.register(stop_llm)
+        log(f"Voice chat: loading {config['llm_model']} on {config['llm_device']} "
+            f"in a separate process (pid {_llm.process.pid})")
+        return _llm
+
+
+def llm_loaded(config: dict) -> bool:
+    """The LLM for config is loaded and its process still running."""
+    llm = _llm
+    return (llm is not None and llm.key == (config["llm_model"], config["llm_device"])
+            and llm.running and llm.loaded.is_set())
+
+
+def load_llm(config: dict, log=print, log_path=None, stop=None) -> "LLMProcess | None":
+    """start_llm, then wait until it has loaded (None if stop was set first)."""
+    llm = start_llm(config, log, log_path)
+    return llm if llm.wait_loaded(stop) else None
+
+
+def stop_llm():
+    global _llm
+    with _llm_lock:
+        llm, _llm = _llm, None
+    if llm is not None:
+        llm.stop()
 
 
 def generate_reply(messages: list[dict], config: dict, on_text, stop: threading.Event,
-                   log=print):
+                   log=print, log_path=None):
     """Stream the reply to messages into on_text(chunk) until it ends or stop
     is set."""
-    import openvino_genai as ov_genai
-    pipe = load_llm(config, log)
-    # Qwen3's template turns thinking off with enable_thinking; other
-    # templates ignore the variable.
-    prompt = pipe.get_tokenizer().apply_chat_template(
-        messages, add_generation_prompt=True, extra_context={"enable_thinking": False})
-    generation = ov_genai.GenerationConfig()
-    # The prompt is already templated: a second pass would wrap it as a
-    # user message, and Qwen3 would think aloud again.
-    generation.apply_chat_template = False
-    generation.max_new_tokens = LLM_MAX_TOKENS
-    generation.do_sample = True
-    generation.temperature = 0.7
-    generation.top_p = 0.8
-    generation.top_k = 20
-
-    def streamer(chunk):
-        if stop.is_set():
-            return ov_genai.StreamingStatus.CANCEL
-        on_text(chunk)
-        return ov_genai.StreamingStatus.RUNNING
-
-    # A pipeline runs one generation at a time; a cancelled one ends at its
-    # next token.
-    with _generate_lock:
-        pipe.generate(prompt, generation, streamer)
+    llm = load_llm(config, log, log_path, stop)
+    if llm is not None:
+        llm.generate(messages, on_text, stop)
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +388,7 @@ def ensure_tts_server(config: dict, log=print, log_path=None):
             _tts_process = subprocess.Popen(
                 command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                 env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"},
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                creationflags=NO_WINDOW)
         except Exception as e:
             log(f"Voice chat: cannot start the TTS server ({e})")
             return
@@ -297,31 +419,15 @@ def stop_tts_server():
     global _tts_process
     with _tts_lock:
         process, _tts_process = _tts_process, None
-    if process is None or process.poll() is not None:
+    if process is None:
         return
-    if sys.platform == "win32":
-        # uv runs the server as a child process: end the whole tree, or the
-        # server keeps its GPU memory after uv is gone.
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
-                       capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-    else:
-        process.terminate()
+    # uv runs the server as a child process: end the whole tree, or the
+    # server keeps its GPU memory after uv is gone.
+    kill_tree(process)
     try:
         process.wait(5)
     except subprocess.TimeoutExpired:
         process.kill()
-
-
-def warm_up(config: dict, log=print, tts_log_path=None, before_llm=None):
-    """Start the TTS server and load the LLM ahead of the first reply.
-    before_llm() runs first and returns False to skip the LLM."""
-    ensure_tts_server(config, log, tts_log_path)
-    if before_llm is not None and not before_llm():
-        return
-    try:
-        load_llm(config, log)
-    except Exception as e:
-        log(f"Voice chat: LLM not available ({e})")
 
 
 # ---------------------------------------------------------------------------
@@ -334,13 +440,14 @@ class VoiceChat:
     called); it is meant to run on the engine's transcription thread.
     llm(messages, on_text, stop) replaces the OpenVINO model (tests)."""
 
-    def __init__(self, config: dict, log=print, play=None, tts_log_path=None, llm=None):
+    def __init__(self, config: dict, log=print, play=None, tts_log_path=None, llm=None,
+                 llm_log_path=None):
         self.config = config
         self.log = log
         self.tts_log_path = tts_log_path
         self._play = play or _play_interruptible
-        self._llm = llm or (lambda messages, on_text, stop:
-                            generate_reply(messages, self.config, on_text, stop, self.log))
+        self._llm = llm or (lambda messages, on_text, stop: generate_reply(
+            messages, self.config, on_text, stop, self.log, llm_log_path))
         self._history: list[dict] = []
         self._last_turn = 0.0
         self._interrupt = threading.Event()
