@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from npu_whisper.dictation_engine import AudioRecorder, NeuralVAD
+from debora_whisper.dictation_engine import AudioRecorder, NeuralVAD
 
 
 class FakeSession:

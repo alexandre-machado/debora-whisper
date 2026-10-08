@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    NPU Dictation Engine - PowerShell Launcher
-    Local voice-to-text powered by Intel NPU via OpenVINO + Whisper
+    Debora Whisper - PowerShell Launcher
+    Local voice-to-text on Intel NPU, GPU, NVIDIA CUDA or CPU
 
 .DESCRIPTION
-    Runs a local dictation app that uses your Intel NPU to transcribe speech.
+    Runs a local dictation app that transcribes speech on your own hardware.
     Press Ctrl+Alt+D (configurable) to toggle recording.
     Transcribed text is typed into the active window.
 
@@ -42,10 +42,18 @@ param(
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PyProjectPath = Join-Path $ScriptDir "pyproject.toml"
-# `python -m npu_whisper` must resolve to this checkout even from another cwd,
+# `python -m debora_whisper` must resolve to this checkout even from another cwd,
 # a venv created before the package layout, or the system-Python fallback.
 $env:PYTHONPATH = if ($env:PYTHONPATH) { "$ScriptDir;$env:PYTHONPATH" } else { $ScriptDir }
-$VenvDir = Join-Path (Join-Path $env:USERPROFILE ".npu-dictation") "venv"
+$AppDir = Join-Path $env:USERPROFILE ".debora"
+# Before the rename to Debora Whisper the folder was ~/.npu-dictation. Move it
+# here, before the venv check; the app moves it too, but only once it runs.
+$LegacyAppDir = Join-Path $env:USERPROFILE ".npu-dictation"
+if ((Test-Path $LegacyAppDir) -and -not (Test-Path $AppDir)) {
+    try { Move-Item -LiteralPath $LegacyAppDir -Destination $AppDir }
+    catch { $AppDir = $LegacyAppDir }  # in use by an older copy of the app
+}
+$VenvDir = Join-Path $AppDir "venv"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -53,8 +61,8 @@ $VenvDir = Join-Path (Join-Path $env:USERPROFILE ".npu-dictation") "venv"
 function Write-Banner {
     Write-Host ""
     Write-Host "  ╔══════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "  ║   NPU Dictation Engine               ║" -ForegroundColor Cyan
-    Write-Host "  ║   Local Whisper on Intel NPU         ║" -ForegroundColor Cyan
+    Write-Host "  ║   Debora Whisper                     ║" -ForegroundColor Cyan
+    Write-Host "  ║   Local voice dictation              ║" -ForegroundColor Cyan
     Write-Host "  ╚══════════════════════════════════════╝" -ForegroundColor Cyan
     Write-Host ""
 }
@@ -157,7 +165,7 @@ function Invoke-Setup {
 
     # 3. Install project dependencies
     Write-Host ""
-    Write-Host "Step 3: Installing npu-whisper and its dependencies..." -ForegroundColor Yellow
+    Write-Host "Step 3: Installing debora-whisper and its dependencies..." -ForegroundColor Yellow
     if (-not (Test-Path $PyProjectPath)) {
         Write-Host "  ERROR: pyproject.toml not found at $PyProjectPath" -ForegroundColor Red
         exit 1
@@ -187,7 +195,7 @@ function Invoke-Setup {
     Write-Host "  This will take several minutes on first run." -ForegroundColor Yellow
     Write-Host ""
     
-    & $venvPython -m npu_whisper.dictation_engine --setup
+    & $venvPython -m debora_whisper.dictation_engine --setup
 
     Write-Host ""
     Write-Host "Setup complete! Start dictating with:" -ForegroundColor Green
@@ -216,7 +224,7 @@ function Start-Dictation {
     if ($Continuous){ $engineArgs += "--continuous" }
 
     # Check if model is set up
-    $configFile = Join-Path (Join-Path $env:USERPROFILE ".npu-dictation") "config.json"
+    $configFile = Join-Path $AppDir "config.json"
     if (-not (Test-Path $configFile)) {
         Write-Host "First-time setup required. Running setup..." -ForegroundColor Yellow
         Write-Host ""
@@ -234,9 +242,9 @@ function Start-Dictation {
 
     # Launch engine: GUI mode by default, -CLI for console-only mode
     if ($CLI) {
-        & $python -m npu_whisper.dictation_engine @engineArgs
+        & $python -m debora_whisper.dictation_engine @engineArgs
     } else {
-        & $python -m npu_whisper @engineArgs
+        & $python -m debora_whisper @engineArgs
     }
 }
 

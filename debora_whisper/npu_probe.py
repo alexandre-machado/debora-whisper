@@ -5,7 +5,7 @@ GIL: inside the app that froze everything (tray, hotkey, Ctrl+C), and nothing
 in the process could cancel it. Here the app waits with a timeout and kills
 this process if it hangs.
 
-    python -m npu_whisper.npu_probe <model_path> <backend> <model_size> <language> <sample_rate>
+    python -m debora_whisper.npu_probe <model_path> <backend> <model_size> <language> <sample_rate>
 
 Exit code 0: the model loaded on the NPU and transcribed half a second of
 silence. Otherwise the last line of output says why.
@@ -20,7 +20,7 @@ NPU_PROBE_TIMEOUT = 300
 
 def run(model_path: str, backend: str, model_size: str, language: str, sample_rate: int) -> int:
     import numpy as np
-    from npu_whisper.dictation_engine import create_model
+    from debora_whisper.dictation_engine import create_model
     try:
         model = create_model(Path(model_path), device="NPU", backend=backend, model_size=model_size)
         # Loaders fall back silently on benign errors, so loading is not
@@ -37,16 +37,16 @@ def run(model_path: str, backend: str, model_size: str, language: str, sample_ra
 
 
 def probe_command(config: dict, model_path) -> list[str]:
-    from npu_whisper.dictation_engine import MODEL_REGISTRY
-    from npu_whisper.processes import python_executable
-    return [python_executable(), "-m", "npu_whisper.npu_probe", str(model_path),
+    from debora_whisper.dictation_engine import MODEL_REGISTRY
+    from debora_whisper.processes import python_executable
+    return [python_executable(), "-m", "debora_whisper.npu_probe", str(model_path),
             MODEL_REGISTRY[config["model_size"]]["backend"], config["model_size"],
             config.get("language", "en"), str(config["sample_rate"])]
 
 
 def probe_npu(config: dict, model_path, timeout=NPU_PROBE_TIMEOUT, command=None):
     """Return if the NPU runs the model again; raise RuntimeError otherwise."""
-    from npu_whisper.processes import NO_WINDOW, kill_tree
+    from debora_whisper.processes import NO_WINDOW, kill_tree
     process = subprocess.Popen(
         command or probe_command(config, model_path),
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

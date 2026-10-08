@@ -1,10 +1,14 @@
 """Shared fixtures for dictation engine tests."""
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
-# Add project root to path so we can import npu_whisper
+# Importing the package must never move the user's pre-rename folders.
+os.environ["DEBORA_WHISPER_NO_MIGRATION"] = "1"
+
+# Add project root to path so we can import debora_whisper
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
@@ -13,8 +17,8 @@ def _private_logs(tmp_path_factory):
     """Tests log to a temporary folder, never to the user's app.log, and
     never record a lost NPU for the real app. Not restored afterwards: daemon
     threads of finished tests may still log."""
-    from npu_whisper import dictation_engine as engine
-    home = tmp_path_factory.mktemp("npu-dictation")
+    from debora_whisper import dictation_engine as engine
+    home = tmp_path_factory.mktemp("debora")
     engine.LOG_DIR = home / "logs"
     engine.LOG_FILE = engine.LOG_DIR / "app.log"
     engine.TELEMETRY_LOG = engine.LOG_DIR / "telemetry.log"
@@ -25,14 +29,14 @@ def _private_logs(tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def _no_npu_loss_record():
-    from npu_whisper import dictation_engine as engine
+    from debora_whisper import dictation_engine as engine
     engine.NPU_LOST_FILE.unlink(missing_ok=True)
 
 
 @pytest.fixture(autouse=True)
 def _reset_device_failure_latch():
     """The fatal device latch is process-wide; isolate it per test."""
-    from npu_whisper import dictation_engine
+    from debora_whisper import dictation_engine
     dictation_engine._reset_device_failure_for_tests()
     yield
     dictation_engine._reset_device_failure_for_tests()

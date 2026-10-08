@@ -7,7 +7,7 @@ import time
 import tkinter as tk
 from collections import deque
 
-from npu_whisper.ui.glass import (
+from debora_whisper.ui.glass import (
     TRANSPARENT_COLOR, PillCache, composite_on_transparent, pil_to_photo,
     render_button, render_dot, render_icon_mic, render_icon_stop,
     render_waveform, render_pill, _hex_to_rgba,
@@ -170,7 +170,7 @@ class OverlayWindow:
         s = self._scale
         if s not in getattr(self, "_btn_cache", {}):
             if not hasattr(self, "_btn_cache"): self._btn_cache = {}
-            from npu_whisper.ui.glass import render_icon_mic, render_button
+            from debora_whisper.ui.glass import render_icon_mic, render_button
             icon = render_icon_mic(max(1, int(12 * s)), self.GREEN)
             self._btn_cache[s] = render_button(max(1, int(24 * s)), self.GREEN, "#1B3A20", icon)
         return self._btn_cache[s]
@@ -180,7 +180,7 @@ class OverlayWindow:
         k = f"stop_{s}"
         if k not in getattr(self, "_btn_cache", {}):
             if not hasattr(self, "_btn_cache"): self._btn_cache = {}
-            from npu_whisper.ui.glass import render_icon_stop, render_button
+            from debora_whisper.ui.glass import render_icon_stop, render_button
             icon = render_icon_stop(max(1, int(10 * s)), self.VIOLET)
             self._btn_cache[k] = render_button(max(1, int(24 * s)), self.VIOLET, "#2E1A47", icon)
         return self._btn_cache[k]

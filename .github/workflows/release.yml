@@ -26,7 +26,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}  # via env, never interpolated into the script
         run: |
-          $version = (Select-String -Path npu_whisper/__init__.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
+          $version = (Select-String -Path debora_whisper/__init__.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
           if ("v$version" -ne $env:TAG) {
             Write-Error "Tag $env:TAG does not match __version__ $version"
             exit 1
@@ -39,9 +39,9 @@ jobs:
         shell: pwsh
         run: |
           uv tool install --python 3.12 (Get-ChildItem dist/*.whl).FullName
-          npu-whisper-cli --help
+          debora-cli --help
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          npu-whisper --help
+          debora --help
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Upload dist
@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/npu-whisper
+      url: https://pypi.org/p/debora-whisper
     permissions:
       id-token: write  # trusted publishing; no API token is stored
     steps:

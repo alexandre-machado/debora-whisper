@@ -1,28 +1,29 @@
-"""GUI orchestrator for NPU Dictation Engine.
+"""GUI orchestrator for Débora Whisper.
 
 Entry point for tray-icon mode. Wires the engine, system tray, overlay,
 settings dialog, onboarding wizard, and transcription history together.
 
 Usage:
-    npu-whisper [--device NPU|GPU|CPU] [--model base|small|medium|turbo|parakeet]
+    debora [--device NPU|GPU|CPU] [--model base|small|medium|turbo|parakeet]
 """
 
 import sys
 import argparse
 import customtkinter as ctk
 
-from npu_whisper.dictation_engine import (
+from debora_whisper.dictation_engine import (
     AppState, DictationApp, MODEL_REGISTRY,
     load_config, save_config, validate_config, log, create_model,
     is_model_downloaded, device_failure,
-    apply_device_priority, avoid_lost_npu, detect_devices, rotate_logs, select_device,
+    apply_device_priority, avoid_lost_npu, detect_devices, rotate_logs, log_folder_moves,
+    select_device,
 )
-from npu_whisper.npu_probe import probe_npu
-from npu_whisper.ui.tray import TrayManager
-from npu_whisper.ui.overlay import OverlayWindow
-from npu_whisper.ui.settings import SettingsWindow
-from npu_whisper.ui.history import HistoryWindow
-from npu_whisper.ui.onboarding import OnboardingWindow
+from debora_whisper.npu_probe import probe_npu
+from debora_whisper.ui.tray import TrayManager
+from debora_whisper.ui.overlay import OverlayWindow
+from debora_whisper.ui.settings import SettingsWindow
+from debora_whisper.ui.history import HistoryWindow
+from debora_whisper.ui.onboarding import OnboardingWindow
 
 
 class GUIApp:
@@ -37,7 +38,7 @@ class GUIApp:
         self._root.withdraw()  # No visible root window
 
         # Set app icon on root — inherited by all toplevel windows
-        from npu_whisper.ui.icons import render_app_icon
+        from debora_whisper.ui.icons import render_app_icon
         from PIL import ImageTk
         self._icon_photo = ImageTk.PhotoImage(render_app_icon(32))
         self._root.iconphoto(True, self._icon_photo)
@@ -129,7 +130,7 @@ class GUIApp:
     def _on_hardware_event(self):
         """Called by the tray manager when the PC wakes up or a device changes."""
         import threading
-        from npu_whisper.dictation_engine import log
+        from debora_whisper.dictation_engine import log
         
         if getattr(self, "_hw_event_timer", None):
             self._hw_event_timer.cancel()
@@ -161,14 +162,14 @@ class GUIApp:
         state_name = state.value
 
         if state == AppState.LOADING:
-            self._tray.update_state(state_name, "NPU Dictation — Loading model...")
+            self._tray.update_state(state_name, "Débora Whisper — Loading model...")
             self._overlay.show_loading()
             self._settings_status("Loading model...", "#FF9F0A")
 
         elif state == AppState.READY:
             self._stop_audio_polling()
             text = data.get("text")
-            self._tray.update_state(state_name, "NPU Dictation — Ready")
+            self._tray.update_state(state_name, "Débora Whisper — Ready")
             if text:
                 self._overlay.show_result(text)
             else:
@@ -182,13 +183,13 @@ class GUIApp:
 
         elif state == AppState.RECORDING:
             draft = data.get("draft_text", "")
-            self._tray.update_state(state_name, "NPU Dictation — Recording...")
+            self._tray.update_state(state_name, "Débora Whisper — Recording...")
             self._overlay.show_recording(draft)
             self._start_audio_polling()
 
         elif state == AppState.PROCESSING:
             self._stop_audio_polling()
-            self._tray.update_state(state_name, "NPU Dictation — Transcribing...")
+            self._tray.update_state(state_name, "Débora Whisper — Transcribing...")
             self._overlay.show_processing()
 
         elif state == AppState.ERROR:
@@ -202,7 +203,7 @@ class GUIApp:
                 self._show_restart_required(data)
                 return
 
-            self._tray.update_state(state_name, f"NPU Dictation — Error: {error_msg[:60]}")
+            self._tray.update_state(state_name, f"Débora Whisper — Error: {error_msg[:60]}")
             self._settings_status(f"Error: {error_msg[:40]}", "#FF453A")
 
             if data.get("device_lost"):
@@ -255,7 +256,7 @@ class GUIApp:
         threading.Thread(target=_probe_thread, daemon=True).start()
 
     def _run_npu_recovery_probe(self):
-        from npu_whisper.dictation_engine import (
+        from debora_whisper.dictation_engine import (
             setup_model, create_model, forget_npu_loss, MODEL_REGISTRY, log)
         import numpy as np
 
@@ -317,14 +318,14 @@ class GUIApp:
         message = failure.get("message") or data.get("error", "Restart the app.")
         self._tray.update_state(
             AppState.ERROR.value,
-            f"NPU Dictation — {device} failed. Quit and restart the app.",
+            f"Débora Whisper — {device} failed. Quit and restart the app.",
         )
-        self._settings_status(f"{device} failed: restart NPU Dictation.", "#FF453A")
+        self._settings_status(f"{device} failed: restart Débora Whisper.", "#FF453A")
         if getattr(self, "_restart_alert_shown", False):
             return
         self._restart_alert_shown = True
         log(f"Restart required: {message}")
-        self._alert_error("NPU Dictation: restart required", message)
+        self._alert_error("Débora Whisper: restart required", message)
 
     def _alert_error(self, title: str, message: str):
         try:
@@ -433,7 +434,7 @@ class GUIApp:
             )
             if rebuild:
                 log(f"Settings saved; not reloading after {failure['device']} failure.")
-                self._settings_status("Saved. Restart NPU Dictation to apply.", "#FF9F0A")
+                self._settings_status("Saved. Restart Débora Whisper to apply.", "#FF9F0A")
             else:
                 self._settings_status("Settings saved.", "#30D158")
             return
@@ -516,7 +517,7 @@ def _ensure_stdio():
             setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
 
 
-INSTANCE_MUTEX = r"Local\npu-whisper-tray"
+INSTANCE_MUTEX = r"Local\debora-whisper-tray"
 
 
 def _claim_single_instance(name: str = INSTANCE_MUTEX) -> bool:
@@ -538,7 +539,7 @@ _instance_mutex = None
 
 def main():
     _ensure_stdio()
-    parser = argparse.ArgumentParser(prog="npu-whisper", description="NPU Dictation Engine (GUI)")
+    parser = argparse.ArgumentParser(prog="debora", description="Débora Whisper (GUI)")
     parser.add_argument("--device", choices=["NPU", "GPU", "CPU", "CUDA"], help="Override device")
     parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), help="Model size")
     parser.add_argument("--language", type=str, help="Language code")
@@ -550,7 +551,7 @@ def main():
                              "instead of typing")
     shortcut = parser.add_mutually_exclusive_group()
     shortcut.add_argument("--install-shortcut", action="store_true",
-                          help="Add NPU Whisper to the Start Menu, then exit")
+                          help="Add Débora Whisper to the Start Menu, then exit")
     parser.add_argument("--autostart", action="store_true",
                         help="With --install-shortcut: also start with Windows")
     shortcut.add_argument("--remove-shortcut", action="store_true",
@@ -560,7 +561,7 @@ def main():
         parser.error("--autostart only works with --install-shortcut")
 
     if args.install_shortcut or args.remove_shortcut:
-        from npu_whisper import shortcuts
+        from debora_whisper import shortcuts
         if args.remove_shortcut:
             shortcuts.remove()
         else:
@@ -568,7 +569,7 @@ def main():
         return
 
     if not _claim_single_instance():
-        log("npu-whisper is already running (see the tray icon); not starting another.")
+        log("Débora Whisper is already running (see the tray icon); not starting another.")
         return
 
     config = load_config()
@@ -590,6 +591,7 @@ def main():
 
     validate_config(config)
     rotate_logs()
+    log_folder_moves()
     if not args.device:
         apply_device_priority(config)
     check_npu = avoid_lost_npu(config)

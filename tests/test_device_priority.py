@@ -1,7 +1,7 @@
 """config["device_priority"] picks the startup device and the fallback."""
 import pytest
 
-from npu_whisper import dictation_engine as de
+from debora_whisper import dictation_engine as de
 
 ALL = {"CUDA", "NPU", "GPU", "CPU"}
 

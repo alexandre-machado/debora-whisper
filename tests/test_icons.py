@@ -3,7 +3,7 @@
 import pytest
 from PIL import Image
 
-from npu_whisper.ui.icons import (
+from debora_whisper.ui.icons import (
     icon_loading, icon_ready, icon_recording, icon_processing, icon_error,
     STATE_ICONS, ICON_SIZE,
 )

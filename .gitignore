@@ -23,7 +23,7 @@ env/
 .DS_Store
 Thumbs.db
 
-# Project runtime files (created in ~/.npu-dictation/)
+# Project runtime files (created in ~/.debora/)
 *.log
 models/
 config.json

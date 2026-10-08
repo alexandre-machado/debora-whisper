@@ -6,13 +6,13 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from npu_whisper.dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
+from debora_whisper.dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
 
 
 @pytest.fixture(autouse=True)
 def isolate_desktop():
     """Tests must not inspect real keys or paste into the user's desktop."""
-    with patch('keyboard.is_pressed', return_value=False), patch('npu_whisper.dictation_engine.type_text'):
+    with patch('keyboard.is_pressed', return_value=False), patch('debora_whisper.dictation_engine.type_text'):
         yield
 
 
@@ -136,7 +136,7 @@ class TestStateTransitions:
         app.recorder = MagicMock()
         app.recorder.stop = MagicMock(return_value=np.zeros(16000, dtype=np.float32))
 
-        with patch("npu_whisper.dictation_engine.type_text"):
+        with patch("debora_whisper.dictation_engine.type_text"):
             app.toggle_recording()
 
         # Wait for transcription thread
@@ -160,7 +160,7 @@ class TestHistory:
         app.recorder = MagicMock()
         app.recorder.stop = MagicMock(return_value=np.zeros(16000, dtype=np.float32))
 
-        with patch("npu_whisper.dictation_engine.type_text"):
+        with patch("debora_whisper.dictation_engine.type_text"):
             app.toggle_recording()
 
         time.sleep(0.5)
@@ -228,6 +228,6 @@ class TestListInputDevices:
         assert devices[1] == {"index": 2, "name": "Mic 2"}
 
     def test_list_input_devices_handles_import_error(self):
-        with patch("npu_whisper.dictation_engine.DictationApp.list_input_devices", return_value=[]):
+        with patch("debora_whisper.dictation_engine.DictationApp.list_input_devices", return_value=[]):
             devices = DictationApp.list_input_devices()
         assert devices == []

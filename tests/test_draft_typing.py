@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from npu_whisper import dictation_engine as de
-from npu_whisper.dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
+from debora_whisper import dictation_engine as de
+from debora_whisper.dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
 
 AUDIO = np.zeros(16000, dtype=np.float32)
 
@@ -179,7 +179,7 @@ def test_final_does_not_change_endpoint(screen):
 
 def test_segment_consumer_preserves_draft_identity_and_position(monkeypatch, screen):
     from types import SimpleNamespace
-    from npu_whisper.vad_endpoint import VadSegment
+    from debora_whisper.vad_endpoint import VadSegment
 
     app = _app()
     app.recorder = de.AudioRecorder(config=app.config)

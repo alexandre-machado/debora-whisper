@@ -13,9 +13,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from npu_whisper import dictation_engine as de
-from npu_whisper import voice_chat as vc
-from npu_whisper.dictation_engine import DictationApp, DEFAULT_CONFIG
+from debora_whisper import dictation_engine as de
+from debora_whisper import voice_chat as vc
+from debora_whisper.dictation_engine import DictationApp, DEFAULT_CONFIG
 
 AUDIO = np.zeros(16000, dtype=np.float32)
 
@@ -394,13 +394,13 @@ def test_muted_recorder_drops_speech_and_skips_what_it_heard():
     assert recorder._read_pos == 5000
 
 
-@pytest.mark.parametrize("module", ["npu_whisper.app", "npu_whisper.dictation_engine"])
+@pytest.mark.parametrize("module", ["debora_whisper.app", "debora_whisper.dictation_engine"])
 def test_voice_chat_flag_turns_the_mode_on(monkeypatch, module):
     import importlib
     import sys
     mod = importlib.import_module(module)
     started = []
-    monkeypatch.setattr(sys, "argv", ["npu-whisper", "--voice-chat", "--device", "CPU"])
+    monkeypatch.setattr(sys, "argv", ["debora", "--voice-chat", "--device", "CPU"])
     monkeypatch.setattr(mod, "load_config", lambda: dict(DEFAULT_CONFIG))
     app_class = "GUIApp" if module.endswith(".app") else "DictationApp"
     monkeypatch.setattr(mod, app_class, lambda config: started.append(config) or MagicMock())
@@ -560,7 +560,7 @@ def test_saved_variables_are_used_when_the_terminal_predates_them(monkeypatch, t
     """A terminal opened before MODELS_DIR/HF_HOME were set does not pass
     them on; the app must still use the folders they point to."""
     import importlib
-    from npu_whisper import paths
+    from debora_whisper import paths
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "winreg", _Registry(
         {"MODELS_DIR": str(tmp_path), "HF_HOME": str(tmp_path / "huggingface")}))
@@ -568,7 +568,7 @@ def test_saved_variables_are_used_when_the_terminal_predates_them(monkeypatch, t
     monkeypatch.delenv("HF_HOME", raising=False)
     try:
         importlib.reload(paths)
-        assert paths.MODEL_DIR == tmp_path / "npu-whisper" / "models"
+        assert paths.MODEL_DIR == tmp_path / "debora-whisper" / "models"
         assert paths.VOICES_DIR == tmp_path / "voices"
         import os
         assert os.environ["HF_HOME"] == str(tmp_path / "huggingface")
@@ -579,18 +579,18 @@ def test_saved_variables_are_used_when_the_terminal_predates_them(monkeypatch, t
 
 def test_paths_follow_models_dir(monkeypatch, tmp_path):
     import importlib
-    from npu_whisper import paths
+    from debora_whisper import paths
     monkeypatch.setitem(sys.modules, "winreg", _Registry({}))
     monkeypatch.setenv("MODELS_DIR", str(tmp_path))
     try:
         importlib.reload(paths)
-        assert paths.MODEL_DIR == tmp_path / "npu-whisper" / "models"
-        assert paths.CACHE_DIR == tmp_path / "npu-whisper" / "ov-cache"
+        assert paths.MODEL_DIR == tmp_path / "debora-whisper" / "models"
+        assert paths.CACHE_DIR == tmp_path / "debora-whisper" / "ov-cache"
         assert paths.VOICES_DIR == tmp_path / "voices"
-        assert paths.CONFIG_FILE == Path.home() / ".npu-dictation" / "config.json"
+        assert paths.CONFIG_FILE == Path.home() / ".debora" / "config.json"
         monkeypatch.delenv("MODELS_DIR")
         importlib.reload(paths)
-        assert paths.MODEL_DIR == Path.home() / ".npu-dictation" / "models"
+        assert paths.MODEL_DIR == Path.home() / ".debora" / "models"
     finally:
         monkeypatch.undo()
         importlib.reload(paths)
@@ -723,7 +723,7 @@ def test_sentence_typed_as_dictation_goes_to_the_llm_after_the_switch(typed):
 
 
 def _gui(**config):
-    from npu_whisper.app import GUIApp
+    from debora_whisper.app import GUIApp
     gui = GUIApp.__new__(GUIApp)
     gui._config = {**DEFAULT_CONFIG, **config}
     gui._engine = MagicMock()

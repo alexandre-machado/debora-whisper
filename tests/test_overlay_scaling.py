@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 tk = pytest.importorskip("tkinter")
-from npu_whisper.ui.overlay import OverlayWindow
+from debora_whisper.ui.overlay import OverlayWindow
 
 
 @pytest.mark.parametrize("dpi", [96, 120, 144, 192, 240])

@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
-from npu_whisper.dictation_engine import ParakeetNPU, MODEL_DIR, MODEL_REGISTRY, is_model_downloaded
+from debora_whisper.dictation_engine import ParakeetNPU, MODEL_DIR, MODEL_REGISTRY, is_model_downloaded
 
 
 def synthetic_utterance(duration_s: float, sample_rate: int = 16000, seed: int = 0) -> np.ndarray:
@@ -141,7 +141,7 @@ def main():
         model_dir = MODEL_DIR / MODEL_REGISTRY["parakeet"]["local_dir"]
     if not model_dir.exists():
         print(f"ERROR: model dir not found: {model_dir}")
-        print("Run: npu-whisper-cli --model parakeet --setup")
+        print("Run: debora-cli --model parakeet --setup")
         sys.exit(1)
 
     print(f"Loading ParakeetNPU from {model_dir} on {args.device} "

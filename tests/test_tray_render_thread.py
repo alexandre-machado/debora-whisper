@@ -16,11 +16,11 @@ def _tray_class():
         import pystray  # noqa: F401
     except ImportError:
         with patch.dict(sys.modules, {"pystray": MagicMock()}):
-            sys.modules.pop("npu_whisper.ui.tray", None)
-            from npu_whisper.ui.tray import TrayManager
-        sys.modules.pop("npu_whisper.ui.tray", None)
+            sys.modules.pop("debora_whisper.ui.tray", None)
+            from debora_whisper.ui.tray import TrayManager
+        sys.modules.pop("debora_whisper.ui.tray", None)
         return TrayManager
-    from npu_whisper.ui.tray import TrayManager
+    from debora_whisper.ui.tray import TrayManager
     return TrayManager
 
 
@@ -69,9 +69,9 @@ def _settle(icon, timeout=2.0):
 
 def test_updates_do_not_touch_pystray_on_caller_thread():
     tray = _tray()
-    tray.update_state("recording", "NPU Dictation — Recording...")
+    tray.update_state("recording", "Débora Whisper — Recording...")
     tray.update_audio_level(0.8)
-    tray.update_state("ready", "NPU Dictation — Ready")
+    tray.update_state("ready", "Débora Whisper — Ready")
     assert tray._icon.calls == []
 
 
@@ -79,7 +79,7 @@ def test_renderer_applies_state_on_its_own_thread():
     tray = _tray()
     t = _run_renderer(tray)
     try:
-        tray.update_state("ready", "NPU Dictation — Ready")
+        tray.update_state("ready", "Débora Whisper — Ready")
         _settle(tray._icon)
         names = {name for name, _ in tray._icon.calls}
         assert {"icon", "title", "menu", "update_menu"} <= names
@@ -95,11 +95,11 @@ def test_repeated_state_makes_no_windows_calls():
     tray = _tray()
     t = _run_renderer(tray)
     try:
-        tray.update_state("ready", "NPU Dictation — Ready")
+        tray.update_state("ready", "Débora Whisper — Ready")
         _settle(tray._icon)
         tray._icon.calls.clear()
         for _ in range(5):
-            tray.update_state("ready", "NPU Dictation — Ready")
+            tray.update_state("ready", "Débora Whisper — Ready")
         _settle(tray._icon)
         assert tray._icon.calls == []
     finally:
@@ -111,7 +111,7 @@ def test_silent_recording_does_not_redraw():
     tray = _tray()
     t = _run_renderer(tray)
     try:
-        tray.update_state("recording", "NPU Dictation — Recording...")
+        tray.update_state("recording", "Débora Whisper — Recording...")
         tray.update_audio_level(0.0)
         _settle(tray._icon)
         tray._icon.calls.clear()

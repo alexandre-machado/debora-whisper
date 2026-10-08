@@ -2,7 +2,7 @@
 
 import threading
 import pystray
-from npu_whisper.ui.icons import get_icon, get_volume_icon
+from debora_whisper.ui.icons import get_icon, get_volume_icon
 
 
 class TrayManager:
@@ -23,7 +23,7 @@ class TrayManager:
         self._model = model
         self._hotkey = hotkey
         self._state = "loading"
-        self._tooltip = "NPU Dictation — Loading..."
+        self._tooltip = "Débora Whisper — Loading..."
         self._icon: pystray.Icon | None = None
         self._thread: threading.Thread | None = None
         
@@ -94,7 +94,7 @@ class TrayManager:
         """Start the tray icon in a daemon thread."""
         initial_icon = get_icon(self._state)
         self._icon = pystray.Icon(
-            name="npu-dictation",
+            name="debora-whisper",
             icon=initial_icon,
             title=self._tooltip,
             menu=self._build_menu(),

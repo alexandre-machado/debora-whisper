@@ -87,7 +87,7 @@ jobs:
         run: uv pip compile pyproject.toml --python-version 3.12 --extra cuda --extra export --quiet -o resolved.txt
 
       - name: The cuda extra resolves to prebuilt wheels
-        # Resolve `npu-whisper[cuda]` as a user's install would (without
+        # Resolve `debora-whisper[cuda]` as a user's install would (without
         # [export], whose transformers cap hides the problem), then require
         # wheels for exactly those versions: a backtrack to sdist-only
         # tokenizers 0.13.3 (needs Rust) broke installs before.
@@ -98,8 +98,8 @@ jobs:
       - name: Smoke test the commands
         shell: pwsh
         run: |
-          npu-whisper-cli --help
+          debora-cli --help
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           # pystray connects to X at import time; Linux runners have no display.
-          if ($IsLinux) { xvfb-run -a npu-whisper --help } else { npu-whisper --help }
+          if ($IsLinux) { xvfb-run -a debora --help } else { debora --help }
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
