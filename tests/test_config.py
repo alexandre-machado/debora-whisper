@@ -28,3 +28,13 @@ class TestConfigValidation:
         config = {**DEFAULT_CONFIG, "max_record_seconds": -5}
         with pytest.raises(ValueError, match="max_record_seconds"):
             validate_config(config)
+
+    @pytest.mark.parametrize("key", ["vad_end_silence_seconds", "vad_incomplete_silence_seconds"])
+    @pytest.mark.parametrize("value", [None, True, "3", 0, -1, float("nan"), float("inf")])
+    def test_invalid_vad_silence_raises(self, key, value):
+        with pytest.raises(ValueError, match=key):
+            validate_config({**DEFAULT_CONFIG, key: value})
+
+    def test_existing_config_without_vad_keys_uses_defaults(self):
+        config = {key: value for key, value in DEFAULT_CONFIG.items() if not key.startswith("vad_")}
+        validate_config(config)

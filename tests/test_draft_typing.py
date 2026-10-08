@@ -122,6 +122,51 @@ def test_empty_draft_keeps_typed_draft(screen):
     assert app._draft_typed_text == "Além disso... "
 
 
+def test_endpoint_receives_raw_draft_before_display_ellipses(screen):
+    app = _app()
+    app.whisper.transcribe.return_value = "Minha ideia é"
+    app._finish_recording(audio=AUDIO, is_final=False, segment_id=7, audio_end=16000)
+    app.recorder.endpoint.update.assert_called_once_with(7, 16000, "Minha ideia é")
+    assert screen.text == "Minha ideia é... "
+
+
+def test_hallucination_feedback_is_empty(screen):
+    app = _app()
+    app.whisper.transcribe.return_value = "Obrigado."
+    app._finish_recording(audio=AUDIO, is_final=False, segment_id=7, audio_end=16000)
+    app.recorder.endpoint.update.assert_called_once_with(7, 16000, "")
+
+
+def test_final_does_not_change_endpoint(screen):
+    app = _app()
+    app.whisper.transcribe.return_value = "Minha ideia é"
+    app._finish_recording(audio=AUDIO, is_final=True, segment_id=7, audio_end=16000)
+    app.recorder.endpoint.update.assert_not_called()
+
+
+def test_segment_consumer_preserves_draft_identity_and_position(monkeypatch, screen):
+    from types import SimpleNamespace
+    from npu_whisper.vad_endpoint import VadSegment
+
+    app = _app()
+    app.recorder = de.AudioRecorder(config=app.config)
+    segment_id = app.recorder.endpoint.start()
+    app.recorder.segment_queue.put(VadSegment(AUDIO, False, segment_id, len(AUDIO)))
+    app.whisper.transcribe.return_value = "Minha ideia é"
+    finish = app._finish_recording
+
+    def consume(**kwargs):
+        finish(**kwargs)
+        app._stopping.set()
+
+    app._finish_recording = consume
+    # Run the actual consumer synchronously, stopping after this draft.
+    monkeypatch.setattr(de.threading, "Thread", lambda target, **kw: SimpleNamespace(start=target))
+    app._start_segment_consumer()
+    assert app.recorder.endpoint.incomplete
+    assert screen.text == "Minha ideia é... "
+
+
 def test_empty_final_erases_draft(screen):
     app = _app()
     _say(app, "Hum", is_final=False)
