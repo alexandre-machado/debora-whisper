@@ -97,6 +97,20 @@ def _stub_sklearn():
             setattr(sys.modules["sklearn"], name.split(".", 1)[1], mod)
 
 
+# Chatterbox Multilingual reads the attention of these layers to keep speech
+# aligned with the text (AlignmentStreamAnalyzer's LLAMA_ALIGNED_HEADS).
+SPIED_LAYERS = (9, 12, 13)
+
+
+def drop_attention_spies(model):
+    """Each generate() adds 3 forward hooks that are never removed, each
+    copying its layer's attention to the CPU on every token: remove the old
+    ones before the next generate() adds its own. Unmeasurable after 20
+    sentences (93 hooks), but they pile up for as long as the server runs."""
+    for idx in SPIED_LAYERS:
+        model.t3.tfmr.layers[idx].self_attn._forward_hooks.clear()
+
+
 def load_model(device: str, voice: str | None):
     sys.modules["sklearn"] = None
     import torch
@@ -165,6 +179,7 @@ def make_handler(model, default_language: str):
             with lock:
                 start = time.time()
                 try:
+                    drop_attention_spies(model)
                     with torch.inference_mode():
                         wav = model.generate(text, language_id=language)
                 except Exception as e:
