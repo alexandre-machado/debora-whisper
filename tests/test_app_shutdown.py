@@ -126,7 +126,7 @@ def test_overlay_and_tray_toggle_follow_replaced_engine():
     assert isinstance(app._tray, RealTray)
     app._tray._on_toggle_click()
     # Real overlay dot-click handler, given the callback __init__ passed in.
-    overlay = SimpleNamespace(_DOT_HIT_X=10, _state="ready", _drag_is_click=False,
+    overlay = SimpleNamespace(_DOT_HIT_X=10, _scale=1.0, _state="ready", _drag_is_click=False,
                               _on_toggle=captured["on_toggle"])
     RealOverlay._on_drag_start(overlay, SimpleNamespace(x=0, y=0))
 

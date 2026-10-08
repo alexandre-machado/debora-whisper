@@ -74,18 +74,18 @@ class OverlayWindow:
         self._win: tk.Toplevel | None = None
         self._canvas: tk.Canvas | None = None
 
+        # Position is in desktop pixels; dimensions below are logical (96 DPI).
+        self._pos_x: int | None = pos_x
+        self._pos_y: int = pos_y
+
         # Animated size
         self._tgt_base_w = float(self.COMPACT_W)
         self._tgt_base_h = float(self.COMPACT_H)
-        s = self._get_scale()
+        s = self._scale = self._get_scale()
         self._cur_w = self._tgt_base_w * s
         self._cur_h = self._tgt_base_h * s
         self._tgt_w = self._tgt_base_w * s
         self._tgt_h = self._tgt_base_h * s
-
-        # Position (None = auto-center, set on first drag)
-        self._pos_x: int | None = pos_x
-        self._pos_y: int = pos_y
 
         # Drag state
         self._drag_offset_x = 0
@@ -106,6 +106,7 @@ class OverlayWindow:
         # Balloon
         self._balloon_win: tk.Toplevel | None = None
         self._balloon_id = None
+        self._balloon_text = ""
         self._show_balloon = True
 
         # PIL rendering state
@@ -119,23 +120,54 @@ class OverlayWindow:
 
 
     def _get_scale(self) -> float:
+        """Read the effective DPI of this window, including Windows display scaling."""
         try:
             import ctypes
-            x = int(self._pos_x) if self._pos_x is not None else 0
-            y = int(self._pos_y) if self._pos_y is not None else 0
-            class POINT(ctypes.Structure):
-                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-            pt = POINT(x, y)
-            hMon = ctypes.windll.user32.MonitorFromPoint(pt, 2)
-            dpiX = ctypes.c_uint()
-            dpiY = ctypes.c_uint()
-            ctypes.windll.shcore.GetDpiForMonitor(hMon, 0, ctypes.byref(dpiX), ctypes.byref(dpiY))
-            return dpiX.value / 96.0
-        except Exception:
-            return 1.0
+            from ctypes import wintypes
+
+            get_dpi = ctypes.windll.user32.GetDpiForWindow
+            get_dpi.argtypes = [wintypes.HWND]
+            get_dpi.restype = wintypes.UINT
+            window = self._win if self._win is not None else self._root
+            dpi = get_dpi(window.winfo_id())
+            if dpi > 0:
+                return dpi / 96.0
+        except (AttributeError, OSError, tk.TclError):
+            pass
+        try:
+            dpi = float(self._root.winfo_fpixels("1i"))
+            if dpi > 0:
+                return dpi / 96.0
+        except (AttributeError, ValueError, tk.TclError):
+            pass
+        return 1.0
+
+    @staticmethod
+    def _font_pixels(points, scale):
+        # Negative Tk sizes are pixels. Positive sizes would apply Tk's global
+        # points-to-pixels scaling AGAIN, which may belong to another monitor.
+        return -max(1, round(points * 96 / 72 * scale))
+
+    def _refresh_scale(self, event=None):
+        """Resize all artwork together when moving displays or changing DPI."""
+        if event is not None and event.widget is not self._win:
+            return
+        scale = self._get_scale()
+        if scale == self._scale:
+            return
+        ratio = scale / self._scale
+        self._scale = scale
+        self._cur_w *= ratio
+        self._cur_h *= ratio
+        self._tgt_w = self._tgt_base_w * scale
+        self._tgt_h = self._tgt_base_h * scale
+        self._position()
+        self._redraw()
+        if self._balloon_win is not None:
+            self._show_balloon_popup(self._balloon_text)
 
     def _get_mic_btn(self):
-        s = self._get_scale()
+        s = self._scale
         if s not in getattr(self, "_btn_cache", {}):
             if not hasattr(self, "_btn_cache"): self._btn_cache = {}
             from npu_whisper.ui.glass import render_icon_mic, render_button
@@ -144,7 +176,7 @@ class OverlayWindow:
         return self._btn_cache[s]
 
     def _get_stop_btn(self):
-        s = self._get_scale()
+        s = self._scale
         k = f"stop_{s}"
         if k not in getattr(self, "_btn_cache", {}):
             if not hasattr(self, "_btn_cache"): self._btn_cache = {}
@@ -171,8 +203,8 @@ class OverlayWindow:
             if self._win and self._win.winfo_exists():
                 self._win.attributes("-topmost", True)
                 self._win.lift()
+                self._refresh_scale()
                 self._root.after(500, _force_topmost)
-        _force_topmost()
 
         self._canvas = tk.Canvas(
             self._win, bg=_TRANSPARENT, highlightthickness=0,
@@ -189,6 +221,9 @@ class OverlayWindow:
 
         self._win.update_idletasks()
         self._position()
+        self._win.update_idletasks()
+        self._win.bind("<Configure>", self._refresh_scale)
+        _force_topmost()
         self._apply_window_flags()
         self._redraw()
 
@@ -242,6 +277,10 @@ class OverlayWindow:
                             ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
             
             user32 = ctypes.windll.user32
+            user32.MonitorFromPoint.argtypes = [POINT, wintypes.DWORD]
+            user32.MonitorFromPoint.restype = wintypes.HANDLE
+            user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+            user32.GetMonitorInfoW.restype = wintypes.BOOL
             pt = POINT(x + w // 2, y + h // 2)
             hMonitor = user32.MonitorFromPoint(pt, 2) # MONITOR_DEFAULTTONEAREST
             
@@ -282,7 +321,8 @@ class OverlayWindow:
         c = self._canvas
         c.delete("all")
         self._photo_refs.clear()
-        s = self._get_scale()
+        s = self._scale
+        font_size = self._font_pixels(10, s)
         w, h = int(self._cur_w), int(self._cur_h)
         r = min(int(self.RADIUS * s), h // 2)
         mid = h // 2
@@ -303,18 +343,18 @@ class OverlayWindow:
             dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.GRAY))
             self._paste_centered(frame, dot, bx, mid)
             text_items.append((w // 2 + int(6 * s), mid, "Loading...",
-                               self.TEXT_DIM, ("Segoe UI", max(1, int(10 * s))), "center"))
+                               self.TEXT_DIM, ("Segoe UI", font_size), "center"))
 
         elif self._state == "ready":
             if self._hover and w > int(self.COMPACT_W * s) + int(20 * s):
                 self._paste_centered(frame, self._get_mic_btn(), bx, mid)
                 text_items.append((w // 2 + int(10 * s), mid, "Start recording",
-                                   self.TEXT_DIM, ("Segoe UI", max(1, int(10 * s))), "center"))
+                                   self.TEXT_DIM, ("Segoe UI", font_size), "center"))
             else:
                 dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.GREEN))
                 self._paste_centered(frame, dot, bx, mid)
                 text_items.append((w // 2 + int(6 * s), mid, "Ready",
-                                   self.TEXT, ("Segoe UI", max(1, int(10 * s)), "bold"), "center"))
+                                   self.TEXT, ("Segoe UI", font_size, "bold"), "center"))
 
         elif self._state == "recording":
             self._paste_centered(frame, self._get_stop_btn(), bx, mid)
@@ -326,10 +366,10 @@ class OverlayWindow:
             draft = getattr(self, "_draft_text", "")
             if draft:
                 text_items.append((int(wave_end + 15 * s), mid, draft[-40:],
-                                   self.TEXT, ("Segoe UI", max(1, int(10 * s))), "w"))
+                                   self.TEXT, ("Segoe UI", font_size), "w"))
             else:
                 text_items.append((int(wave_end + 15 * s), mid, "Listening...",
-                                   self.TEXT_DIM, ("Segoe UI", max(1, int(10 * s))), "w"))
+                                   self.TEXT_DIM, ("Segoe UI", font_size), "w"))
 
             # Waveform
             levels = list(self._wave)
@@ -347,19 +387,19 @@ class OverlayWindow:
             dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.AMBER))
             self._paste_centered(frame, dot, bx, mid)
             text_items.append((w // 2 + int(6 * s), mid, "Transcribing...",
-                               self.TEXT, ("Segoe UI", max(1, int(10 * s)), "bold"), "center"))
+                               self.TEXT, ("Segoe UI", font_size, "bold"), "center"))
 
         elif self._state == "result":
             dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.GREEN))
             self._paste_centered(frame, dot, bx, mid)
             text_items.append((w // 2 + int(6 * s), mid, "Done",
-                               self.TEXT, ("Segoe UI", max(1, int(10 * s)), "bold"), "center"))
+                               self.TEXT, ("Segoe UI", font_size, "bold"), "center"))
 
         elif self._state == "error":
             dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.RED))
             self._paste_centered(frame, dot, bx, mid)
             text_items.append((w // 2 + int(6 * s), mid, "Error",
-                               self.RED, ("Segoe UI", max(1, int(10 * s)), "bold"), "center"))
+                               self.RED, ("Segoe UI", font_size, "bold"), "center"))
 
         # Flatten to RGB on transparent background and place as one image
         composited = composite_on_transparent(frame)
@@ -378,7 +418,7 @@ class OverlayWindow:
 
     def _on_drag_start(self, event):
         """Click on dot -> toggle recording. Click elsewhere -> start drag."""
-        if event.x <= self._DOT_HIT_X and self._state in ("ready", "recording"):
+        if event.x <= self._DOT_HIT_X * self._scale and self._state in ("ready", "recording"):
             # Clicked the dot button — toggle recording
             self._drag_is_click = True
             if self._on_toggle:
@@ -415,7 +455,7 @@ class OverlayWindow:
 
     def _on_mouse_move(self, event):
         """Show hand cursor when over the dot button area."""
-        if event.x <= self._DOT_HIT_X and self._state in ("ready", "recording"):
+        if event.x <= self._DOT_HIT_X * self._scale and self._state in ("ready", "recording"):
             self._canvas.configure(cursor="hand2")
         else:
             self._canvas.configure(cursor="")
@@ -439,7 +479,7 @@ class OverlayWindow:
         self._anim_tick()
 
     def _anim_tick(self):
-        s = self._get_scale()
+        s = self._scale
         self._tgt_w = self._tgt_base_w * s
         self._tgt_h = self._tgt_base_h * s
         dw = self._tgt_w - self._cur_w
@@ -547,6 +587,7 @@ class OverlayWindow:
     def _show_balloon_popup(self, text: str):
         """Show a dark tooltip-style balloon below the pill with full text."""
         self._dismiss_balloon()
+        self._balloon_text = text
 
         bw = self._balloon_win = tk.Toplevel(self._root)
         bw.overrideredirect(True)
@@ -557,11 +598,11 @@ class OverlayWindow:
         except Exception:
             pass
 
-        s = self._get_scale()
+        s = self._scale
         pad = int(self.BALLOON_PAD * s)
         r = int(self.BALLOON_RADIUS * s)
         max_w = int(self.BALLOON_MAX_W * s)
-        fsize = max(1, int(self.BALLOON_FONT_SIZE * s))
+        fsize = self._font_pixels(self.BALLOON_FONT_SIZE, s)
 
         canvas = tk.Canvas(bw, bg=_TRANSPARENT, highlightthickness=0)
         canvas.pack(fill="both", expand=True)
@@ -634,6 +675,7 @@ class OverlayWindow:
 
     def _dismiss_balloon(self):
         """Destroy the balloon popup if it exists."""
+        self._balloon_text = ""
         if self._balloon_id:
             self._root.after_cancel(self._balloon_id)
             self._balloon_id = None
