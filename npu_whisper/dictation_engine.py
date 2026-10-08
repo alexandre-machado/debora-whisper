@@ -1877,7 +1877,8 @@ class AudioRecorder:
                         if self.neural_vad: self.neural_vad.reset_state()
                         # Extract segment
                         with self._lock:
-                            end_pos = (start_read_pos + i + block_len + self.trailing_frames) % self.capacity
+                            extract_frames = speech_frames - silence_frames + self.trailing_frames
+                            end_pos = (speech_start_pos + extract_frames) % self.capacity
                             if end_pos > speech_start_pos:
                                 audio = self._buffer[speech_start_pos:end_pos].copy()
                             else:
@@ -2808,7 +2809,7 @@ class DictationApp:
                         # Windows handles it naturally, but this prevents "legalFicou".
                         if vad_segment:
                             stripped = text.strip()
-                            if stripped and not re.search(r'[.,!?;\:]$', stripped):
+                            if not is_final and stripped and not re.search(r'[.,!?;\:]$', stripped):
                                 text = stripped + '... '
                             elif not text.endswith(' '):
                                 text += ' '
