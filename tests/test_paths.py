@@ -59,6 +59,18 @@ def test_empty_new_folder_does_not_block_the_move(reload_paths, tmp_path):
     assert not (tmp_path / ".npu-dictation").exists()
 
 
+def test_new_folder_with_only_empty_folders_does_not_block_the_move(
+        reload_paths, tmp_path, monkeypatch):
+    shared = tmp_path / "models"
+    (shared / "debora-whisper" / "ov-cache").mkdir(parents=True)
+    (shared / "npu-whisper" / "models").mkdir(parents=True)
+    (shared / "npu-whisper" / "models" / "model.bin").write_bytes(b"x")
+    monkeypatch.setenv("MODELS_DIR", str(shared))
+    p = reload_paths()
+    assert (p.MODEL_DIR / "model.bin").exists()
+    assert not (shared / "npu-whisper").exists()
+
+
 def test_new_folder_wins_and_legacy_is_left_alone(reload_paths, tmp_path):
     (tmp_path / ".debora").mkdir()
     (tmp_path / ".debora" / "config.json").write_text("{}")

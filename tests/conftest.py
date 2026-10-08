@@ -1,12 +1,15 @@
 """Shared fixtures for dictation engine tests."""
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
-# Importing the package must never move the user's pre-rename folders.
+# Importing the package must never move the user's pre-rename folders, nor
+# create model or cache folders in the user's shared MODELS_DIR.
 os.environ["DEBORA_WHISPER_NO_MIGRATION"] = "1"
+os.environ["MODELS_DIR"] = tempfile.mkdtemp(prefix="debora-models-")
 
 # Add project root to path so we can import debora_whisper
 sys.path.insert(0, str(Path(__file__).parent.parent))

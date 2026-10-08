@@ -557,6 +557,7 @@ def main():
     shortcut.add_argument("--remove-shortcut", action="store_true",
                           help="Remove the Start Menu and startup shortcuts, then exit")
     args = parser.parse_args()
+    log_folder_moves()
     if args.autostart and not args.install_shortcut:
         parser.error("--autostart only works with --install-shortcut")
 
@@ -591,7 +592,6 @@ def main():
 
     validate_config(config)
     rotate_logs()
-    log_folder_moves()
     if not args.device:
         apply_device_priority(config)
     check_npu = avoid_lost_npu(config)

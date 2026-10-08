@@ -12,6 +12,7 @@ folder cannot be moved (an older copy of the app still has files open), this
 run keeps using it and the next one tries again.
 """
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -44,17 +45,21 @@ NO_MIGRATION_ENV = "DEBORA_WHISPER_NO_MIGRATION"
 MIGRATIONS: list[str] = []
 
 
+def _holds_files(folder: Path) -> bool:
+    return any(p.is_file() for p in folder.rglob("*"))
+
+
 def _migrated(new: Path, legacy: Path) -> Path:
-    """new, after moving legacy there if new is missing or empty; legacy
-    itself when it cannot be moved."""
+    """new, after moving legacy there if new is missing or holds only empty
+    folders; legacy itself when it cannot be moved."""
     if os.environ.get(NO_MIGRATION_ENV) or not legacy.is_dir():
         return new
-    if new.exists() and any(new.iterdir()):
+    if new.exists() and _holds_files(new):
         return new
     try:
         new.parent.mkdir(parents=True, exist_ok=True)
         if new.exists():
-            new.rmdir()  # empty: made by something that ran before the move
+            shutil.rmtree(new)  # no files: made by something that ran before the move
         legacy.rename(new)
     except OSError as e:
         MIGRATIONS.append(f"Could not move {legacy} to {new} ({e}); using {legacy} for now.")

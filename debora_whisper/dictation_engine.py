@@ -3481,6 +3481,7 @@ def main():
                         help="Talk to a local LLM and hear its reply (voice chat) "
                              "instead of typing")
     args = parser.parse_args()
+    log_folder_moves()
 
     if args.setup:
         run_setup()
@@ -3506,7 +3507,6 @@ def main():
 
     validate_config(config)
     rotate_logs()
-    log_folder_moves()
     if not args.device:
         apply_device_priority(config)
     avoid_lost_npu(config)
