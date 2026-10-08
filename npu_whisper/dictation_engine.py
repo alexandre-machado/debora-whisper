@@ -2063,14 +2063,8 @@ def same_input_target(a, b) -> bool:
 
 
 def type_draft_text(text: str):
-    """Type a live draft without touching the clipboard.
-
-    type_text() pastes and restores the clipboard 0.5 s later on a thread;
-    drafts arrive about once a second, so a pending restore could land
-    between the next copy and its Ctrl+V and paste the user's clipboard.
-    """
-    if text:
-        _type_text_ctypes(text)
+    """Paste live drafts through the same serialized path as final text."""
+    type_text(text)
 
 
 def delete_text(count: int):
@@ -2107,6 +2101,9 @@ def delete_text(count: int):
         user32.keybd_event(VK_BACK, 0, KEYEVENTF_KEYUP, 0)
 
 
+_clipboard_lock = threading.Lock()
+
+
 def type_text(text: str, auto_enter: bool = False):
     """Type text into the currently active window using keyboard simulation."""
     if not text:
@@ -2117,31 +2114,31 @@ def type_text(text: str, auto_enter: bool = False):
         import pyperclip
         import keyboard
 
-        # Save current clipboard
-        try:
-            old_clipboard = pyperclip.paste()
-        except Exception:
-            old_clipboard = ""
-
-        # Copy transcribed text and paste
-        pyperclip.copy(text)
-        time.sleep(0.05)
-        keyboard.press_and_release("ctrl+v")
-        time.sleep(0.1)
-
-        if auto_enter:
-            keyboard.press_and_release("enter")
-
-        # Restore clipboard after a short delay
-        def restore():
-            time.sleep(0.5)
+        # Complete restoration before another draft/final uses the clipboard.
+        # A detached restore can otherwise overwrite the next text before
+        # its Ctrl+V is processed. Unicode key packets are only a fallback:
+        # live text should reach the target as one paste, not individual keys.
+        with _clipboard_lock:
             try:
-                pyperclip.copy(old_clipboard)
+                old_clipboard = pyperclip.paste()
             except Exception:
-                pass
+                old_clipboard = None
 
-        threading.Thread(target=restore, daemon=True).start()
-        log(f"Typed: {text[:80]}{'...' if len(text) > 80 else ''}")
+            pyperclip.copy(text)
+            try:
+                time.sleep(0.05)
+                keyboard.press_and_release("ctrl+v")
+                time.sleep(0.1)
+                if auto_enter:
+                    keyboard.press_and_release("enter")
+            finally:
+                time.sleep(0.5)
+                try:
+                    # Don't overwrite something the user copied meanwhile.
+                    if old_clipboard is not None and pyperclip.paste() == text:
+                        pyperclip.copy(old_clipboard)
+                except Exception:
+                    pass
 
     except ImportError:
         # Fallback: use ctypes SendInput on Windows
@@ -2856,6 +2853,7 @@ class DictationApp:
                                 keyboard.press_and_release("enter")
                             self._draft_typed_text = ""
                             self._draft_target = None
+                            log(f"Final transcription: {text.strip()}")
 
                             self._history.append({
                                 "timestamp": datetime.now().isoformat(),

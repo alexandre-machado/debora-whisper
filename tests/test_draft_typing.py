@@ -66,7 +66,7 @@ def _say(app, text, is_final):
     app._finish_recording(audio=AUDIO, is_final=is_final)
 
 
-def test_draft_is_corrected_in_place_without_clipboard(screen):
+def test_draft_is_corrected_in_place(screen):
     app = _app()
     _say(app, "Olá tudo", is_final=False)
     _say(app, "Olá tudo bem", is_final=False)
@@ -74,7 +74,7 @@ def test_draft_is_corrected_in_place_without_clipboard(screen):
 
     assert screen.text == "Olá, tudo bem? "
     assert screen.drafted == ["Olá tudo... ", " bem... "]
-    # Only the differing tail goes through the clipboard paste.
+    # Only the differing tail is sent as final text.
     assert screen.pasted == [", tudo bem? "]
     assert app._draft_typed_text == ""
 
@@ -87,6 +87,27 @@ def test_final_equal_to_draft_still_presses_auto_enter(screen):
     assert screen.text == "Pronto. "
     assert screen.pasted == []
     assert screen.enters == 1
+
+
+@pytest.mark.parametrize("draft", ["Olá, tudo", "Olá, tudo bem?"])
+def test_console_logs_complete_final_even_if_only_tail_or_nothing_is_typed(screen, capsys, draft):
+    app = _app()
+    _say(app, draft, is_final=False)
+    assert "Final transcription:" not in capsys.readouterr().out
+
+    _say(app, "Olá, tudo bem?", is_final=True)
+
+    assert screen.text == "Olá, tudo bem? "
+    output = capsys.readouterr().out
+    assert output.count("Final transcription:") == 1
+    assert "Final transcription: Olá, tudo bem?" in output
+    assert "Final transcription: Olá, tudo bem?" in de.LOG_FILE.read_text(encoding="utf-8")
+
+
+def test_final_log_is_not_truncated(screen, capsys):
+    text = "Uma frase longa. " * 10
+    _say(_app(), text, is_final=True)
+    assert f"Final transcription: {text.strip()}" in capsys.readouterr().out
 
 
 def test_focus_change_leaves_old_draft_and_types_full_text(screen):
@@ -253,6 +274,63 @@ def test_unicode_typing_sends_utf16_units(monkeypatch):
     ctypes.windll.user32.SendInput.side_effect = send_input
     monkeypatch.setattr(de.time, "sleep", lambda s: None)
 
-    de.type_draft_text("é👍")
+    de._type_text_ctypes("é👍")
 
     assert units == [0xE9, 0xD83D, 0xDC4D]
+
+
+@pytest.fixture
+def clipboard(monkeypatch):
+    import pyperclip
+    import keyboard
+
+    state = {"text": "user clipboard", "pasted": [], "pending": False}
+    monkeypatch.setattr(pyperclip, "paste", lambda: state["text"])
+    monkeypatch.setattr(pyperclip, "copy", lambda text: state.update(text=text))
+
+    def key(name):
+        if name == "ctrl+v":
+            state["pending"] = True
+
+    def wait(seconds):
+        # Model a target that reads the clipboard after Ctrl+V returns.
+        if state["pending"]:
+            state["pasted"].append(state["text"])
+            state["pending"] = False
+
+    monkeypatch.setattr(keyboard, "press_and_release", key)
+    monkeypatch.setattr(de.time, "sleep", wait)
+    return state
+
+
+def test_drafts_and_final_paste_before_restoring_clipboard(clipboard):
+    with patch.object(de, "_type_text_ctypes") as unicode_keys, \
+            patch.object(de.threading, "Thread") as background:
+        for text, final in [("Olá, tudo... ", False), (" bem? ", False), ("fim", True)]:
+            (de.type_text if final else de.type_draft_text)(text)
+            assert clipboard["pasted"][-1] == text
+            assert clipboard["text"] == "user clipboard"
+
+    unicode_keys.assert_not_called()
+    background.assert_not_called()
+    assert clipboard["pasted"] == ["Olá, tudo... ", " bem? ", "fim"]
+
+
+def test_paste_does_not_overwrite_new_user_copy(clipboard, monkeypatch):
+    def wait(seconds):
+        if seconds == 0.5:
+            clipboard["text"] = "new user copy"
+
+    monkeypatch.setattr(de.time, "sleep", wait)
+    de.type_draft_text("Olá")
+    assert clipboard["text"] == "new user copy"
+
+
+def test_failed_paste_restores_clipboard_and_releases_lock(clipboard):
+    with patch("keyboard.press_and_release", side_effect=RuntimeError("paste failed")):
+        with pytest.raises(RuntimeError, match="paste failed"):
+            de.type_draft_text("Olá")
+
+    assert clipboard["text"] == "user clipboard"
+    assert de._clipboard_lock.acquire(blocking=False)
+    de._clipboard_lock.release()
