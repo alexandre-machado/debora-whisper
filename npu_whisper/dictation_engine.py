@@ -1877,7 +1877,13 @@ class AudioRecorder:
                         if self.neural_vad: self.neural_vad.reset_state()
                         # Extract segment
                         with self._lock:
-                            extract_frames = speech_frames - silence_frames + self.trailing_frames
+                            # Cap the trailing silence to prevent Whisper from dropping words or hallucinating spaces.
+                            # We keep up to 1.0s of the silence (which may contain quiet speech) plus trailing_frames.
+                            max_silence_keep = int(self.sample_rate * 1.0)
+                            extract_frames = speech_frames
+                            if silence_frames > max_silence_keep:
+                                extract_frames -= (silence_frames - max_silence_keep)
+                            extract_frames += self.trailing_frames
                             end_pos = (speech_start_pos + extract_frames) % self.capacity
                             if end_pos > speech_start_pos:
                                 audio = self._buffer[speech_start_pos:end_pos].copy()
@@ -2068,22 +2074,37 @@ def type_draft_text(text: str):
 
 
 def delete_text(count: int):
-    """Delete the specified number of characters, one Backspace each."""
+    """Delete the specified number of characters using Shift+Left selection."""
     if count <= 0:
         return
     try:
         import keyboard
+        keyboard.press("shift")
         for _ in range(count):
-            keyboard.send("backspace")
+            keyboard.send("left")
             time.sleep(0.001)
+        keyboard.release("shift")
+        keyboard.send("backspace")
     except ImportError:
         import ctypes
         user32 = ctypes.windll.user32
         KEYEVENTF_KEYUP = 0x0002
         VK_BACK = 0x08
+        VK_SHIFT = 0x10
+        VK_LEFT = 0x25
+        
+        # Press Shift
+        user32.keybd_event(VK_SHIFT, 0, 0, 0)
+        # Press Left Arrow `count` times
         for _ in range(count):
-            user32.keybd_event(VK_BACK, 0, 0, 0)
-            user32.keybd_event(VK_BACK, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_LEFT, 0, 0, 0)
+            user32.keybd_event(VK_LEFT, 0, KEYEVENTF_KEYUP, 0)
+            time.sleep(0.001)
+        # Release Shift
+        user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+        # Press Backspace
+        user32.keybd_event(VK_BACK, 0, 0, 0)
+        user32.keybd_event(VK_BACK, 0, KEYEVENTF_KEYUP, 0)
 
 
 def type_text(text: str, auto_enter: bool = False):
