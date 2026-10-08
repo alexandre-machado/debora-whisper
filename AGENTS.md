@@ -25,3 +25,12 @@
 - Implemented robust hardware identification logging using `nvidia-smi` and OpenVINO properties so the logs state the exact GPU/NPU model name (e.g., "NVIDIA GeForce RTX 4070").
 - Separated telemetry and application logs.
 - Implemented real-time resource tracking (CPU, System RAM, App RAM, and VRAM) in the telemetry loop.
+
+## Token-Efficient Workflow
+- Start with targeted `rg` searches and read only the relevant functions or line ranges. Avoid dumping entire files, workflows, logs, or test collections when a focused query answers the question.
+- Keep track of relevant files, symbols, and findings. Re-read only changed sections or information needed to resolve a new uncertainty.
+- Batch independent searches and keep tool output concise. Request summaries, failure details, or filtered results instead of large outputs that will be truncated.
+- Finish the intended code and test edits before starting the full test suite. Do not edit source or test files while tests are running; this can invalidate results and cause source-inspection failures.
+- Run focused tests for the affected behavior, then the full suite when appropriate or required. Repeat checks only after relevant changes, failures, or unresolved concerns; avoid redundant builds and test runs.
+- For long-running tests and CI, use completion notifications or reasonably spaced status checks. Keep progress updates useful without repeatedly querying unchanged status.
+- Preserve required validation and correctness. Reduce redundant context and operations rather than skipping necessary investigation or checks.
