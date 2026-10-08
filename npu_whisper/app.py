@@ -17,6 +17,7 @@ from npu_whisper.dictation_engine import (
     is_model_downloaded, device_failure,
     apply_device_priority, avoid_lost_npu, detect_devices, rotate_logs, select_device,
 )
+from npu_whisper.npu_probe import probe_npu
 from npu_whisper.ui.tray import TrayManager
 from npu_whisper.ui.overlay import OverlayWindow
 from npu_whisper.ui.settings import SettingsWindow
@@ -224,49 +225,48 @@ class GUIApp:
                 )
                 self._engine.fallback_device(fallback_dev)
 
+    # Seconds before each NPU recovery probe. A lost NPU failed probes a
+    # minute later but worked again (without a reboot) some minutes after.
+    NPU_PROBE_DELAYS = (30, 60, 300, 900)
+
     def _schedule_npu_recovery(self):
         if not hasattr(self, "_npu_retry_count"):
             self._npu_retry_count = 0
-            
-        if self._npu_retry_count == 0:
-            delay = 30000
-        elif self._npu_retry_count == 1:
-            delay = 60000
-        else:
-            from npu_whisper.dictation_engine import log
+        if self._npu_retry_count >= len(self.NPU_PROBE_DELAYS):
             log("NPU recovery retries exhausted. Staying on fallback device.")
             return
-            
+        delay = self.NPU_PROBE_DELAYS[self._npu_retry_count]
         self._npu_retry_count += 1
-        from npu_whisper.dictation_engine import log
-        log(f"Scheduling background NPU recovery probe in {delay//1000}s (Attempt {self._npu_retry_count}/2)...")
-        
+        log(f"Scheduling background NPU recovery probe in {delay}s "
+            f"(Attempt {self._npu_retry_count}/{len(self.NPU_PROBE_DELAYS)})...")
+
         def _probe_thread():
             import time
-            time.sleep(delay / 1000.0)
+            time.sleep(delay)
             self._run_npu_recovery_probe()
-            
+
         import threading
         threading.Thread(target=_probe_thread, daemon=True).start()
 
     def _run_npu_recovery_probe(self):
-        from npu_whisper.dictation_engine import setup_model, create_model, MODEL_REGISTRY
-        from npu_whisper.dictation_engine import log
+        from npu_whisper.dictation_engine import (
+            setup_model, create_model, forget_npu_loss, MODEL_REGISTRY, log)
         import numpy as np
-        
+
         if self._engine.config["device"] == "NPU":
             return
-            
-        log("Probing NPU recovery in background...")
+
+        log("Probing NPU recovery in a separate process...")
         try:
             model_info = MODEL_REGISTRY[self._config["model_size"]]
             probe_config = self._config.copy()
             probe_config["device"] = "NPU"
             model_path = setup_model(probe_config)
-            
-            # Do not compile uncached here: a long NPU compile holds the GIL
-            # and froze the whole app. The cached load fails fast while the
-            # quarantined model still holds the ov-cache blob.
+
+            # Loading on a lost NPU can hang in the driver while holding the
+            # GIL, which froze the whole app: only load here once a separate
+            # process, killed if it hangs, has run the model on the NPU.
+            probe_npu(probe_config, model_path)
             test_model = create_model(model_path, device="NPU", backend=model_info["backend"],
                                       model_size=self._config["model_size"])
             # Loaders fall back silently on benign errors (e.g. a locked
@@ -278,6 +278,7 @@ class GUIApp:
             test_model.transcribe(silence, sample_rate=self._config["sample_rate"], language=self._config.get("language", "en"))
             
             log("NPU recovery successful! Swapping active engine back to NPU seamlessly...")
+            forget_npu_loss()
             engine = self._engine
             self._root.after(0, lambda: self._swap_to_recovered_npu(engine, test_model))
 
@@ -564,9 +565,11 @@ def main():
     rotate_logs()
     if not args.device:
         apply_device_priority(config)
-    avoid_lost_npu(config)
+    check_npu = avoid_lost_npu(config)
 
     app = GUIApp(config)
+    if check_npu:
+        app._schedule_npu_recovery()
     app.run()
 
 

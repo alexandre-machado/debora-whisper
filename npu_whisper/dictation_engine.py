@@ -31,7 +31,7 @@ TELEMETRY_LOG = LOG_DIR / "telemetry.log"
 TTS_SERVER_LOG = LOG_DIR / "tts_server.log"
 # At startup a larger log moves to <name>.1, replacing the previous one.
 LOG_MAX_BYTES = 5_000_000
-# An NPU lost to DEVICE_LOST, kept until Windows restarts (see npu_lost_this_boot).
+# An NPU lost to DEVICE_LOST, until a recovery probe or a reboot (npu_lost_this_boot).
 NPU_LOST_FILE = CONFIG_DIR / "npu_lost.json"
 
 DEFAULT_CONFIG = {
@@ -587,12 +587,22 @@ def remember_npu_loss(detail: str):
         log(f"Cannot record the NPU failure in {NPU_LOST_FILE}: {e}")
 
 
+def forget_npu_loss():
+    """The NPU works again (the recovery probe ran a model on it)."""
+    try:
+        NPU_LOST_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def npu_lost_this_boot() -> dict | None:
     """The NPU failure recorded since Windows last started, or None.
 
-    A lost NPU stays lost until a reboot: in the next run, loading a model
-    on it hung inside the driver while holding the GIL, which froze the whole
-    app, console and Ctrl+C included."""
+    After a loss, loading a model on the NPU in the app froze it for
+    minutes (console and Ctrl+C included): the load holds the GIL while the
+    driver recovers or the model compiles again from scratch (~3 min for
+    turbo). Until the recovery probe (npu_probe, its own process) has run
+    the model on the NPU, the app starts on another device."""
     try:
         record = json.loads(NPU_LOST_FILE.read_text(encoding="utf-8"))
         boot = _boot_time()
@@ -608,16 +618,17 @@ def npu_lost_this_boot() -> dict | None:
     return None
 
 
-def avoid_lost_npu(config: dict):
-    """Move config["device"] off an NPU lost earlier in this boot."""
+def avoid_lost_npu(config: dict) -> bool:
+    """Move config["device"] off an NPU lost earlier in this boot; True if
+    it moved (the GUI then probes the NPU in the background)."""
     if config["device"] != "NPU" or not (lost := npu_lost_this_boot()):
-        return
+        return False
     when = datetime.fromtimestamp(lost["time"]).strftime("%H:%M")
     chosen = select_device(config, detect_devices(), exclude={"NPU"}) or "CPU"
-    log(f"The NPU failed at {when} ({lost.get('detail')}) and stays unusable until "
-        f"Windows restarts; using {chosen} instead. To try the NPU anyway, delete "
-        f"{NPU_LOST_FILE}.")
+    log(f"The NPU failed at {when} ({lost.get('detail')}); starting on {chosen} "
+        f"until a check in a separate process finds it working again.")
     config["device"] = chosen
+    return True
 
 
 def device_failure() -> dict | None:

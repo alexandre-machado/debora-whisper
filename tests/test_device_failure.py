@@ -539,7 +539,8 @@ def test_npu_recovery_probe_rejects_silent_cpu_fallback(genai):
     app, gui = _probe_gui(genai)
 
     with patch.object(app, "inject_recovered_model") as inject, \
-         patch.object(gui, "_schedule_npu_recovery") as recovery:
+         patch.object(gui, "_schedule_npu_recovery") as recovery, \
+         patch("npu_whisper.app.probe_npu"):
         gui._run_npu_recovery_probe()
 
     assert genai.loads == ["NPU", "CPU"]
@@ -550,10 +551,15 @@ def test_npu_recovery_probe_rejects_silent_cpu_fallback(genai):
 
 def test_npu_recovery_probe_swaps_when_npu_loads(genai):
     app, gui = _probe_gui(genai)
+    de.remember_npu_loss("DEVICE_LOST")
 
     with patch.object(app, "inject_recovered_model") as inject, \
-         patch.object(gui, "_schedule_npu_recovery") as recovery:
+         patch.object(gui, "_schedule_npu_recovery") as recovery, \
+         patch("npu_whisper.app.probe_npu") as probe:
         gui._run_npu_recovery_probe()
+
+    probe.assert_called_once()
+    assert not de.NPU_LOST_FILE.exists()
 
     assert genai.loads == ["NPU"]
     inject.assert_called_once()
@@ -561,6 +567,62 @@ def test_npu_recovery_probe_swaps_when_npu_loads(genai):
     recovery.assert_not_called()
     # An uncached NPU compile holds the GIL for minutes and froze the app.
     assert "CACHE_DIR" in genai.load_kwargs[0]
+
+
+def test_failed_npu_probe_never_loads_on_the_npu_in_the_app(genai):
+    """The probe process said no (or hung and was killed): the app itself
+    must not touch the NPU, or a hung load freezes it."""
+    app, gui = _probe_gui(genai)
+
+    with patch.object(app, "inject_recovered_model") as inject, \
+         patch.object(gui, "_schedule_npu_recovery") as recovery, \
+         patch("npu_whisper.app.probe_npu", side_effect=RuntimeError("no answer in 300s")):
+        gui._run_npu_recovery_probe()
+
+    assert genai.loads == []
+    inject.assert_not_called()
+    recovery.assert_called_once()
+
+
+def test_hung_probe_process_is_killed_after_the_timeout():
+    from npu_whisper import npu_probe
+    import time
+    start = time.time()
+    with pytest.raises(RuntimeError, match="no answer in 1s"):
+        npu_probe.probe_npu({}, None, timeout=1,
+                            command=[sys.executable, "-c", "import time; time.sleep(60)"])
+    assert time.time() - start < 10
+
+
+def test_probe_process_failure_reports_its_last_line():
+    from npu_whisper import npu_probe
+    with pytest.raises(RuntimeError, match="^probe model loaded on CPU, not NPU$"):
+        npu_probe.probe_npu({}, None, command=[
+            sys.executable, "-c",
+            "print('Loading...'); print('probe model loaded on CPU, not NPU'); exit(1)"])
+    npu_probe.probe_npu({}, None, command=[sys.executable, "-c", "pass"])
+
+
+def test_probe_process_runs_the_model_on_the_npu(genai, tmp_path):
+    from npu_whisper import npu_probe
+    genai.generate_error = None
+    assert npu_probe.run(str(tmp_path), "whisper", "base", "pt", 16000) == 0
+    assert genai.loads == ["NPU"]
+
+
+def test_probe_process_fails_when_the_model_lands_elsewhere(genai, tmp_path, capsys):
+    from npu_whisper import npu_probe
+    genai.load_errors = {"NPU": "remove: The process cannot access the file"}
+    assert npu_probe.run(str(tmp_path), "whisper", "base", "pt", 16000) == 1
+    assert capsys.readouterr().out.strip().endswith("probe model loaded on CPU, not NPU")
+
+
+def test_probe_command_runs_the_probe_module():
+    from npu_whisper import npu_probe
+    command = npu_probe.probe_command({**DEFAULT_CONFIG, "model_size": "turbo",
+                                       "language": "pt"}, "D:/m")
+    assert command[:3] == [sys.executable, "-m", "npu_whisper.npu_probe"]
+    assert command[3:] == ["D:/m", "whisper", "turbo", "pt", str(DEFAULT_CONFIG["sample_rate"])]
 
 
 class QueuedRoot(Root):
@@ -731,3 +793,31 @@ def test_large_logs_are_rotated(tmp_path, monkeypatch):
 def test_tests_never_write_the_real_app_log():
     from npu_whisper import paths
     assert paths.LOG_DIR not in de.LOG_FILE.parents
+
+
+def test_startup_after_an_npu_loss_probes_it_in_the_background(monkeypatch):
+    from npu_whisper import app as app_module
+    monkeypatch.setattr(de, "_boot_time", lambda: 1000.0)
+    monkeypatch.setattr(de, "detect_devices", lambda: {"NPU", "GPU", "CPU"})
+    de.remember_npu_loss("DEVICE_LOST")
+    created = []
+
+    class FakeGUI:
+        def __init__(self, config):
+            self.config, self.scheduled = config, 0
+            created.append(self)
+
+        def _schedule_npu_recovery(self):
+            self.scheduled += 1
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(app_module, "GUIApp", FakeGUI)
+    monkeypatch.setattr(app_module, "_claim_single_instance", lambda: True)
+    monkeypatch.setattr(app_module, "load_config", lambda: _priority_config())
+    monkeypatch.setattr(sys, "argv", ["npu-whisper", "--device", "NPU"])
+    app_module.main()
+
+    assert created[0].config["device"] == "GPU"
+    assert created[0].scheduled == 1
