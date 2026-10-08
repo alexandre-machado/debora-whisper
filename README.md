@@ -155,6 +155,7 @@ Stored at `~/.npu-dictation/config.json`:
   "hotkey": "ctrl+space",
   "tap_action": "continuous",
   "auto_enter": false,
+  "inline_drafts": false,
   "beep_on_start": true,
   "max_record_seconds": 60,
   "sample_rate": 16000
@@ -185,6 +186,13 @@ ellipses use the longer wait. This is a punctuation heuristic, not semantic
 understanding. Without a usable draft the normal timeout applies. Set both
 values equal to disable the extension. Manual stop and the segment duration
 limit still apply; push-to-talk and voice chat keep their existing behavior.
+
+In continuous dictation, drafts appear in the overlay and each finished
+sentence is pasted once. `inline_drafts: true` also types drafts into the
+target window and rewrites them in place with Shift+Left and Backspace. That
+only works where the editor leaves the typed text and caret alone; editors
+with autocomplete, auto-closing brackets, autocorrect or slow input handling
+(browsers, Word, IDEs) can garble the result.
 
 ### Voice chat (OpenVINO LLM + Chatterbox)
 

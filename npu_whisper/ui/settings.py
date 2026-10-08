@@ -290,6 +290,12 @@ class SettingsWindow:
             variable=self._enter_var, **chk_opts,
         ).pack(anchor="w", pady=2)
 
+        self._inline_drafts_var = ctk.BooleanVar(value=self._config.get("inline_drafts", False))
+        ctk.CTkCheckBox(
+            toggles_frame, text="Type live drafts into the window (may garble some editors)",
+            variable=self._inline_drafts_var, **chk_opts,
+        ).pack(anchor="w", pady=2)
+
         self._voice_chat_var = ctk.BooleanVar(value=self._config.get("voice_chat", False))
         ctk.CTkCheckBox(
             toggles_frame, text="Voice chat: talk to a local LLM and hear the reply",
@@ -403,6 +409,7 @@ class SettingsWindow:
         new_config["language"] = self._get_selected_lang_code()
         new_config["beep_on_start"] = self._beep_var.get()
         new_config["auto_enter"] = self._enter_var.get()
+        new_config["inline_drafts"] = self._inline_drafts_var.get()
         new_config["voice_chat"] = self._voice_chat_var.get()
         new_config["show_balloon"] = self._balloon_var.get()
         try:

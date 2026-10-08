@@ -47,6 +47,11 @@ DEFAULT_CONFIG = {
     "language": "en",          # Language code or "auto"
     "hotkey": "ctrl+space",    # Global hotkey to toggle recording
     "auto_enter": False,       # Press Enter after pasting (useful for Claude Code)
+    # Continuous drafts: shown in the overlay only, or also typed into the
+    # target and rewritten with Shift+Left. Rewriting assumes the editor
+    # leaves text and caret alone, which autocomplete, auto-closing pairs,
+    # autocorrect and slow targets (browsers, Word, IDEs) do not.
+    "inline_drafts": False,
     "beep_on_start": True,     # Audio feedback when recording starts/stops
     "max_record_seconds": 60,  # Max recording length
     "sample_rate": 16000,      # Whisper expects 16kHz
@@ -2862,7 +2867,7 @@ class DictationApp:
                             })
                             if len(self._history) > self.MAX_HISTORY:
                                 self._history = self._history[-self.MAX_HISTORY:]
-                        else:
+                        elif self.config.get("inline_drafts"):
                             # It's a draft. Type it so the user sees it real-time.
                             type_draft_text(text_to_type)
                             self._draft_typed_text = text

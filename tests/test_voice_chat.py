@@ -712,7 +712,7 @@ def test_switching_off_stops_the_reply_and_forgets_the_conversation():
 
 
 def test_sentence_typed_as_dictation_goes_to_the_llm_after_the_switch(typed):
-    app = _app(continuous_listening=True)
+    app = _app(continuous_listening=True, inline_drafts=True)
     app.is_recording = True
     _say(app, "ola tudo", is_final=False)  # typed as a dictation draft
     app.config["voice_chat"] = True

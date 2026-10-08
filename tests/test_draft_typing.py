@@ -50,7 +50,8 @@ def screen():
 
 def _app(**config):
     app = DictationApp({**DEFAULT_CONFIG, "beep_on_start": False,
-                        "continuous_listening": True, **config})
+                        "continuous_listening": True, "inline_drafts": True,
+                        **config})
     app.recorder = MagicMock()
     app.whisper = MagicMock()
     app._model_ready.set()
@@ -77,6 +78,17 @@ def test_draft_is_corrected_in_place(screen):
     # Only the differing tail is sent as final text.
     assert screen.pasted == [", tudo bem? "]
     assert app._draft_typed_text == ""
+
+
+def test_drafts_stay_in_overlay_by_default(screen):
+    app = _app(inline_drafts=DEFAULT_CONFIG["inline_drafts"])
+    _say(app, "Olá tudo", is_final=False)
+    assert app.last_draft_text == "Olá tudo... "
+    _say(app, "Olá, tudo bem?", is_final=True)
+
+    assert screen.drafted == []
+    assert screen.pasted == ["Olá, tudo bem? "]
+    assert screen.text == "Olá, tudo bem? "
 
 
 def test_final_equal_to_draft_still_presses_auto_enter(screen):
