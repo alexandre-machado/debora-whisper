@@ -59,9 +59,12 @@ DEFAULT_CONFIG = {
     # (null: never), so a stray tap does not leave the microphone open.
     "continuous_idle_stop_seconds": 120,
     # Voice chat: instead of typing, each final transcription goes to a local
-    # LLM (OpenVINO GenAI, in this process) and its reply is spoken by the
+    # LLM (OpenVINO GenAI, in its own process) and its reply is spoken by the
     # Chatterbox TTS server (npu_whisper/tts_server.py, its own uv env).
     "voice_chat": False,
+    # Silence that ends a sentence in voice chat (dictation: 1.5 s, room to
+    # think). The reply cannot start before it has passed.
+    "voice_chat_end_silence_seconds": 0.8,
     # Hugging Face repo (OpenVINO IR) or local directory. The int4-cw export
     # answers in ~0.4 s at ~15 tokens/s on a Core Ultra's Arc iGPU.
     "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
@@ -1540,10 +1543,19 @@ class AudioRecorder:
         # RMS threshold, used only when Silero cannot be loaded.
         self.energy_threshold = self.config.get("vad_energy_threshold", 0.005)
         self.min_speech_frames = int(sample_rate * self.config.get("vad_min_speech_seconds", 0.4))
-        self.end_silence_frames = int(sample_rate * self.config.get("vad_end_silence_seconds", 1.5))
         self.max_segment_frames = int(sample_rate * self.config.get("segment_max_seconds", 15))
         self.lookback_frames = int(sample_rate * self.config.get("vad_lookback_seconds", 0.5))
         self.trailing_frames = int(sample_rate * self.config.get("vad_trailing_seconds", 0.3))
+
+    @property
+    def end_silence_frames(self) -> int:
+        """Silence that ends a segment; shorter in voice chat, read each time
+        so switching modes applies to the next sentence."""
+        if self.config.get("voice_chat"):
+            seconds = self.config.get("voice_chat_end_silence_seconds", 0.8)
+        else:
+            seconds = self.config.get("vad_end_silence_seconds", 1.5)
+        return int(self.sample_rate * seconds)
 
     def warmup(self, timeout=3.0):
         """Open the stream continuously in the background."""

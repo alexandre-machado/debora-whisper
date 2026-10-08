@@ -445,7 +445,8 @@ class VoiceChat:
         self.config = config
         self.log = log
         self.tts_log_path = tts_log_path
-        self._play = play or _play_interruptible
+        # play(samples, rate, stop) per clip; None: a StreamPlayer per reply.
+        self._play = play
         self._llm = llm or (lambda messages, on_text, stop: generate_reply(
             messages, self.config, on_text, stop, self.log, llm_log_path))
         self._history: list[dict] = []
@@ -548,7 +549,7 @@ class VoiceChat:
                             tts_ok = False
                             self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
                     if audio is not None:
-                        clips.put(audio)
+                        clips.put((trim_silence(*audio), audio[1]))
             finally:
                 clips.put(None)
 
@@ -557,15 +558,20 @@ class VoiceChat:
         writer.start()
         renderer.start()
         self.speaking = True
+        play = self._play or StreamPlayer()
         try:
             while True:
                 clip = clips.get()
                 if clip is None or stop.is_set():
                     break
-                self._play(clip[0], clip[1], stop)
+                play(clip[0], clip[1], stop)
         finally:
-            self.speaking = False
-            stop.set()  # stops the writer and renderer threads
+            try:
+                if hasattr(play, "close"):
+                    play.close(interrupted=stop.is_set())  # waits for the last clip
+            finally:
+                self.speaking = False
+                stop.set()  # stops the writer and renderer threads
 
         if state["llm_error"] is not None and not state["reply"]:
             self.log(f"Voice chat: LLM failed ({state['llm_error']})")
@@ -579,15 +585,60 @@ class VoiceChat:
         return reply
 
 
-def _play_interruptible(samples, sample_rate, interrupt: threading.Event):
-    import sounddevice as sd
-    sd.play(samples, sample_rate)
-    duration = len(samples) / sample_rate
-    deadline = time.time() + duration + 0.5
-    while time.time() < deadline:
-        if interrupt.wait(0.05):
-            sd.stop()
+# Pause between two sentences, after their own silence is trimmed.
+SENTENCE_GAP_SECONDS = 0.15
+_SILENCE_LEVEL = 10 ** (-45 / 20)  # -45 dBFS
+
+
+def trim_silence(samples, sample_rate: int, keep_seconds=0.05):
+    """samples without the silence the TTS leaves before and after speech."""
+    import numpy as np
+    loud = np.flatnonzero(np.abs(samples) > _SILENCE_LEVEL)
+    if len(loud) == 0:
+        return samples[:0]
+    keep = int(sample_rate * keep_seconds)
+    return samples[max(loud[0] - keep, 0):loud[-1] + keep + 1]
+
+
+class StreamPlayer:
+    """Plays a reply's clips back to back on one output stream.
+
+    sd.play() opened a stream per clip: the next one started while the last
+    one's buffered tail was still playing, and the two overlapped."""
+
+    BLOCK_SECONDS = 0.05  # how soon an interrupt silences it
+
+    def __init__(self):
+        self._stream = None
+        self._rate = None
+
+    def __call__(self, samples, sample_rate: int, stop: threading.Event):
+        import numpy as np
+        import sounddevice as sd
+        if self._stream is not None and self._rate != sample_rate:
+            self.close(interrupted=False)
+        if self._stream is None:
+            self._stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32")
+            self._stream.start()
+            self._rate = sample_rate
+        else:
+            samples = np.concatenate([np.zeros(int(sample_rate * SENTENCE_GAP_SECONDS),
+                                               dtype=np.float32), samples])
+        data = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1, 1)
+        block = max(int(sample_rate * self.BLOCK_SECONDS), 1)
+        for start in range(0, len(data), block):
+            if stop.is_set():
+                return
+            # Blocks while the stream's buffer is full, so this keeps pace
+            # with playback.
+            self._stream.write(data[start:start + block])
+
+    def close(self, interrupted: bool):
+        """Let the queued audio finish (or drop it if interrupted)."""
+        stream, self._stream = self._stream, None
+        if stream is None:
             return
-        if not sd.get_stream().active:
-            return
-    sd.stop()
+        try:
+            stream.abort() if interrupted else stream.stop()
+        finally:
+            stream.close()

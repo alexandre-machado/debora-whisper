@@ -182,7 +182,9 @@ nothing is typed: each final transcription goes to a local LLM, and its reply
 is spoken by a local TTS server and shown in the overlay. The reply streams and
 plays sentence by sentence. The conversation keeps the last 8 turns and starts
 over after 10 minutes of silence. In continuous listening the microphone is
-muted while the reply plays; a hotkey press cuts the reply short.
+muted while the reply plays; a hotkey press cuts the reply short. A sentence
+ends after 0.8 s of silence (`voice_chat_end_silence_seconds`; dictation
+waits 1.5 s), and the reply's sentences play back to back on one audio stream.
 
 Switch it on or off while the app runs, from **Voice chat** in the tray menu
 or in Settings: no restart. Switching on starts the TTS server and loads the

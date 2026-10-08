@@ -761,3 +761,80 @@ def test_notice_shows_in_the_balloon_without_changing_state():
     gui._overlay.show_notice.assert_called_once_with("Voice chat ready")
     gui._overlay.show_recording.assert_not_called()
     gui._tray.update_state.assert_not_called()
+
+
+# --- Latency and playback -------------------------------------------------------
+
+def test_voice_chat_ends_a_sentence_after_a_shorter_silence():
+    config = {"voice_chat": False}
+    recorder = de.AudioRecorder(sample_rate=16000, config=config)
+    assert recorder.end_silence_frames == int(16000 * 1.5)
+    config["voice_chat"] = True  # switched while running
+    assert recorder.end_silence_frames == int(16000 * 0.8)
+    config["voice_chat_end_silence_seconds"] = 0.6
+    assert recorder.end_silence_frames == int(16000 * 0.6)
+
+
+def test_silence_around_a_clip_is_trimmed():
+    rate = 1000
+    speech = np.full(500, 0.2, dtype=np.float32)
+    clip = np.concatenate([np.zeros(300, np.float32), speech, np.zeros(700, np.float32)])
+    trimmed = vc.trim_silence(clip, rate)
+    assert len(trimmed) == 500 + 2 * 50  # 50 ms kept on each side
+    assert len(vc.trim_silence(np.zeros(100, np.float32), rate)) == 0
+
+
+class FakeStream:
+    instances = []
+
+    def __init__(self, samplerate, channels, dtype):
+        self.rate, self.written, self.ended = samplerate, [], None
+        FakeStream.instances.append(self)
+
+    def start(self):
+        pass
+
+    def write(self, data):
+        self.written.append(len(data))
+
+    def stop(self):
+        self.ended = "drained"
+
+    def abort(self):
+        self.ended = "dropped"
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def stream(monkeypatch):
+    FakeStream.instances = []
+    monkeypatch.setitem(sys.modules, "sounddevice", MagicMock(OutputStream=FakeStream))
+    return FakeStream.instances
+
+
+def test_clips_of_a_reply_share_one_stream_with_a_pause_between(stream):
+    player, stop = vc.StreamPlayer(), threading.Event()
+    player(np.ones(24000, np.float32), 24000, stop)
+    player(np.ones(24000, np.float32), 24000, stop)
+    player.close(interrupted=False)
+    assert len(stream) == 1
+    gap = int(24000 * vc.SENTENCE_GAP_SECONDS)
+    assert sum(stream[0].written) == 2 * 24000 + gap
+    assert stream[0].ended == "drained"  # the last clip plays to its end
+
+
+def test_interrupt_drops_the_queued_audio(stream):
+    player, stop = vc.StreamPlayer(), threading.Event()
+    stop.set()
+    player(np.ones(24000, np.float32), 24000, stop)
+    player.close(interrupted=True)
+    assert stream[0].written == [] and stream[0].ended == "dropped"
+
+
+def test_reply_plays_through_one_stream_player(server, stream, monkeypatch):
+    chat = vc.VoiceChat(_cfg(server), log=lambda m: None,
+                        llm=FakeLLM(["A capital é Canberra. Fica no sul do país."]))
+    assert chat.respond("capital") == "A capital é Canberra. Fica no sul do país."
+    assert len(stream) == 1 and stream[0].ended == "drained"
