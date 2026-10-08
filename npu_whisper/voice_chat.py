@@ -31,7 +31,9 @@ DEFAULT_VOICE_CHAT_PROMPT = (
     "recognizer, so their text may contain recognition mistakes: read it for "
     "what they most likely said. Your reply is read aloud, so answer in the "
     "user's language, briefly (one to three short sentences), in plain spoken "
-    "language: no markdown, lists, emoji, code or URLs."
+    "language: no markdown, lists, emoji, code or URLs. You have no internet "
+    "or tools: when asked what you cannot know, such as the weather or the "
+    "news, say so instead of guessing."
 )
 LLM_MAX_TOKENS = 400
 # Earlier turns sent with each request, and how long a pause starts a fresh
@@ -472,6 +474,8 @@ class VoiceChat:
             from npu_whisper.dictation_engine import LANGUAGES
             name = LANGUAGES.get(language, language)
             prompt += f" The user speaks {name}: reply in {name}."
+        # Without it, asked the time at 00:25, it said 10 in the morning.
+        prompt += f" It is now {time.strftime('%A, %Y-%m-%d %H:%M')}."
         recent = self._history[-2 * HISTORY_TURNS:]
         return [{"role": "system", "content": prompt}, *recent,
                 {"role": "user", "content": text}]
@@ -577,7 +581,14 @@ class VoiceChat:
             self.log(f"Voice chat: LLM failed ({state['llm_error']})")
             return ""
         reply = state["reply"]
-        if reply:
+        if reply and any(turn == {"role": "assistant", "content": reply}
+                         for turn in self._history):
+            # A copy of an earlier reply. Kept in the history, it made the
+            # next replies copies too, whatever the user said.
+            self.log("Voice chat: the LLM repeated an earlier reply; "
+                     "not keeping it in the conversation.")
+            self._last_turn = time.time()
+        elif reply:
             self._history += [{"role": "user", "content": text},
                               {"role": "assistant", "content": reply}]
             self._last_turn = time.time()

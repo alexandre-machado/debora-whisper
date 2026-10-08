@@ -110,6 +110,19 @@ def test_server_templates_without_thinking(genai):
     assert json.loads(prompt)[1] == {"enable_thinking": False}
     assert config.max_new_tokens == 400
     assert config.apply_chat_template is False  # already templated
+    assert config.repetition_penalty == 1.1
+
+
+def test_each_reply_draws_its_own_seed(genai):
+    """The default seed, a fixed 0, made replies repeat themselves."""
+    from types import SimpleNamespace
+    genai.GenerationConfig = SimpleNamespace
+    pipes = []
+    genai.LLMPipeline = lambda *a, **k: pipes.append(FakePipeline(*a, **k)) or pipes[-1]
+    _serve({"id": 1, "messages": [], "max_new_tokens": 9},
+           {"id": 2, "messages": [], "max_new_tokens": 9})
+    seeds = [config.rng_seed for _, config in pipes[0].prompts]
+    assert len(seeds) == 2 and seeds[0] != seeds[1]
     assert pipes[0].properties == {"CACHE_DIR": "cache"}
 
 

@@ -111,7 +111,8 @@ def test_reply_is_streamed_and_spoken_sentence_by_sentence(server):
     assert played == [(2400, 24000)] * 2
     assert llm.calls[0] == [
         {"role": "system", "content": vc.DEFAULT_VOICE_CHAT_PROMPT +
-         " The user speaks Portuguese: reply in Portuguese."},
+         " The user speaks Portuguese: reply in Portuguese." +
+         time.strftime(" It is now %A, %Y-%m-%d %H:%M.")},
         {"role": "user", "content": "qual é a capital da austrália"}]
     assert [b["language"] for p, b in server.requests if p == "/tts"] == ["pt"] * 2
 
@@ -132,7 +133,7 @@ def test_configured_prompt_is_used(server):
     llm = FakeLLM(["ok"])
     chat, _ = _chat(server, llm, llm_prompt="Seja breve.", language="auto")
     chat.respond("oi")
-    assert llm.calls[0][0]["content"] == "Seja breve."
+    assert llm.calls[0][0]["content"] == "Seja breve." +         time.strftime(" It is now %A, %Y-%m-%d %H:%M.")
 
 
 def test_earlier_turns_are_sent_as_history(server):
@@ -145,6 +146,18 @@ def test_earlier_turns_are_sent_as_history(server):
         {"role": "user", "content": "capital da austrália"},
         {"role": "assistant", "content": "Canberra."},
         {"role": "user", "content": "e quantos habitantes"}]
+
+
+def test_a_repeated_reply_is_not_kept_in_the_history(server):
+    """A copy in the history made every next reply a copy too."""
+    llm = FakeLLM(["Parece que quer brincar."])
+    chat, _ = _chat(server, llm)
+    chat.respond("ah, mas você")
+    assert chat.respond("e...") == "Parece que quer brincar."  # still spoken
+    llm.chunks = ["Não sei, não tenho acesso à previsão."]
+    chat.respond("vai chover amanhã?")
+    assert [m["content"] for m in llm.calls[2][1:]] == [
+        "ah, mas você", "Parece que quer brincar.", "vai chover amanhã?"]
 
 
 def test_history_resets_after_a_long_pause(server):

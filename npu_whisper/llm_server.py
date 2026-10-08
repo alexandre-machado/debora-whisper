@@ -20,6 +20,7 @@ The process exits when stdin closes, so it never outlives the app.
 """
 import json
 import queue
+import random
 import sys
 import threading
 import time
@@ -65,6 +66,11 @@ def generate(pipe, request: dict, cancelled: threading.Event, say):
         generation.temperature = 0.7
         generation.top_p = 0.8
         generation.top_k = 20
+        # The default seed is a fixed 0: every reply drew the same numbers.
+        generation.rng_seed = random.randrange(1 << 31)
+        # With a reply repeated in the history, it answered every question
+        # with that reply again: 5 of 6 seeds without this, 0 with it.
+        generation.repetition_penalty = 1.1
 
         def streamer(chunk):
             if cancelled.is_set():
