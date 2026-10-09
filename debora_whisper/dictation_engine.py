@@ -3299,6 +3299,7 @@ class DictationApp:
         try:
             # The TTS server (its own process, on the RTX) starts now.
             ensure_tts_server(self.config, log, TTS_SERVER_LOG)
+            self.voice_chat.warm_tts()
             if self.config.get("voice_chat_backend", "local") == "claude":
                 if self.config.get("voice_chat") and not self._stopping.is_set():
                     from debora_whisper.harness import start_harness
@@ -3480,6 +3481,8 @@ class DictationApp:
         log("Loading model in background (first time may take several minutes)...")
         load_thread = threading.Thread(target=self._load_model_background, daemon=True)
         load_thread.start()
+        if self.config.get("voice_chat"):
+            self._warm_up_voice_chat()
         self._start_segment_consumer()
 
         try:

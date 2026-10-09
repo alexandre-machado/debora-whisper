@@ -2,6 +2,7 @@
 spoken by a local TTS server instead of being typed."""
 import io
 import json
+import re
 import sys
 import threading
 import time
@@ -766,6 +767,107 @@ def test_each_spoken_sentence_is_logged(server):
         "Voice chat: reply 'Fica no sul do país.'"]
 
 
+def test_tts_timings_follow_each_chunk_through_playback(server):
+    logs = []
+    chat, played = _chat(server, FakeLLM(["A capital é Canberra. Fica no sul do país."]))
+    chat.log = logs.append
+    chat.respond("capital")
+    chunks = [line for line in logs if " chunk=" in line]
+    assert len(chunks) == len(played) == 2
+    for line in chunks:
+        times = {key: float(value) for key, value in re.findall(r"(\w+)=(\d+\.\d+)s", line)}
+        assert times["enqueued"] <= times["synth_start"] <= times["synth_end"] <= times["play"]
+        assert times["audio"] == pytest.approx(0.1)
+    assert len([line for line in logs if " first_audio=" in line]) == 1
+    assert not any("first_audio=-" in line for line in logs)
+
+
+@pytest.mark.parametrize("boundary", [",", ";", ":", " —"])
+def test_only_the_first_reply_chunk_splits_at_a_clause(server, boundary):
+    head = "Eu posso explicar isso" + boundary
+    tail = " porque temos bastante tempo para conversar. "
+    later = "Agora temos outra frase, que deve continuar inteira."
+    chat, _ = _chat(server, FakeLLM([head + " ", tail, later]))
+    chat.respond("explique")
+    assert _tts_texts(server) == [vc.speakable(head), tail.strip(), later]
+
+
+def test_first_chunk_uses_twelve_complete_words_without_punctuation():
+    head = "uma duas três quatro cinco seis sete oito nove dez onze doze"
+    assert vc.split_sentences(head + " tre", first=True) == ([head], "tre")
+    assert vc.split_sentences(head[:-1], first=True) == ([], head[:-1])
+    # A clause later in the same delta must not move the cut past word 12.
+    assert vc.split_sentences(head + " treze quatorze, depois", first=True) == (
+        [head], "treze quatorze, depois")
+    assert vc.split_sentences("Eu vi, mas ainda não terminei", first=True)[0] == []
+    assert vc.split_sentences("Eu posso explicar — depois", first=True)[0] == []
+    assert vc.split_sentences("a b c d, resto", first=True)[0] == []
+
+
+def test_warmup_discards_audio_and_caches_waiting_phrase(server):
+    chat, played = _chat(server, FakeLLM())
+    for _ in range(2):
+        worker = chat.warm_tts()
+        worker.join(5)
+        assert not worker.is_alive()
+    assert _tts_texts(server) == ["Olá, estou pronta.", "Um instante."]
+    assert not played
+    assert chat._waiting_audio(chat.config) is chat._waiting_audio(chat.config)
+    assert len(server.requests) == 2
+
+
+@pytest.mark.parametrize("key,value", [("tts_voice", "another"), ("language", "en"),
+                                      ("tts_url", "http://127.0.0.1:9999")])
+def test_waiting_cache_is_invalidated_by_settings(key, value, monkeypatch):
+    synth = MagicMock(side_effect=[(AUDIO, 16000), (AUDIO.copy(), 16000)])
+    monkeypatch.setattr(vc, "synthesize", synth)
+    chat = vc.VoiceChat({**DEFAULT_CONFIG, "language": "pt"})
+    old = chat._waiting_audio(chat.config)
+    assert chat._waiting_audio(chat.config) is old
+    chat.config[key] = value
+    assert chat._waiting_audio(chat.config) is not old
+    assert synth.call_count == 2
+
+
+def test_warmup_returns_while_server_loads_and_failure_does_not_poison_cache(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    def wait(config):
+        entered.set()
+        assert release.wait(5)
+        return True
+
+    monkeypatch.setattr(vc, "wait_tts_server", wait)
+    synth = MagicMock(side_effect=[vc.TTSRejected("cold"), (AUDIO, 16000)])
+    monkeypatch.setattr(vc, "synthesize", synth)
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), log=lambda m: None)
+    worker = chat.warm_tts()
+    try:
+        assert entered.wait(5) and worker.is_alive()
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert chat._waiting_audio(chat.config)[1] == 16000
+    assert synth.call_count == 2
+
+
+def test_waiting_phrase_is_reused_across_turns(server, monkeypatch):
+    # Trigger feedback deterministically, before the writer's first delta.
+    def timer(delay, callback):
+        return MagicMock(start=callback)
+
+    monkeypatch.setattr(vc.threading, "Timer", timer)
+    chat, played = _chat(server, FakeLLM(["A capital é Canberra."]), voice_chat_backend="claude")
+    logs = []
+    chat.log = logs.append
+    chat.respond("capital")
+    chat.respond("capital")
+    assert _tts_texts(server) == ["Um instante.", "A capital é Canberra.", "A capital é Canberra."]
+    assert len(played) == 4
+    assert len([line for line in logs if " cached" in line]) == 1
+
+
 # --- Switching voice chat while running ---------------------------------------
 
 @pytest.fixture
@@ -773,6 +875,8 @@ def loader(monkeypatch):
     """The engine's LLM loading, recorded instead of run."""
     calls = []
     monkeypatch.setattr(de, "ensure_tts_server", lambda *a: calls.append("tts"))
+    # Never warm the user's real server from the engine loading tests.
+    monkeypatch.setattr(vc.VoiceChat, "warm_tts", MagicMock())
     monkeypatch.setattr(de, "download_llm", lambda *a: calls.append("download"))
     monkeypatch.setattr(de, "llm_loaded", lambda config: False)
 
@@ -805,6 +909,7 @@ def test_switching_on_loads_the_llm_in_the_background(loader):
     assert app.config["voice_chat"] is True
     # Downloaded first, then compiled with every transcription held back.
     assert loader == ["tts", "download", ("llm", True)]
+    vc.VoiceChat.warm_tts.assert_called_once()
     assert notices == ["Voice chat: loading the LLM...", "Voice chat ready"]
 
 

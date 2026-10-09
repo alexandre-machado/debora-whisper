@@ -244,8 +244,35 @@ def spoken_numbers(text: str, language) -> str:
                   number, text)
 
 
-def split_sentences(buffer: str) -> tuple[list[str], str]:
-    """Complete sentences in buffer, and the unfinished rest."""
+def split_sentences(buffer: str, first=False) -> tuple[list[str], str]:
+    """Complete sentences and unfinished rest; optionally shorten the first."""
+    if first:
+        sentence_end = _SENTENCE_END.search(buffer)
+        limit = sentence_end.start() if sentence_end else len(buffer)
+        cuts = []
+        for boundary in re.finditer(r"[,;:](?=\s)| — ", buffer[:limit]):
+            head = buffer[:boundary.end()]
+            spoken = speakable(head)
+            words = sum(any(c.isalnum() for c in word) for word in spoken.split())
+            if words >= 4 and len(spoken) >= TTS_MIN_CHARS:
+                cuts.append(boundary.end())
+                break
+        # Only count complete words: a delta may end halfway through one.
+        words = list(re.finditer(r"\S+\s+", buffer[:limit]))
+        if len(words) >= 12 and not re.search(r"[,;:—.!?…]", buffer[:words[11].end()]):
+            cuts.append(words[11].end())
+        if cuts:
+            cut = min(cuts)
+            head = buffer[:cut].rstrip()
+            tail = buffer[cut:].lstrip()
+            # A complete short tail already in this delta can stay with
+            # the head, instead of creating a new undersized final clip.
+            spoken_tail = without_emoji(speakable(tail))
+            short_tail = (re.search(r"[.!?…]\s*$", spoken_tail)
+                          and len(spoken_tail) < TTS_MIN_CHARS)
+            if len(speakable(head)) >= TTS_MIN_CHARS and not short_tail:
+                done, rest = split_sentences(tail)
+                return [head, *done], rest
     parts = _SENTENCE_END.split(buffer)
     return [p for p in parts[:-1] if p.strip()], parts[-1]
 
@@ -667,7 +694,60 @@ class VoiceChat:
         self._history: list[dict] = []
         self._last_turn = 0.0
         self._interrupt = threading.Event()
+        self._tts_cache_lock = threading.RLock()
+        self._tts_cache_key = None
+        self._waiting_clip = None
+        self._tts_warmed = False
         self.speaking = False
+
+    def _select_tts_cache(self, config):
+        """Called under the cache lock; settings changes discard the old voice."""
+        key = (config.get("tts_voice"), config.get("language"), config.get("tts_url"))
+        if key != self._tts_cache_key:
+            self._tts_cache_key = key
+            self._waiting_clip = None
+            self._tts_warmed = False
+
+    def _waiting_audio(self, config, timing=None, started=0):
+        with self._tts_cache_lock:
+            self._select_tts_cache(config)
+            if self._waiting_clip is None:
+                if timing is not None:
+                    timing["synth_start"] = time.perf_counter() - started
+                try:
+                    self._waiting_clip = synthesize("Um instante.", config)
+                finally:
+                    if timing is not None:
+                        timing["synth_end"] = time.perf_counter() - started
+            elif timing is not None:
+                timing["cached"] = True
+            return self._waiting_clip
+
+    def warm_tts(self):
+        """Warm a started server without holding up the UI or LLM loading."""
+        config = dict(self.config)
+
+        def warm():
+            try:
+                with self._tts_cache_lock:
+                    self._select_tts_cache(config)
+                    if self._tts_warmed or not wait_tts_server(config):
+                        return
+                    if self.speaking:
+                        return  # a first turn arrived while the server loaded
+                    started = time.perf_counter()
+                    synthesize("Olá, estou pronta.", config)  # discarded, never played
+                    if self.speaking:
+                        return
+                    self._waiting_audio(config)
+                    self._tts_warmed = True
+                    self.log(f"Voice chat: TTS warmed in {time.perf_counter() - started:.1f}s")
+            except Exception as e:
+                self.log(f"Voice chat: TTS warm-up failed ({e}); will try on the next reply.")
+
+        worker = threading.Thread(target=warm, daemon=True)
+        worker.start()
+        return worker
 
     def reset(self):
         self.interrupt()
@@ -723,6 +803,35 @@ class VoiceChat:
     def respond(self, text: str, on_reply=None) -> str:
         """Ask the LLM, speak its reply and return the text spoken so far
         ("" if the LLM failed). on_reply(text) gets the reply as it grows."""
+        started = time.perf_counter()
+        turn = time.monotonic_ns()
+        timings = []
+        timing_lock = threading.Lock()
+        first_audio = None
+
+        def enqueue(sentence):
+            with timing_lock:
+                timing = {"chunk": len(timings) + 1, "enqueued": time.perf_counter() - started}
+                timings.append(timing)
+                sentences.put((sentence, timing))
+
+        def log_timing(timing):
+            with timing_lock:
+                if timing.get("logged"):
+                    return
+                timing["logged"] = True
+                fields = " ".join(f"{key}={timing[key]:.3f}s" if key in timing else f"{key}=-"
+                                  for key in ("enqueued", "synth_start", "synth_end", "audio", "play"))
+                self.log(f"Voice chat: TTS turn={turn} chunk={timing['chunk']} {fields}"
+                         + (" cached" if timing.get("cached") else ""))
+
+        def playback_started(timing):
+            nonlocal first_audio
+            timing["play"] = time.perf_counter() - started
+            if first_audio is None:
+                first_audio = timing["play"]
+            log_timing(timing)
+
         if (self.config.get("voice_chat_backend", "local") == "claude"
                 and text.strip().rstrip(".!?").casefold() in ("nova conversa", "new conversation")):
             self.reset()
@@ -741,7 +850,7 @@ class VoiceChat:
         # short to send alone.
         # said: whether a sentence was kept, so an offer of help after it can go.
         state = {"reply": "", "llm_error": None, "buffer": "", "short": "", "tokens": False,
-                 "said": False, "markdown_pending": "", "fence": ""}
+                 "said": False, "markdown_pending": "", "fence": "", "first": True}
         start = time.time()
         waiting = object()
         feedback_lock = threading.Lock()
@@ -751,7 +860,7 @@ class VoiceChat:
             with feedback_lock:
                 if not state["tokens"] and not stop.is_set() and not finished.is_set():
                     self.log("Voice chat: waiting for Claude. Um instante.")
-                    sentences.put(waiting)
+                    enqueue(waiting)
 
         timer = threading.Timer(1.5, feedback) if claude else None
 
@@ -772,7 +881,7 @@ class VoiceChat:
             if claude:
                 chunk, state["markdown_pending"], state["fence"] = speech_markdown(
                     state["markdown_pending"] + chunk, state["fence"])
-            done, state["buffer"] = split_sentences(state["buffer"] + chunk)
+            done, state["buffer"] = split_sentences(state["buffer"] + chunk, first=state["first"])
             for sentence in done:
                 if unwanted(sentence):
                     continue
@@ -781,7 +890,8 @@ class VoiceChat:
                     state["short"] = sentence
                 else:
                     state["short"] = ""
-                    sentences.put(sentence)
+                    state["first"] = False
+                    enqueue(sentence)
 
         def write():
             try:
@@ -790,12 +900,12 @@ class VoiceChat:
                     state["buffer"] = ""
                 rest = f"{state['short']} {state['buffer']}".strip()
                 if rest and not stop.is_set():
-                    sentences.put(rest)
+                    enqueue(rest)
             except Exception as e:
                 state["llm_error"] = e
                 self.log(f"Voice chat: LLM failed ({e})")
                 if claude and not stop.is_set():
-                    sentences.put("Não consegui falar com o Claude. Confira a pasta e o log da Débora.")
+                    enqueue("Não consegui falar com o Claude. Confira a pasta e o log da Débora.")
             finally:
                 with feedback_lock:
                     finished.set()
@@ -807,9 +917,10 @@ class VoiceChat:
             tts_ok = None  # unknown until the first sentence
             try:
                 while not stop.is_set():
-                    sentence = sentences.get()
-                    if sentence is None:
+                    item = sentences.get()
+                    if item is None:
                         return
+                    sentence, timing = item
                     is_feedback = sentence is waiting
                     if is_feedback:
                         sentence = "Um instante."
@@ -833,7 +944,15 @@ class VoiceChat:
                             self.log("Voice chat: TTS server not reachable; showing the reply only.")
                     if tts_ok:
                         try:
-                            audio = synthesize(spoken, self.config)
+                            config = dict(self.config)
+                            if is_feedback:
+                                audio = self._waiting_audio(config, timing, started)
+                            else:
+                                timing["synth_start"] = time.perf_counter() - started
+                                try:
+                                    audio = synthesize(spoken, config)
+                                finally:
+                                    timing["synth_end"] = time.perf_counter() - started
                         except TTSRejected as e:
                             self.log(f"Voice chat: TTS skipped {spoken[:40]!r} ({e})")
                         except Exception as e:
@@ -841,7 +960,10 @@ class VoiceChat:
                             tts_ok = False
                             self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
                     if audio is not None:
-                        clips.put((trim_silence(*audio), audio[1]))
+                        timing["audio"] = len(audio[0]) / audio[1]
+                        clips.put((trim_silence(*audio), audio[1], timing))
+                    else:
+                        log_timing(timing)
             finally:
                 clips.put(None)
 
@@ -859,7 +981,13 @@ class VoiceChat:
                 clip = clips.get()
                 if clip is None or stop.is_set():
                     break
-                play(clip[0], clip[1], stop)
+                if len(clip[0]):
+                    if self._play is None:
+                        play(clip[0], clip[1], stop,
+                             on_start=lambda timing=clip[2]: playback_started(timing))
+                    else:
+                        playback_started(clip[2])
+                        play(clip[0], clip[1], stop)
         finally:
             try:
                 if hasattr(play, "close"):
@@ -867,6 +995,10 @@ class VoiceChat:
             finally:
                 self.speaking = False
                 stop.set()  # stops the writer and renderer threads
+                for timing in list(timings):
+                    log_timing(timing)
+                elapsed = f"{first_audio:.3f}s" if first_audio is not None else "-"
+                self.log(f"Voice chat: TTS turn={turn} first_audio={elapsed}")
 
         if state["llm_error"] is not None and not state["reply"]:
             self.log(f"Voice chat: LLM failed ({state['llm_error']})")
@@ -948,9 +1080,10 @@ class StreamPlayer:
         self._stream = None
         self._rate = None
 
-    def __call__(self, samples, sample_rate: int, stop: threading.Event):
+    def __call__(self, samples, sample_rate: int, stop: threading.Event, on_start=None):
         import numpy as np
         import sounddevice as sd
+        gap = 0
         if self._stream is not None and self._rate != sample_rate:
             self.close(interrupted=False)
         if self._stream is None:
@@ -958,13 +1091,18 @@ class StreamPlayer:
             self._stream.start()
             self._rate = sample_rate
         else:
-            samples = np.concatenate([np.zeros(int(sample_rate * SENTENCE_GAP_SECONDS),
-                                               dtype=np.float32), samples])
+            gap = int(sample_rate * SENTENCE_GAP_SECONDS)
+            samples = np.concatenate([np.zeros(gap, dtype=np.float32), samples])
         data = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1, 1)
         block = max(int(sample_rate * self.BLOCK_SECONDS), 1)
         for start in range(0, len(data), block):
             if stop.is_set():
                 return
+            if on_start is not None and start + block > gap:
+                # First speech block submitted to the output device. Its
+                # hardware buffer adds latency we cannot measure here.
+                on_start()
+                on_start = None
             # Blocks while the stream's buffer is full, so this keeps pace
             # with playback.
             self._stream.write(data[start:start + block])

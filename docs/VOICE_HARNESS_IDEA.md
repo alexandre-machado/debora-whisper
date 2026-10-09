@@ -11,10 +11,31 @@
 2. Texto quebra antes de ocupar a largura do balão — corrigido neste commit: medição e desenho usam toda a largura interna, com padding e fonte escalados por DPI.
 3. Animação diferente durante a fala — conferido, sem alteração: gravação usa `mascot_loop.webp`; fala começa com `mascot_zoom.webp` e depois volta ao loop; `mascot.png` é a imagem estática.
 4. Diagnósticos de shell sem perguntar — corrigido neste commit: `harness_allowed_tools`, padrões conservadores para Bash/PowerShell e prova com o CLI real; pedidos restantes continuam no handler.
-5. TTS começar mais cedo a partir do stream — em análise, separadamente.
+5. TTS começar mais cedo a partir do stream — implementado: tempos por chunk no
+   `app.log` (entrada na fila, início/fim da síntese, duração do WAV e início da
+   reprodução), além do tempo até o primeiro áudio por turno. Os tempos são em
+   segundos desde a entrada em `respond`; síntese inclui HTTP e espera no lock do
+   servidor; reprodução marca o envio do primeiro bloco de fala ao dispositivo,
+   sem medir a latência interna do hardware. `-` indica etapa não realizada ou
+   ainda pendente quando o turno foi interrompido; `cached` dispensa síntese.
+   Ao ativar a conversa, inclusive no início do app, o servidor parte em segundo
+   plano, faz uma síntese curta descartada e guarda “Um instante.” em memória por
+   voz, idioma e URL. Mudanças nessa chave invalidam o cache no próximo uso.
+   Só o primeiro trecho da resposta corta em vírgula, ponto e vírgula, dois-pontos
+   ou travessão após pelo menos quatro palavras, ou em cerca de doze palavras sem
+   pontuação; os seguintes mantêm sentenças e a junção de trechos curtos.
+   Diagnóstico anterior: 14,8 s de síntese para 13,2 s de áudio (~1,12× a duração)
+   e 6–7 s de carregamento ainda pendente no primeiro turno. Sem nova medição com
+   Chatterbox nesta sessão; ganho real e qualidade das pausas ainda precisam de
+   confirmação no app. CUDA graphs/static KV cache ficam para experimento separado.
 
 As mudanças visuais ainda precisam de confirmação no app, inclusive em monitores
-com DPI diferente. Não foram executados suíte de testes nem revisão de segurança.
+com DPI diferente. A validação desta mudança de TTS se limita a `py_compile` e
+`tests/test_voice_chat.py`; sem suíte completa nem revisão de segurança.
+`py_compile` passou; os testes tiveram 129 aprovações e uma falha preexistente:
+`test_switching_off_stops_the_reply_and_forgets_the_conversation` espera uma
+chamada a `interrupt()`, mas desligar já chama diretamente e via `reset()` no
+`HEAD` anterior a esta mudança.
 
 ## Decisão
 
