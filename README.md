@@ -554,6 +554,25 @@ if ($env:MODELS_DIR) { Rename-Item "$env:MODELS_DIR\voices.off" voices }
 uv tool install --editable .
 ```
 
+### Editable install with the NVIDIA backend
+
+The `cuda` extra adds faster-whisper and the CUDA runtime DLLs (~2 GB from
+PyPI). An editable install picks up code changes on restart, but changing
+extras needs a reinstall:
+
+```powershell
+uv tool install --editable ".[cuda]" --reinstall
+# back to the lighter install
+uv tool install --editable . --reinstall
+```
+
+With the extra installed, `device_priority` (`CUDA` first by default) moves
+Whisper to the RTX. When voice chat is on, Chatterbox also runs there, and an
+8 GB card can run out of video memory. To keep Whisper on the NPU, put `NPU`
+first in `device_priority` or start with `--device NPU`. The TTS server is not
+affected by the extra: it runs in its own uv environment with its own CUDA
+build of torch.
+
 `docs/` is source material (branding, voice recordings) and is not part of the
 wheel or the sdist; the voices the app uses ship in `debora_whisper/voices/`.
 
