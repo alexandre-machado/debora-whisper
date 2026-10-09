@@ -83,3 +83,67 @@ class TestTranscriptionThreading:
             else:
                 paste.assert_called_once_with('completed speech', auto_enter=False)
                 assert states == [AppState.PROCESSING, AppState.READY]
+
+
+def test_voice_chat_delivers_both_sides_to_the_single_overlay():
+    import numpy as np
+    from debora_whisper.app import GUIApp
+    from debora_whisper.ui.overlay import OverlayWindow
+
+    gui = GUIApp.__new__(GUIApp)
+    gui._config = {**DEFAULT_CONFIG, "beep_on_start": False}
+    gui._root = MagicMock()
+    gui._tray = MagicMock()
+    gui._stop_audio_polling = MagicMock()
+    gui._settings_status = MagicMock()
+    gui._settings_set_apply = MagicMock()
+    with patch.object(OverlayWindow, "_build"), \
+            patch.object(OverlayWindow, "_get_scale", return_value=1.0):
+        gui._overlay = OverlayWindow(gui._root)
+    gui._overlay._update_layout = MagicMock()
+    engine = gui._engine = DictationApp(gui._config)
+    engine.recorder = MagicMock()
+    engine.add_callback(gui._update_ui)
+    during_speech = []
+
+    def respond(text, on_reply):
+        assert gui._overlay._conversation_lines()[0][1] == "Você: abre o log"
+        on_reply("O log mostra.")
+        on_reply("O log mostra. O TTS demorou.")
+        during_speech.extend(gui._overlay._conversation_lines())
+        assert gui._overlay._balloon_id is None
+        return "O log mostra. O TTS demorou."
+
+    with patch.object(engine.voice_chat, "respond", side_effect=respond):
+        engine._voice_chat_turn("abre o log", np.zeros(160), True)
+    assert [line[1] for line in during_speech] == [
+        "Você: abre o log", "Débora: O log mostra. O TTS demorou."]
+    assert gui._overlay._conversation_lines() == during_speech
+    assert gui._overlay._balloon_id is not None
+    gui._update_ui(AppState.READY, {"notice": "Voice chat ready"})
+    assert gui._overlay._conversation_lines() == during_speech
+    gui._tray.update_state.assert_called_with("ready", "Débora Whisper — Voice chat ready")
+
+
+@pytest.mark.parametrize("width", [None, 200, 360, 420.5])
+def test_balloon_width_config_round_trip(tmp_path, monkeypatch, width):
+    from debora_whisper import dictation_engine as de
+    from debora_whisper.app import GUIApp
+
+    monkeypatch.setattr(de, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(de, "CONFIG_FILE", tmp_path / "config.json")
+    gui = GUIApp.__new__(GUIApp)
+    gui._config = DEFAULT_CONFIG.copy()
+    gui._on_width_changed(width)
+    config = de.load_config()
+    de.validate_config(config)
+    assert config["balloon_width"] == width
+    gui._on_pos_changed(200, 1042)
+    assert de.load_config()["balloon_width"] == width
+
+
+@pytest.mark.parametrize("width", [True, False, 0, -1, 199, "360", float("inf"), float("nan")])
+def test_invalid_balloon_width_is_rejected(width):
+    from debora_whisper.dictation_engine import validate_config
+    with pytest.raises(ValueError, match="balloon_width"):
+        validate_config({**DEFAULT_CONFIG, "balloon_width": width})

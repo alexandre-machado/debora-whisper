@@ -58,7 +58,8 @@ DEFAULT_CONFIG = {
     "beep_on_start": True,     # Audio feedback when recording starts/stops
     "max_record_seconds": 60,  # Max recording length
     "sample_rate": 16000,      # Whisper expects 16kHz
-    "show_balloon": True,      # Show text balloon under notch after transcription
+    "show_balloon": True,      # Show conversation beside the mascot
+    "balloon_width": None,     # Preferred text area width in logical px; null: default
     "continuous_listening": False, # Start in continuous (VAD) listening
     "vad_end_silence_seconds": 1.5,
     # Total silence allowed when the latest draft lacks sentence-ending punctuation.
@@ -297,6 +298,10 @@ def save_config(config: dict):
 
 def validate_config(config: dict):
     """Validate config values. Raises ValueError on invalid values."""
+    width = config.get("balloon_width")
+    if width is not None and (isinstance(width, bool) or not isinstance(width, (int, float))
+                              or not 200 <= width < float("inf")):
+        raise ValueError(f"balloon_width must be null or a finite number >= 200, got {width!r}")
     valid_devices = set(VALID_DEVICES)
     if config.get("device") not in valid_devices:
         raise ValueError(f"device must be one of {valid_devices}, got '{config.get('device')}'")
@@ -3042,7 +3047,7 @@ class DictationApp:
         # dictation goes, the sentence goes to the LLM instead.
         with self._output_lock:
             self._forget_draft_locked(erase=True)
-        self._set_state(AppState.PROCESSING)
+        self._set_state(AppState.PROCESSING, {"user_text": text})
         # The microphone must not hear the reply.
         self.recorder.set_muted(True)
         try:

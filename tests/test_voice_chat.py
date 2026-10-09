@@ -1024,12 +1024,12 @@ def test_rebuilt_engine_starts_voice_chat_itself():
     old.set_voice_chat.assert_not_called()
 
 
-def test_notice_shows_in_the_balloon_without_changing_state():
+def test_notice_shows_only_in_the_tray_without_changing_state():
     gui = _gui()
     gui._update_ui(de.AppState.RECORDING, {"notice": "Voice chat ready"})
-    gui._overlay.show_notice.assert_called_once_with("Voice chat ready")
+    gui._overlay.show_notice.assert_not_called()
     gui._overlay.show_recording.assert_not_called()
-    gui._tray.update_state.assert_not_called()
+    gui._tray.update_state.assert_called_once_with("recording", "Débora Whisper — Voice chat ready")
 
 
 # --- Latency and playback -------------------------------------------------------

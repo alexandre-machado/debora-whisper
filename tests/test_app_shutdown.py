@@ -125,9 +125,11 @@ def test_overlay_and_tray_toggle_follow_replaced_engine():
     # Real tray menu handler, built by the real __init__.
     assert isinstance(app._tray, RealTray)
     app._tray._on_toggle_click()
-    # Real overlay dot-click handler, given the callback __init__ passed in.
+    # Real mascot-click handler, given the callback __init__ passed in.
     overlay = SimpleNamespace(_CLICK_STATES=RealOverlay._CLICK_STATES, _state="ready",
-                              _on_toggle=captured["on_toggle"])
+                              _on_toggle=captured["on_toggle"], _scale=1.0, _cur_w=64,
+                              _hit_region=lambda x: "mascot",
+                              _mascot_geometry=lambda: (2, 34, 62, 64))
     RealOverlay._on_drag_start(overlay, SimpleNamespace(x=0, y=0))
     RealOverlay._on_drag_end(overlay, SimpleNamespace(x=0, y=0))
 
