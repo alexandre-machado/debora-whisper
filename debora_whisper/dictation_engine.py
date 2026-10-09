@@ -11,6 +11,7 @@ import time
 import json
 import re
 import argparse
+import inspect
 import threading
 from collections import deque
 from enum import Enum
@@ -18,6 +19,7 @@ from pathlib import Path
 from datetime import datetime
 
 from debora_whisper import paths
+from debora_whisper.harness import MemoryHotwords
 from debora_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
 from debora_whisper.vad_endpoint import AdaptiveEndpoint, VadSegment
 from debora_whisper.voice_chat import (VoiceChat, download_llm, ensure_tts_server, is_http_url,
@@ -77,6 +79,7 @@ DEFAULT_CONFIG = {
     "harness_permission_response": "deny",  # requests not already allowed by Claude
     "harness_prompt_file": None,   # null: packaged voice-channel rules
     "harness_memory_file": None,   # null: ~/.debora/harness/voice_memory.md
+    "harness_hotwords": True,     # Voice memory hints only for Claude voice chat
     # Silence that ends a sentence in voice chat (dictation: 1.5 s, room to
     # think). The reply cannot start before it has passed.
     "voice_chat_end_silence_seconds": 0.8,
@@ -330,6 +333,8 @@ def validate_config(config: dict):
             raise ValueError(f"{key} must be a non-empty string, got {value!r}")
     if config.get("voice_chat_backend", "local") not in ("local", "claude"):
         raise ValueError("voice_chat_backend must be local or claude")
+    if not isinstance(config.get("harness_hotwords", True), bool):
+        raise ValueError("harness_hotwords must be a bool")
     for key in ("harness_cwd", "harness_model", "harness_prompt_file", "harness_memory_file"):
         value = config.get(key)
         if value is not None and (not isinstance(value, str) or not value.strip()):
@@ -769,7 +774,16 @@ class FasterWhisperCUDA:
         hw_name = has_nvidia_gpu(return_name=True) or "NVIDIA GPU"
         log(f"Loaded faster-whisper on {hw_name} in {time.time() - start:.1f}s")
 
-    def transcribe(self, audio_data, sample_rate: int = 16000, language: str = "en") -> str:
+    def supports_hotwords(self) -> bool:
+        try:
+            parameter = inspect.signature(self.pipeline.transcribe).parameters.get("hotwords")
+        except (TypeError, ValueError):
+            return False
+        return parameter is not None and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+
+    def transcribe(self, audio_data, sample_rate: int = 16000, language: str = "en",
+                   hotwords: str | None = None) -> str:
         import numpy as np
         start = time.time()
 
@@ -785,12 +799,14 @@ class FasterWhisperCUDA:
         # threshold, so the default re-decoded up to 5 times (0.7s -> 3s on
         # an RTX 4070) and returned a temperature-1.0 sample. The OpenVINO
         # path is greedy with no fallback; this matches it.
+        hints = {"hotwords": hotwords} if hotwords and self.supports_hotwords() else {}
         segments, info = self.pipeline.transcribe(
             audio_data,
             language=language if language != "auto" else None,
             condition_on_previous_text=False,
             without_timestamps=True,
             temperature=0.0,
+            **hints,
         )
 
         # segments is a lazy generator: decoding happens here.
@@ -859,7 +875,8 @@ class WhisperNPU:
             else:
                 raise
 
-    def transcribe(self, audio_data, sample_rate: int = 16000, language: str = "en") -> str:
+    def transcribe(self, audio_data, sample_rate: int = 16000, language: str = "en",
+                   hotwords: str | None = None) -> str:
         """Transcribe audio numpy array to text."""
         import numpy as np
         start = time.time()
@@ -870,12 +887,18 @@ class WhisperNPU:
         elif audio_data.dtype != np.float32:
             audio_data = audio_data.astype(np.float32)
 
+        # OpenVINO returns a fresh config per call; never store hints on the pipeline.
         config = self.pipeline.get_generation_config()
         config.max_new_tokens = 448
         if language and language != "auto":
             config.language = f"<|{language}|>"
         config.task = "transcribe"
         config.return_timestamps = False
+        if hotwords:
+            try:
+                config.hotwords = hotwords
+            except (AttributeError, TypeError):
+                config.initial_prompt = hotwords
 
         ensure_devices_usable()
         try:
@@ -2399,6 +2422,10 @@ class DictationApp:
         # Continuous (VAD) listening is on: from --continuous at startup or a
         # hotkey tap. Guarded by _audio_lifecycle_lock.
         self._continuous = bool(config.get("continuous_listening", False))
+        self._recording_claude_chat = False
+        self._memory_hotwords = MemoryHotwords()
+        self._hotword_terms = ()
+        self._hotwords_unsupported = set()
         self._continuous_since = 0.0
         self._model_ready = threading.Event()
         self._load_error: str | None = None
@@ -2611,6 +2638,8 @@ class DictationApp:
                 # capture readiness is checked. Neither stream reopens on a hotkey.
                 if self.config["beep_on_start"]:
                     self.chimes.warmup()
+                if self._continuous:
+                    self._recording_claude_chat = self._claude_voice_chat()
                 self.recorder.warmup()
 
             self.ensure_model()
@@ -2765,6 +2794,29 @@ class DictationApp:
 
     # -- Recording -------------------------------------------------------
 
+    def _claude_voice_chat(self) -> bool:
+        return bool(self.config.get("voice_chat")
+                    and self.config.get("voice_chat_backend", "local") == "claude")
+
+    def _transcription_hotwords(self) -> dict:
+        terms = ()
+        if (self._recording_claude_chat and self._claude_voice_chat()
+                and self.config.get("harness_hotwords", True)):
+            unsupported = (isinstance(self.whisper, ParakeetNPU)
+                           or (isinstance(self.whisper, FasterWhisperCUDA)
+                               and not self.whisper.supports_hotwords()))
+            if unsupported:
+                backend = type(self.whisper).__name__
+                if backend not in self._hotwords_unsupported:
+                    log(f"Voice chat: {backend} has no hotword support; skipping memory hints")
+                    self._hotwords_unsupported.add(backend)
+            else:
+                terms = self._memory_hotwords.terms(self.config, log)
+        if terms != self._hotword_terms:
+            log(f"Voice chat: using {len(terms)} memory hint terms")
+            self._hotword_terms = terms
+        return {"hotwords": ", ".join(terms)} if terms else {}
+
     def _forget_draft_locked(self, erase: bool):
         """Stop tracking the typed draft, first erasing it if asked and keys
         still land where it was typed. Caller holds _output_lock."""
@@ -2827,11 +2879,23 @@ class DictationApp:
                 try:
                     with self._model_lock:
                         self.ensure_model()
+                        hints = self._transcription_hotwords()
                         text = self.whisper.transcribe(
                             audio,
                             sample_rate=self.config["sample_rate"],
                             language=self.config["language"],
+                            **hints,
                         )
+                        if hints and not self._claude_voice_chat():
+                            # A toggle during inference must not send hinted text
+                            # to dictation or Qwen. Decode again without hints.
+                            self._hotword_terms = ()
+                            log("Voice chat: using 0 memory hint terms (mode changed during inference)")
+                            text = self.whisper.transcribe(
+                                audio,
+                                sample_rate=self.config["sample_rate"],
+                                language=self.config["language"],
+                            )
                 finally:
                     _inference_gate.release()
                 t_lower = text.strip().lower()
@@ -3085,6 +3149,9 @@ class DictationApp:
                     log(f"Audio stream not ready ({e}), attempting recovery...")
                     self.recorder.close()
                     self.recorder.warmup(timeout=3.0)
+                # Routing happens after transcription. Snapshot the voice-chat toggle
+                # and backend at recording start, also for a tap's continuous session.
+                self._recording_claude_chat = self._claude_voice_chat()
                 self.recorder.start()
                 self.is_recording = True
         except Exception as exc:

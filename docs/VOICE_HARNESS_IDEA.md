@@ -94,12 +94,21 @@ no primeiro uso; caminhos relativos partem de `harness_cwd`. Só os processos
 iniciados pela Débora recebem seu conteúdo no prompt (últimas 100 linhas, até
 8 KiB, com log de truncamento). Claude mantém menos de 100 linhas e registra cada
 correção no formato `- "o que foi ouvido" → termo correto (contexto opcional)`;
-`memory_terms(text)` extrai os termos sem contexto, ainda sem ligação ao Whisper.
+`memory_terms(text)` extrai os termos sem contexto para as dicas do Whisper.
 Editar o conteúdo não reinicia o processo: a próxima inicialização o relê.
 Mudar o caminho reinicia no próximo turno, inclusive para trocar a permissão de
 `--add-dir`, que abrange só a pasta da memória. Use uma pasta dedicada para um
 caminho personalizado. Isso não reduz permissões preexistentes: com a pasta
 pessoal como `harness_cwd`, `~/.debora` já está dentro do diretório de trabalho.
+
+`harness_hotwords: true` (padrão) envia esses termos ao Whisper somente no chat de
+voz com Claude, usando o modo capturado ao iniciar a gravação ou escuta contínua.
+Ditado e Qwen local não recebem dicas. O cache acompanha o mtime do arquivo e mantém
+as entradas mais recentes primeiro, sem duplicatas por maiúsculas/minúsculas, até
+40 termos / 150 tokens estimados. OpenVINO aceita uma string em `hotwords`, com
+fallback para `initial_prompt`; faster-whisper só recebe `hotwords` se a assinatura
+suportar. Parakeet ignora as dicas e avisa uma vez. Mudanças registram apenas a
+quantidade de termos; `harness_hotwords: false` desativa o recurso.
 
 O conhecimento do projeto permanece na pasta: seus arquivos de instruções
 (`CLAUDE.md`/`AGENTS.md` conforme a configuração do Claude), skills e settings

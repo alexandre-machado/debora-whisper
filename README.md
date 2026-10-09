@@ -213,6 +213,7 @@ the default (`"voice_chat_backend": "local"`); speech recognition and TTS stay l
   "harness_permission_response": "deny",
   "harness_prompt_file": null,
   "harness_memory_file": null,
+  "harness_hotwords": true,
   "language": "pt"
 }
 ```
@@ -237,6 +238,15 @@ Changing the file path restarts it on the next turn. Ordinary terminal sessions
 are not configured to load this file. `--add-dir` adds edit permission for the memory
 directory; it does not restrict existing permissions or the working directory
 (using your home as `harness_cwd` already includes `~/.debora`).
+
+With `harness_hotwords: true` (default), Claude voice chat also feeds the corrected
+terms to Whisper as recognition hints: newest entries first, deduplicated ignoring
+case, capped at 40 terms / 150 estimated tokens and cached by file modification time.
+Memory edits affect the next transcription without restarting Claude. The mode is
+captured when recording starts (including continuous listening); dictation and local
+Qwen receive no hints. Set it to `false` to disable. OpenVINO uses a hotwords string
+(or `initial_prompt` on older runtimes); faster-whisper uses hotwords when supported.
+Parakeet skips hints and logs that once; hint changes log counts, never the terms.
 
 Permissions already allowed by Claude's mode/settings proceed normally. Pending
 requests are denied and logged by default; `harness_permission_response: "allow"`

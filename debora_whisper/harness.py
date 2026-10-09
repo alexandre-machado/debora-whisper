@@ -74,6 +74,50 @@ def memory_terms(text: str) -> list[str]:
     return terms
 
 
+class MemoryHotwords:
+    """Cache a small, newest-first recognition vocabulary by file mtime."""
+
+    def __init__(self):
+        self._key = None
+        self._terms = ()
+
+    def terms(self, config: dict, log=print) -> tuple[str, ...]:
+        path = harness_memory_file(config)
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            mtime = None
+        key = (path, mtime)
+        if key == self._key:
+            return self._terms
+        self._key, self._terms = key, ()
+        if mtime is None:
+            return self._terms
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as e:
+            log(f"Voice chat: cannot read hotword memory ({type(e).__name__})")
+            return self._terms
+        # Reverse lines before extraction so repeated terms retain their latest entry.
+        terms, seen, tokens = [], set(), 0
+        for term in memory_terms("\n".join(reversed(text.splitlines()))):
+            folded = term.casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+            # UTF-8 bytes / 3 plus a separator is a cheap, conservative estimate
+            # for project names; leave room below Whisper's ~224-token budget.
+            cost = (len(term.encode("utf-8")) + 2) // 3 + 1
+            if tokens + cost > 150:
+                continue
+            terms.append(term)
+            tokens += cost
+            if len(terms) == 40:
+                break
+        self._terms = tuple(terms)
+        return self._terms
+
+
 def _memory_prompt(path: Path, log) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
