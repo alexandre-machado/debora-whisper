@@ -214,17 +214,25 @@ def test_real_tk_clipped_text_ignores_other_monitors_font_scale(tk_root, monkeyp
         boxes = [canvas.bbox(item) for item in canvas.find_all()]
         left, right, _, _ = overlay._text_geometry(overlay._cur_w)
         visible = right - left
-        assert boxes[0][0] == 0  # fitting text starts exactly at the divider + gap
-        assert boxes[0][2] < visible
-        assert boxes[1][0] < 0  # overflowing reply slides behind the divider
+        # One row: the long reply pushes the user's words behind the divider.
+        assert boxes[0][0] < 0
+        assert boxes[0][2] < boxes[1][0] < visible
         assert boxes[1][2] == visible
-        assert 0 <= boxes[0][1] < boxes[0][3] <= boxes[1][1]
+        assert boxes[0][1] == boxes[1][1] >= 0
         assert boxes[1][3] <= int(canvas.place_info()["height"])
         assert int(canvas.place_info()["x"]) == left
         assert int(canvas.place_info()["width"]) == visible
         assert canvas.cget("scrollregion") == ""
         measurements.append((boxes, overlay._cur_w, overlay._cur_h))
     assert measurements[0] == measurements[1]
+    assert overlay._cur_h == round(38 * scale)  # never a second line
+    overlay._new_turn(True)
+    overlay.show_processing("Oi", voice_chat=True)
+    overlay.show_speaking("Olá!")
+    now[0] += 1
+    overlay._slide_tick()
+    boxes = [canvas.bbox(item) for item in canvas.find_all()]
+    assert boxes[0][0] == 0  # fitting text starts exactly at the divider + gap
     overlay.set_show_balloon(False)
     assert overlay._cur_w == overlay._mascot_geometry()[3]
     assert not overlay._text_canvas.place_info()
@@ -537,3 +545,13 @@ def test_mascot_edge_fades_into_the_panel():
     assert soft.getpixel((30, 17))[3] == 255
     rim = [(30, 0), (0, 17), (59, 17), (30, 33)]
     assert sum(soft.getpixel(p)[3] for p in rim) < sum(hard.getpixel(p)[3] for p in rim) / 2
+
+
+def test_text_pulses_while_she_processes_the_input():
+    overlay = _overlay()
+    a = overlay._pulse(overlay.TEXT, 0)
+    b = overlay._pulse(overlay.TEXT, overlay.PULSE_SECONDS / 2)
+    assert a == overlay.TEXT  # full brightness at the top of the pulse
+    dim = int(b[1:3], 16)
+    bg, fg = int(overlay.BG[1:3], 16), int(overlay.TEXT[1:3], 16)
+    assert dim == round(bg + (fg - bg) * overlay.PULSE_MIN)

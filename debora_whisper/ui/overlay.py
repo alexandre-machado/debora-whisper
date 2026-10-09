@@ -68,6 +68,10 @@ class OverlayWindow:
     BALLOON_FONT_SIZE = 16
     BALLOON_DURATION = 2500  # the former result -> ready auto-dismiss delay
     SLIDE_SECONDS = 0.2
+    # While she works on the input, the text breathes between these
+    # opacities over the panel, once per period.
+    PULSE_SECONDS = 1.4
+    PULSE_MIN = 0.45
 
     # --- Resize grip: a small glass capsule at the right edge ---
     GRIP_W = 4
@@ -397,8 +401,10 @@ class OverlayWindow:
         if lines:
             requested = self._balloon_width or self.BALLOON_DEFAULT_W
             w += min(round(requested * self._scale), max(0, wr - x - mascot_w))
-            h = max(h, len(lines) * self._text_font().metrics("linespace")
-                    + 2 * round(self.BALLOON_PAD * self._scale))
+            # Both sides share one row; her reply pushes the user's text left.
+            # The row is centered on the mascot; only a font taller than her
+            # makes the window grow.
+            h = max(h, self._text_font().metrics("linespace"))
         self._cur_w, self._cur_h = w, h
         # +negative coordinates are absolute desktop positions in Tk geometry.
         self._win.geometry(f"{w}x{h}+{x}+{y}")
@@ -443,9 +449,9 @@ class OverlayWindow:
         left, right, bar, bar_w = self._text_geometry(w)
         if self._conversation_lines() and right > left:
             self._draw_grip()
-            self._text_canvas.place(x=left, y=round(self.BALLOON_PAD * s),
-                                    width=right - left,
-                                    height=h - 2 * round(self.BALLOON_PAD * s))
+            line_h = min(h, self._text_font().metrics("linespace"))
+            self._text_canvas.place(x=left, y=(h - line_h) // 2,
+                                    width=right - left, height=line_h)
             self._draw_text(right - left)
         else:
             self._text_canvas.place_forget()
@@ -472,24 +478,40 @@ class OverlayWindow:
         canvas = self._text_canvas
         canvas.delete("all")
         font = self._text_font()
-        line_h = font.metrics("linespace")
         now = monotonic()
-        moving = False
-        for row, (key, text, fill) in enumerate(self._conversation_lines()):
+        pulsing = self._state == "processing"
+        # One row: "Você: …" then "Débora: …", slid left together, so her
+        # reply pushes the user's words under the mascot like new words do.
+        items, x = [], 0
+        space = font.measure("   ")
+        for key, text, fill in self._conversation_lines():
             # Newlines in a transcript/reply never create additional rows.
             text = " ".join(text.split())
-            item = canvas.create_text(0, row * line_h, text=text, fill=fill,
-                                      font=font, anchor="nw")
+            if pulsing:
+                fill = self._pulse(fill, now)
+            item = canvas.create_text(0, 0, text=text, fill=fill, font=font, anchor="nw")
             bbox = canvas.bbox(item)
-            width = bbox[2] - bbox[0]
-            target = self._line_target(width, visible_width)
-            offset = self._slide_offset(key, target, now)
-            # Tk text bboxes include font bearings: normalize their left edge
-            # before applying the offset, so fitting text starts at text_left.
-            canvas.move(item, offset - bbox[0], 0)
-            moving |= abs(offset - target) > 0.01
-        if moving and self._slide_id is None:
-            self._slide_id = self._root.after(16, self._slide_tick)
+            # Tk text bboxes include font bearings: normalize their left edge,
+            # so fitting text starts at text_left.
+            canvas.move(item, x - bbox[0], 0)
+            items.append(item)
+            x += bbox[2] - bbox[0] + space
+        width = max(0, x - space)
+        target = self._line_target(width, visible_width)
+        offset = self._slide_offset("row", target, now)
+        for item in items:
+            canvas.move(item, offset, 0)
+        moving = abs(offset - target) > 0.01
+        if (moving or pulsing) and self._slide_id is None:
+            self._slide_id = self._root.after(16 if moving else 50, self._slide_tick)
+
+    def _pulse(self, fill, now):
+        """fill faded toward the panel by the breathing pulse at time now."""
+        import math
+        wave = 0.5 + 0.5 * math.cos(2 * math.pi * now / self.PULSE_SECONDS)
+        opacity = self.PULSE_MIN + (1 - self.PULSE_MIN) * wave
+        bg, fg = _hex_to_rgba(self.BG), _hex_to_rgba(fill)
+        return "#" + "".join(f"{round(b + (f - b) * opacity):02X}" for f, b in zip(fg[:3], bg[:3]))
 
     def _slide_tick(self):
         self._slide_id = None
