@@ -2,7 +2,7 @@
 
 import ctypes
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -46,46 +46,56 @@ def test_fonts_use_pixels_with_one_dpi_conversion(scale):
     assert OverlayWindow._font_pixels(16, scale) == -round(16 * 96 / 72 * scale)
 
 
-def test_monitor_change_rescales_even_without_animation():
-    overlay = OverlayWindow.__new__(OverlayWindow)
-    overlay._scale = 2.0
-    overlay._cur_w, overlay._cur_h = 300, 76
-    overlay._tgt_base_w, overlay._tgt_base_h = 450, 38
-    overlay._get_scale = Mock(return_value=1.25)
-    overlay._position = Mock()
-    overlay._redraw = Mock()
-    overlay._balloon_win = object()
-    overlay._balloon_text = "Visible transcription"
-    overlay._show_balloon_popup = Mock()
-
-    overlay._refresh_scale()
-
-    assert (overlay._cur_w, overlay._cur_h) == (187.5, 47.5)
-    assert (overlay._tgt_w, overlay._tgt_h) == (562.5, 47.5)
-    overlay._show_balloon_popup.assert_called_once_with("Visible transcription")
-    overlay._refresh_scale()
-    overlay._redraw.assert_called_once()
-    overlay._position.assert_called_once()
-
-
-def _clickable_overlay(scale, state="ready"):
-    overlay = OverlayWindow.__new__(OverlayWindow)
-    overlay._scale = scale
+def _overlay(scale=1.0, state="ready"):
+    with patch.object(OverlayWindow, "_get_scale", return_value=scale), \
+            patch.object(OverlayWindow, "_build"):
+        overlay = OverlayWindow(Mock(), on_toggle=Mock(), on_pos_changed=Mock(),
+                                on_width_changed=Mock(), pos_x=132, pos_y=10)
     overlay._state = state
-    overlay._on_toggle = Mock()
-    overlay._on_pos_changed = Mock()
-    overlay._cur_w = 150 * scale
     overlay._win = Mock(winfo_x=Mock(return_value=100), winfo_y=Mock(return_value=10))
+    overlay._canvas = Mock()
+    overlay._text_font = Mock(side_effect=lambda: Mock(
+        metrics=Mock(return_value=round(26 * overlay._scale))))
+    overlay._monitor_work_area = Mock(return_value=(0, 0, 1920, 1080))
+    overlay._redraw = Mock()
+    overlay._position()
     return overlay
 
 
+def test_monitor_change_rescales_even_without_animation():
+    overlay = _overlay(2.0)
+    overlay.show_result("Visible transcription")
+    x = overlay._window_x
+    overlay._get_scale = Mock(return_value=1.25)
+    overlay._redraw.reset_mock()
+    overlay._refresh_scale()
+    assert overlay._scale == 1.25
+    assert overlay._cur_w == overlay._mascot_geometry()[3] + round(360 * 1.25)
+    assert overlay._cur_h == round(38 * 1.25)
+    assert overlay._window_x == x
+    assert overlay._conversation_lines()[0][1] == "Visible transcription"
+    overlay._refresh_scale()
+    overlay._redraw.assert_called_once()
+
+
+@pytest.mark.parametrize("root_scale, monitor_scale", [(1.0, 2.0), (2.0, 1.0), (1.0, 1.5)])
+def test_saved_position_uses_destination_dpi_at_startup(root_scale, monitor_scale):
+    overlay = _overlay(root_scale)
+    overlay._window_x = None
+    overlay._pos_x, overlay._pos_y = 32, 1042
+    overlay._get_scale = Mock(return_value=monitor_scale)
+    overlay._restore_position()
+    width = overlay._mascot_geometry()[3]
+    assert overlay._window_x == max(0, 32 - width // 2)
+    assert overlay._pos_y == min(1042, 1080 - round(38 * monitor_scale))
+
+
 @pytest.mark.parametrize("scale", [1.0, 1.25, 1.5, 2.0])
-@pytest.mark.parametrize("x", [2, 75, 148])
-def test_a_click_anywhere_toggles(scale, x):
-    overlay = _clickable_overlay(scale)
+@pytest.mark.parametrize("x", [2, 30, 59])
+def test_a_click_on_mascot_toggles(scale, x):
+    overlay = _overlay(scale)
     press = SimpleNamespace(x=x * scale, y=10)
     overlay._on_drag_start(press)
-    # A small jitter within the slop is still a click.
     overlay._on_drag_move(SimpleNamespace(x=x * scale + 3 * scale, y=10))
     overlay._on_drag_end(press)
     overlay._on_toggle.assert_called_once()
@@ -94,35 +104,35 @@ def test_a_click_anywhere_toggles(scale, x):
 
 @pytest.mark.parametrize("scale", [1.0, 2.0])
 def test_a_drag_moves_without_toggling(scale):
-    overlay = _clickable_overlay(scale)
+    overlay = _overlay(scale)
     overlay._on_drag_start(SimpleNamespace(x=20, y=10))
     overlay._on_drag_move(SimpleNamespace(x=20 + 30 * scale, y=10))
     overlay._on_drag_end(SimpleNamespace(x=20 + 30 * scale, y=10))
     overlay._on_toggle.assert_not_called()
-    overlay._on_pos_changed.assert_called_once()
+    overlay._on_pos_changed.assert_called_once_with(overlay._pos_x, overlay._pos_y)
 
 
 @pytest.mark.parametrize("state", ["loading", "processing", "error"])
 def test_a_click_does_nothing_while_busy(state):
-    overlay = _clickable_overlay(1.0, state)
+    overlay = _overlay(state=state)
     overlay._on_drag_start(SimpleNamespace(x=20, y=10))
     overlay._on_drag_end(SimpleNamespace(x=20, y=10))
     overlay._on_toggle.assert_not_called()
 
 
-@pytest.mark.parametrize("state, draft, label", [
-    ("ready", "", "Ready"),
-    ("recording", "", ""),  # the mascot alone says it is listening
-    ("recording", "ola tudo bem", "ola tudo bem"),
-    ("processing", "", "Transcribing..."),
-    ("speaking", "", "Speaking..."),
-    ("error", "", "Error"),
+@pytest.mark.parametrize("method,args", [
+    ("show_loading", ()), ("show_ready", ()), ("show_processing", ()),
+    ("show_error", ()), ("show_notice", ("Loading a model, please wait",)),
 ])
-def test_states_are_told_in_words_only(state, draft, label):
-    overlay = _clickable_overlay(1.0, state)
-    overlay._hover = False
-    overlay._draft_text = draft
-    assert overlay._label()[0] == label
+def test_status_and_notice_never_change_conversation(method, args):
+    overlay = _overlay()
+    getattr(overlay, method)(*args)
+    assert overlay._conversation_lines() == []
+    overlay.show_processing("abre o log", voice_chat=True)
+    overlay.show_speaking("O log mostra…")
+    before = overlay._conversation_lines()
+    getattr(overlay, method)(*args)
+    assert overlay._conversation_lines() == before
 
 
 def test_text_is_a_soft_white_in_a_legible_font(monkeypatch):
@@ -158,7 +168,6 @@ def test_panel_is_flat():
 def test_panel_is_translucent_and_slightly_rounded():
     assert 0.5 < OverlayWindow.OPACITY < 1.0
     assert OverlayWindow.RADIUS < OverlayWindow.COMPACT_H // 4
-    assert OverlayWindow.BALLOON_RADIUS == OverlayWindow.RADIUS
 
 
 @pytest.fixture
@@ -183,52 +192,177 @@ def tk_root(monkeypatch):
     root.destroy()
 
 
-@pytest.mark.parametrize("scale", [1.0, 1.25, 1.5, 2.0])
-def test_real_tk_text_and_balloon_ignore_other_monitors_font_scale(
-        tk_root, monkeypatch, scale):
+@pytest.mark.parametrize("scale", [1.0, 1.5, 2.0])
+def test_real_tk_clipped_text_ignores_other_monitors_font_scale(tk_root, monkeypatch, scale):
     monkeypatch.setattr(OverlayWindow, "_get_scale", lambda self: scale)
-    overlay = OverlayWindow(tk_root)
-    assert overlay._cur_w == 150 * scale
-    assert overlay._cur_h == 38 * scale
-    text = "Texto de exemplo para testar a proporção do balão em outra tela."
+    monkeypatch.setattr(OverlayWindow, "_monitor_work_area", lambda *a, **kw: (0, 0, 4000, 2000))
+    now = [0.0]
+    monkeypatch.setattr("debora_whisper.ui.overlay.monotonic", lambda: now[0])
+    overlay = OverlayWindow(tk_root, pos_x=200)
+    assert overlay._cur_w == overlay._mascot_geometry()[3]
+    assert overlay._cur_h == round(38 * scale)
+    assert len(tk_root.winfo_children()) == 1  # only one Toplevel
     measurements = []
     for tk_scale in (96 / 72, 192 / 72):
         tk_root.tk.call("tk", "scaling", tk_scale)
-        overlay._redraw()
-        text_id = next(item for item in overlay._canvas.find_all()
-                       if overlay._canvas.type(item) == "text")
-        pill_bbox = overlay._canvas.bbox(text_id)
-        assert pill_bbox[3] - pill_bbox[1] < overlay._cur_h
-        overlay._show_balloon_popup(text)
-        canvas = overlay._balloon_win.winfo_children()[0]
-        text_id = next(item for item in canvas.find_all()
-                       if canvas.type(item) == "text")
-        bbox = canvas.bbox(text_id)
-        width, height = int(canvas.cget("width")), int(canvas.cget("height"))
-        assert 0 <= bbox[0] < bbox[2] <= width
-        assert 0 <= bbox[1] < bbox[3] <= height
-        measurements.append((pill_bbox, bbox, width, height))
+        overlay._new_turn(True)
+        overlay.show_processing("Oi", voice_chat=True)
+        overlay.show_speaking("Uma resposta bastante longa " * 12)
+        now[0] += 1
+        overlay._slide_tick()
+        canvas = overlay._text_canvas
+        boxes = [canvas.bbox(item) for item in canvas.find_all()]
+        left, right, _, _ = overlay._text_geometry(overlay._cur_w)
+        visible = right - left
+        assert boxes[0][0] == 0  # fitting text starts exactly at the divider + gap
+        assert boxes[0][2] < visible
+        assert boxes[1][0] < 0  # overflowing reply slides behind the divider
+        assert boxes[1][2] == visible
+        assert 0 <= boxes[0][1] < boxes[0][3] <= boxes[1][1]
+        assert boxes[1][3] <= int(canvas.place_info()["height"])
+        assert int(canvas.place_info()["x"]) == left
+        assert int(canvas.place_info()["width"]) == visible
+        assert canvas.cget("scrollregion") == ""
+        measurements.append((boxes, overlay._cur_w, overlay._cur_h))
     assert measurements[0] == measurements[1]
+    overlay.set_show_balloon(False)
+    assert overlay._cur_w == overlay._mascot_geometry()[3]
+    assert not overlay._text_canvas.place_info()
+
+
+def test_voice_turn_keeps_both_sides_through_speech_and_delay():
+    overlay = _overlay()
+    overlay.show_recording("abre", voice_chat=True)
+    overlay.show_processing("abre o log", voice_chat=True)
+    overlay.show_speaking("O log mostra.")
+    overlay.show_speaking("O log mostra. O TTS demorou.")
+    assert [line[1] for line in overlay._conversation_lines()] == [
+        "Você: abre o log", "Débora: O log mostra. O TTS demorou."]
+    assert overlay._balloon_id is None
+    overlay.show_result("O log mostra. O TTS demorou.")
+    assert len(overlay._conversation_lines()) == 2
+    overlay._root.after.assert_called_with(overlay.BALLOON_DURATION, overlay._dismiss_balloon)
     overlay._dismiss_balloon()
+    assert overlay._conversation_lines() == []
+    assert overlay._cur_w == overlay._mascot_geometry()[3]
 
 
-def test_speaking_stays_until_the_next_state_and_shows_the_reply():
-    overlay = OverlayWindow.__new__(OverlayWindow)
-    overlay._state = "processing"
-    overlay._show_balloon = True
-    overlay._cancel_timers = Mock()
-    overlay._animate = Mock()
-    overlay._show_balloon_popup = Mock()
-    overlay._root = Mock()
+def test_continuous_listening_keeps_finished_turn_until_new_speech():
+    overlay = _overlay()
+    overlay.show_processing("um", voice_chat=True)
+    overlay.show_speaking("resposta")
+    overlay.show_recording("", voice_chat=True)
+    assert [line[1] for line in overlay._conversation_lines()] == ["Você: um", "Débora: resposta"]
+    assert overlay._balloon_id is not None
+    overlay.show_recording("dois", voice_chat=True)
+    assert [line[1] for line in overlay._conversation_lines()] == ["Você: dois"]
+    assert overlay._balloon_id is None
 
-    overlay.show_speaking("Oi,")
-    overlay.show_speaking("Oi, tudo bem!")
 
-    assert overlay._state == "speaking"
-    overlay._cancel_timers.assert_called_once()
-    overlay._animate.assert_called_once()
-    overlay._root.after.assert_not_called()  # no auto-return to Ready
-    assert overlay._show_balloon_popup.call_args.args == ("Oi, tudo bem!",)
+def test_text_click_dismisses_until_next_turn_without_toggling():
+    overlay = _overlay()
+    overlay.show_processing("pergunta", voice_chat=True)
+    overlay.show_speaking("primeira frase")
+    press = SimpleNamespace(x=100, y=10)
+    overlay._on_drag_start(press)
+    overlay._on_drag_end(press)
+    overlay.show_speaking("primeira frase. segunda frase.")
+    assert overlay._conversation_lines() == []
+    overlay._on_toggle.assert_not_called()
+    overlay.show_ready()
+    overlay.show_recording("outra pergunta", voice_chat=True)
+    assert overlay._conversation_lines()[0][1] == "Você: outra pergunta"
+
+
+def test_plain_dictation_keeps_the_existing_dismiss_delay():
+    overlay = _overlay()
+    overlay.show_recording("rascunho")
+    overlay.show_processing()
+    assert overlay._conversation_lines()[0][1] == "rascunho"
+    overlay.show_result("transcrição final")
+    assert overlay._conversation_lines() == [("user", "transcrição final", overlay.TEXT)]
+    overlay._root.after.assert_called_with(2500, overlay._dismiss_balloon)
+    overlay.show_recording()
+    assert overlay._conversation_lines() == []
+
+
+def test_failed_reply_finishes_without_showing_error_text():
+    overlay = _overlay()
+    overlay.show_processing("pergunta", voice_chat=True)
+    overlay.show_speaking("resposta parcial")
+    lines = overlay._conversation_lines()
+    overlay.show_error()
+    assert overlay._conversation_lines() == lines
+    assert overlay._balloon_id is not None
+
+
+@pytest.mark.parametrize("scale", [1.0, 1.5, 2.0])
+def test_explicit_text_geometry_and_independent_eased_offsets(scale):
+    overlay = _overlay(scale)
+    overlay.show_processing("oi", voice_chat=True)
+    overlay.show_speaking("resposta")
+    left, right, bar, _ = overlay._text_geometry(overlay._cur_w)
+    assert left == overlay._mascot_geometry()[2] + round(overlay.BALLOON_GAP * scale)
+    assert right == bar - round(overlay.BALLOON_GAP * scale)
+    visible = right - left
+    width = visible + 100 * scale
+    target = overlay._line_target(width, visible)
+    assert left + target + width == right
+    assert overlay._slide_offset("reply", target, 0) == 0
+    midway = overlay._slide_offset("reply", target, 0.1)
+    assert target < midway < target / 2  # ease-out has covered over half the distance
+    assert overlay._slide_offset("user", 0, 0.1) == 0
+    assert overlay._slide_offset("reply", target, 0.2) == target
+    assert overlay._slide_offset("reply", target - 30, 0.2) == target
+    assert overlay._slide_offset("reply", target - 30, 0.5) == target - 30
+
+
+@pytest.mark.parametrize("scale", [1.0, 1.5, 2.0])
+def test_width_handle_clamps_and_saves_logical_pixels(scale):
+    overlay = _overlay(scale)
+    overlay.show_result("texto")
+    x = overlay._window_x
+    _, _, bar, _ = overlay._text_geometry(overlay._cur_w)
+    press = SimpleNamespace(x=bar - 2 * scale, y=10)
+    overlay._on_mouse_move(press)
+    overlay._canvas.configure.assert_called_with(cursor="sb_h_double_arrow")
+    overlay._on_drag_start(press)
+    overlay._on_drag_move(SimpleNamespace(x=press.x + 60 * scale, y=10))
+    overlay._on_drag_end(press)
+    overlay._on_width_changed.assert_called_with(420)
+    assert overlay._window_x == x
+    for delta, expected in [(-5000, 200), (5000, round((1920 - x - overlay._mascot_geometry()[3]) / scale))]:
+        _, _, bar, _ = overlay._text_geometry(overlay._cur_w)
+        overlay._on_drag_start(SimpleNamespace(x=bar, y=10))
+        overlay._on_drag_move(SimpleNamespace(x=bar + delta, y=10))
+        overlay._on_drag_end(press)
+        assert overlay._balloon_width == expected
+        assert x + overlay._cur_w <= 1920
+    overlay._on_toggle.assert_not_called()
+    overlay._on_pos_changed.assert_not_called()
+
+
+@pytest.mark.parametrize("monitor", [(0, 0, 1920, 1080), (-1920, -1080, 0, 0)])
+def test_expansion_preserves_mascot_monitor_and_taskbar_position(monitor):
+    overlay = _overlay()
+    left, top, right, bottom = monitor
+    overlay._monitor_work_area.return_value = monitor
+    overlay._window_x = right - 90
+    overlay._pos_y = bottom - 38  # taskbar included
+    overlay._position()
+    anchor = overlay._window_x, overlay._pos_y
+    overlay._balloon_width = 500
+    overlay.show_processing("pergunta", voice_chat=True)
+    overlay.show_speaking("resposta")
+    assert (overlay._window_x, overlay._pos_y) == anchor
+    assert overlay._window_x + overlay._cur_w == right
+    assert overlay._balloon_width == 500  # shrinking the viewport never loses the preference
+    assert overlay._monitor_work_area.call_args.kwargs == {"full": True}
+    overlay._dismiss_balloon()
+    assert (overlay._window_x, overlay._pos_y) == anchor
+    overlay._window_x = None  # restoring the saved center/top on startup
+    overlay._position()
+    assert (overlay._window_x, overlay._pos_y) == anchor
 
 
 def test_mascot_ships_inside_the_package():
@@ -291,12 +425,8 @@ def test_leaving_an_animated_state_stops_the_timer():
 
 
 def test_speaking_repeats_the_zoom():
-    overlay = OverlayWindow.__new__(OverlayWindow)
-    overlay._state = "recording"
+    overlay = _overlay(state="recording")
     overlay._show_balloon = False
-    overlay._cancel_timers = Mock()
-    overlay._animate = Mock()
-    overlay._redraw = Mock()
     overlay.show_speaking("Oi!")
     assert (overlay._mascot_clip, overlay._mascot_index) == ("zoom", 0)
     zoom_len = len(overlay._mascot_frames(1, clip="zoom"))

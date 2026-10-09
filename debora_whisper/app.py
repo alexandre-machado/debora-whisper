@@ -53,7 +53,9 @@ class GUIApp:
             on_toggle=self._toggle_recording,
             pos_x=config.get("pos_x"),
             pos_y=config.get("pos_y", 10),
-            on_pos_changed=self._on_pos_changed
+            on_pos_changed=self._on_pos_changed,
+            balloon_width=config.get("balloon_width"),
+            on_width_changed=self._on_width_changed,
         )
         self._overlay.set_show_balloon(config.get("show_balloon", True))
         self._overlay.set_balloon_font_size(config.get("balloon_font_size", 16))
@@ -156,8 +158,7 @@ class GUIApp:
     def _update_ui(self, state: AppState, data: dict):
         """Update tray icon and overlay from the main thread."""
         if data.get("notice"):
-            self._overlay.show_notice(data["notice"])
-            self._settings_status(data["notice"], "gray60")
+            self._tray.update_state(state.value, f"Débora Whisper — {data['notice']}")
             return
         state_name = state.value
 
@@ -184,7 +185,7 @@ class GUIApp:
         elif state == AppState.RECORDING:
             draft = data.get("draft_text", "")
             self._tray.update_state(state_name, "Débora Whisper — Recording...")
-            self._overlay.show_recording(draft)
+            self._overlay.show_recording(draft, voice_chat=self._config.get("voice_chat", False))
             self._start_audio_polling()
 
         elif state == AppState.SPEAKING:
@@ -195,8 +196,9 @@ class GUIApp:
         elif state == AppState.PROCESSING:
             self._stop_audio_polling()
             self._tray.update_state(state_name, "Débora Whisper — Transcribing...")
-            # The balloon is only for what was said; status stays in the pill.
-            self._overlay.show_processing()
+            # Only speech enters the conversation; status stays in the tray.
+            self._overlay.show_processing(data.get("user_text", ""),
+                                          voice_chat="user_text" in data)
 
         elif state == AppState.ERROR:
             self._stop_audio_polling()
@@ -361,6 +363,11 @@ class GUIApp:
         """Save the new window position to config."""
         self._config["pos_x"] = pos_x
         self._config["pos_y"] = pos_y
+        save_config(self._config)
+
+    def _on_width_changed(self, width: int):
+        """Save the preferred text area width in logical pixels."""
+        self._config["balloon_width"] = width
         save_config(self._config)
 
     # -- Voice chat --------------------------------------------------------
