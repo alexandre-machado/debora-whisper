@@ -290,7 +290,7 @@ def test_leaving_an_animated_state_stops_the_timer():
     assert overlay._mascot_clip == "loop"
 
 
-def test_speaking_plays_the_zoom_once_then_the_loop():
+def test_speaking_repeats_the_zoom():
     overlay = OverlayWindow.__new__(OverlayWindow)
     overlay._state = "recording"
     overlay._show_balloon = False
@@ -300,14 +300,13 @@ def test_speaking_plays_the_zoom_once_then_the_loop():
     overlay.show_speaking("Oi!")
     assert (overlay._mascot_clip, overlay._mascot_index) == ("zoom", 0)
     zoom_len = len(overlay._mascot_frames(1, clip="zoom"))
-    for _ in range(zoom_len - 1):
+    for _ in range(zoom_len):
         overlay._mascot_tick()
-    assert overlay._mascot_clip == "zoom"
-    overlay._mascot_tick()
-    assert (overlay._mascot_clip, overlay._mascot_index) == ("loop", 0)
+    assert (overlay._mascot_clip, overlay._mascot_index) == ("zoom", 0)
     # More of the reply does not restart the zoom.
+    overlay._mascot_tick()
     overlay.show_speaking("Oi! Tudo bem?")
-    assert overlay._mascot_clip == "loop"
+    assert (overlay._mascot_clip, overlay._mascot_index) == ("zoom", 1)
 
 
 def test_mascot_edge_fades_into_the_panel():

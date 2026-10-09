@@ -549,11 +549,10 @@ class OverlayWindow:
     def _mascot_tick(self):
         self._mascot_anim_id = None
         self._mascot_index += 1
-        if self._mascot_clip != "loop":
-            # A one-shot clip (the zoom) hands over to the loop when done.
-            if self._mascot_index >= len(self._mascot_frames(1, clip=self._mascot_clip)):
-                self._mascot_clip = "loop"
-                self._mascot_index = 0
+        if self._mascot_index >= len(self._mascot_frames(1, clip=self._mascot_clip)):
+            # Recording and speaking both repeat the zoom (the user liked it
+            # better than the calmer loop).
+            self._mascot_index = 0
         self._redraw()  # reschedules through _sync_mascot_animation
 
     # --- Public state API -------------------------------------------------
@@ -585,6 +584,8 @@ class OverlayWindow:
         if self._state != "recording":
             self._cancel_timers()
             self._state = "recording"
+            self._mascot_clip = "zoom"
+            self._mascot_index = 0
             self._animate(self.EXPANDED_W, self.EXPANDED_H)
         self._draft_text = draft_text
         self._redraw()
