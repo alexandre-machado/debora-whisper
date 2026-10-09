@@ -4,7 +4,7 @@
 ![Python](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-<video src="docs/assets/branding/debora.animated.mp4" autoplay loop muted playsinline width="100%"></video>
+https://github.com/user-attachments/assets/a9ddebc2-5150-450b-8df5-4471cc705c73
 
 Local voice-to-text dictation for Windows, on Intel NPU or iGPU via OpenVINO, NVIDIA RTX via faster-whisper, or CPU. Press a hotkey, speak, and text appears at your cursor. Zero cloud, zero cost, zero data leaving your machine.
 
