@@ -1,10 +1,14 @@
 # Débora Whisper
 
-Local voice-to-text dictation for Windows, on Intel NPU or iGPU via OpenVINO, NVIDIA RTX via faster-whisper, or CPU. Press a hotkey, speak, and text appears at your cursor. Zero cloud, zero cost, zero data leaving your machine.
-
 ![Windows](https://img.shields.io/badge/platform-Windows%2011-0078D4?logo=windows)
 ![Python](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
+
+> **⚠️ Prototyping Phase:** Débora Whisper is currently in a prototyping phase. Features, branding, and our holographic cyber-fairy mascot are actively being developed.
+> 
+> <img src="docs/assets/branding/mascot_concept_matrix.jpg" width="600" alt="Mascot Concept Art">
+
+Local voice-to-text dictation for Windows, on Intel NPU or iGPU via OpenVINO, NVIDIA RTX via faster-whisper, or CPU. Press a hotkey, speak, and text appears at your cursor. Zero cloud, zero cost, zero data leaving your machine.
 
 ## Features
 

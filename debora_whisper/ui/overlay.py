@@ -29,14 +29,12 @@ class OverlayWindow:
     EXPANDED_W = 450
     EXPANDED_H = 38
     RADIUS = 6   # a slightly rounded rectangle, not a capsule
-    BORDER = 2   # border thickness
     # Whole-window opacity: Tk has no per-pixel alpha, so text fades too.
     OPACITY = 0.85
 
     # --- iOS-inspired dark palette ---
     BG = "#0A0A0A"
     BG_HOVER = "#0A0A0A"
-    BORDER_COLOR = "#333333"
     TEXT = "#FFFFFF"
     TEXT_DIM = "#8E8E93"
     GREEN = "#30D158"
@@ -296,6 +294,11 @@ class OverlayWindow:
         y = cy - oh // 2
         base.alpha_composite(overlay, (x, y))
 
+    def _flat(self) -> dict:
+        """render_pill arguments for a flat panel: one color, no border."""
+        bg = _hex_to_rgba(self.BG)[:3]
+        return {"bg_top": bg, "bg_bottom": bg, "border_width": 0}
+
     def _label(self) -> tuple[str, str, bool]:
         """(text, color, bold) for the current state."""
         state = self._state
@@ -332,10 +335,7 @@ class OverlayWindow:
         mid = h // 2
 
         # Start with glass pill as the base image
-        border_rgba = _hex_to_rgba(self.BORDER_COLOR)
-        pill = self._pill_cache.get(
-            w, h, radius=r, border_color_rgba=border_rgba,
-            border_width=max(1, int(self.BORDER * s)))
+        pill = self._pill_cache.get(w, h, radius=r, **self._flat())
         # Work on a copy so the cache stays clean
         frame = pill.copy()
 
@@ -567,13 +567,7 @@ class OverlayWindow:
         canvas.configure(width=bw_w, height=bw_h)
 
         # Glass pill background for balloon (PIL-rendered)
-        border_rgba = _hex_to_rgba(self.BORDER_COLOR)
-        bg_rgba = _hex_to_rgba(self.BG)
-        balloon_pill = render_pill(
-            bw_w, bw_h, radius=r,
-            border_color_rgba=border_rgba,
-            bg_top=bg_rgba[:3], bg_bottom=bg_rgba[:3],
-            border_width=max(1, int(self.BORDER * s)))
+        balloon_pill = render_pill(bw_w, bw_h, radius=r, **self._flat())
         composited = composite_on_transparent(balloon_pill)
         photo = pil_to_photo(composited)
         # Store reference to prevent GC

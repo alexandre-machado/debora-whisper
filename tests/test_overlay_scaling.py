@@ -125,6 +125,16 @@ def test_states_are_told_in_words_only(state, draft, label):
     assert overlay._label()[0] == label
 
 
+def test_panel_is_flat():
+    from debora_whisper.ui.glass import render_pill
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    img = render_pill(150, 38, radius=OverlayWindow.RADIUS, **overlay._flat())
+    # One color edge to edge: no border, gradient or highlight.
+    inner = img.crop((8, 2, 142, 36)).convert("RGB")
+    assert len(set(inner.getdata())) == 1
+    assert img.getpixel((75, 0))[:3] == img.getpixel((75, 19))[:3]
+
+
 def test_panel_is_translucent_and_slightly_rounded():
     assert 0.5 < OverlayWindow.OPACITY < 1.0
     assert OverlayWindow.RADIUS < OverlayWindow.COMPACT_H // 4
