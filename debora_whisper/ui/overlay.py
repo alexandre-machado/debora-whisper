@@ -704,6 +704,10 @@ class OverlayWindow:
         self._text_dismissed = False
 
     def _set_state(self, state):
+        if state in self._MASCOT_STILL_STATES:
+            # A replaced or failed engine never reports that the voices
+            # stopped; nobody is talking until a new one says so.
+            self.__dict__.setdefault("_talking", set()).clear()
         self._state = state
 
     def show_loading(self):

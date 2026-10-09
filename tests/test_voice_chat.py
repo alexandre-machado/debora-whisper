@@ -1372,3 +1372,69 @@ def test_on_audio_marks_when_her_voice_is_heard(server):
     assert events[0] == (True, 0)  # before the first clip plays
     assert events[-1] == (False, 2)  # after the last one
     assert all(a != b for (a, _), (b, _) in zip(events, events[1:]))  # once per change
+
+
+def _harness_session(tmp_path, saved, events, closed=None):
+    """closed: set it to close Claude's output after events (None: at once)."""
+    import io
+    import json as _json
+    from debora_whisper.harness import HarnessSession, harness_key
+    config = {**DEFAULT_CONFIG, "harness_cwd": str(tmp_path)}
+    key = harness_key(config)[0]
+    session_file = tmp_path / "harness_session.json"
+    session_file.write_text(_json.dumps({key: saved}), encoding="utf-8")
+
+    def output():
+        for event in events:
+            yield _json.dumps(event) + "\n"
+        if closed is not None:
+            closed.wait(5)
+
+    process = MagicMock(pid=1, stdin=io.StringIO(), stdout=output(), stderr=iter([]))
+    process.poll.return_value = None
+    commands = []
+    session = HarnessSession(
+        config, log=lambda m: None,
+        command_factory=lambda config, sid, resume: commands.append((sid, resume)) or ["claude"],
+        process_factory=lambda *a, **kw: process, session_file=session_file)
+    return session, commands, lambda: _json.loads(
+        session_file.read_text(encoding="utf-8")).get(key)
+
+
+def test_claude_session_that_does_not_resume_is_forgotten(tmp_path):
+    saved = "6f1c2d4e-0000-4000-8000-000000000001"
+    session, commands, stored = _harness_session(tmp_path, saved, [])  # exits at once
+    assert commands == [(saved, True)]
+    with pytest.raises(RuntimeError):
+        session.send("oi", MagicMock(), threading.Event())
+    assert stored() is None
+
+
+def test_claude_session_that_resumed_is_kept_after_a_later_failure(tmp_path):
+    saved = "6f1c2d4e-0000-4000-8000-000000000002"
+    closed = threading.Event()
+    session, _, stored = _harness_session(
+        tmp_path, saved, [{"type": "result", "session_id": saved}], closed)
+    session.send("oi", MagicMock(), threading.Event())
+    closed.set()
+    with pytest.raises(RuntimeError):
+        session.send("de novo", MagicMock(), threading.Event())
+    assert stored() == saved
+
+
+def test_invalid_saved_claude_session_is_never_passed_as_a_flag(tmp_path):
+    _, commands, _ = _harness_session(tmp_path, "--dangerously-skip-permissions", [])
+    sid, resume = commands[0]
+    assert resume is False and not sid.startswith("-")
+
+
+@pytest.mark.parametrize("text, started, echo", [
+    ("sim", 10.5, True),     # heard while she was saying it
+    ("sim", 12.5, False),    # her sentence ended: the user answered
+    ("quê", 13.0, False),
+    ("ela disse sim mesmo", 12.5, True),  # longer text keeps the 2 s room tail
+])
+def test_short_answers_after_her_sentence_are_not_echo(text, started, echo, monkeypatch):
+    chat = vc.VoiceChat({"language": "pt"})
+    chat._spoken = [(10.0, 12.0, "Sim, ela disse que quê mesmo")]
+    assert chat.is_echo(text, started, started + 0.4) is echo

@@ -555,3 +555,15 @@ def test_text_pulses_while_she_processes_the_input():
     dim = int(b[1:3], 16)
     bg, fg = int(overlay.BG[1:3], 16), int(overlay.TEXT[1:3], 16)
     assert dim == round(bg + (fg - bg) * overlay.PULSE_MIN)
+
+
+@pytest.mark.parametrize("show", ["show_loading", "show_error"])
+def test_a_reloaded_or_failed_engine_never_leaves_the_mascot_zooming(show):
+    overlay = _overlay(state="speaking")
+    overlay.set_talking("debora", True)
+    getattr(overlay, show)()  # the old engine's "stopped" event never comes
+    overlay._state = "ready"
+    zoom_len = len(overlay._mascot_frames(1, clip="zoom"))
+    for _ in range(zoom_len + 1):
+        overlay._mascot_tick()
+    assert overlay._mascot_clip == "loop"

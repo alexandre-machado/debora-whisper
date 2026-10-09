@@ -223,6 +223,8 @@ class HarnessSession:
     permission_handler(request) can replace the configured decision later.
     """
 
+    _resumed = _confirmed = False
+
     def __init__(self, config: dict, log=print, command_factory=harness_command,
                  process_factory=subprocess.Popen, session_file=None, on_event=None,
                  permission_handler=None):
@@ -235,7 +237,15 @@ class HarnessSession:
         self.on_event, self.permission_handler = on_event, permission_handler
         self.session_file = Path(session_file) if session_file else paths.CONFIG_DIR / "harness_session.json"
         saved = _sessions(self.session_file, log).get(self.key[0])
+        try:
+            saved = str(uuid.UUID(saved)) if saved else None
+        except (TypeError, ValueError):
+            log(f"Voice chat: ignoring an invalid saved Claude session {saved!r}")
+            saved = None
         self.session_id = saved or str(uuid.uuid4())
+        # A resumed session that never completes a turn (expired, deleted)
+        # is forgotten, so the next start is a new conversation.
+        self._resumed, self._confirmed = bool(saved), False
         self.error: str | None = None
         self._events: queue.Queue = queue.Queue()
         self._send_lock = threading.Lock()
@@ -328,6 +338,7 @@ class HarnessSession:
             # A reserved voice turn still records its user message when
             # interrupted before the writer starts; then drain its result.
             if not self.running:
+                self._forget_unresumed()
                 raise RuntimeError(self.error or "Claude is not running")
             self._send({"type": "user", "message": {"role": "user", "content": text}})
             interrupted = None
@@ -386,6 +397,7 @@ class HarnessSession:
                                 tools_seen.add(block.get("id"))
                                 self._notice("tool_use", f"Claude está usando {block['name']}…", on_event)
                     elif kind == "result":
+                        self._confirmed = True
                         self.session_id = message.get("session_id", self.session_id)
                         try:
                             _save_session(self.session_file, self.key[0], self.session_id, self.log)
@@ -400,7 +412,18 @@ class HarnessSession:
                 self.error = str(e)
                 self.log(f"Voice chat: Claude failed ({e})")
                 self.stop()
+                self._forget_unresumed()
                 raise
+
+    def _forget_unresumed(self):
+        if self._resumed and not self._confirmed:
+            self._resumed = False
+            self.log(f"Voice chat: Claude session {self.session_id} did not resume; "
+                     "the next turn starts a new conversation")
+            try:
+                _save_session(self.session_file, self.key[0], None, self.log)
+            except OSError as e:
+                self.log(f"Voice chat: cannot forget Claude session {self.session_id} ({e})")
 
     def _remove_prompt(self):
         if self._prompt_file:

@@ -808,9 +808,13 @@ class VoiceChat:
         heard = tokens(text)
         if not heard:
             return False
+        # A short answer ("sim", "quê?") right after her sentence is the user
+        # answering; it is only an echo if it was heard while she spoke.
+        short = sum(heard.values()) == 1
         with self._spoken_lock:
             recent = " ".join(words for begin, end, words in self._spoken
-                              if begin <= ended and end + 2 >= started)
+                              if ((begin <= started and ended <= end + 0.3) if short
+                                  else (begin <= ended and end + 2 >= started)))
         overlap = sum((heard & tokens(recent)).values())
         return overlap / sum(heard.values()) >= 0.6
 
