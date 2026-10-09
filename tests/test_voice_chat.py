@@ -625,7 +625,11 @@ def test_without_uv_nothing_is_started(no_tts_process, monkeypatch):
     with patch("subprocess.Popen") as popen:
         vc.ensure_tts_server({**DEFAULT_CONFIG, "tts_url": _closed_port_url()},
                              log=lambda m: None)
-    popen.assert_not_called()
+    # Only the TTS server counts: telemetry threads left by other tests may
+    # run nvidia-smi meanwhile.
+    started = [c for c in popen.call_args_list if str(vc.TTS_SERVER_SCRIPT) in map(str, c.args[0])]
+    assert started == []
+    assert vc._tts_process is None
 
 
 def test_bundled_server_declares_its_own_environment():
