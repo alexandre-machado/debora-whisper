@@ -4,9 +4,7 @@
 ![Python](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-> **⚠️ Prototyping Phase:** Débora Whisper is currently in a prototyping phase. Features, branding, and our holographic cyber-fairy mascot are actively being developed.
-> 
-> <img src="docs/assets/branding/mascot_concept_matrix.jpg" width="600" alt="Mascot Concept Art">
+<video src="docs/assets/branding/debora.animated.mp4" autoplay loop muted playsinline width="100%"></video>
 
 Local voice-to-text dictation for Windows, on Intel NPU or iGPU via OpenVINO, NVIDIA RTX via faster-whisper, or CPU. Press a hotkey, speak, and text appears at your cursor. Zero cloud, zero cost, zero data leaving your machine.
 
@@ -154,7 +152,7 @@ Stored at `~/.debora/config.json`:
 ```json
 {
   "device_priority": ["CUDA", "NPU", "GPU", "CPU"],
-  "model_size": "base",
+  "model_size": "turbo",
   "language": "en",
   "hotkey": "ctrl+space",
   "tap_action": "continuous",
@@ -200,8 +198,8 @@ with autocomplete, auto-closing brackets, autocorrect or slow input handling
 
 ### Voice chat (OpenVINO LLM + Chatterbox)
 
-With `"voice_chat": true` (or `--voice-chat`, or **Voice chat** in Settings),
-nothing is typed: each final transcription goes to a local LLM, and its reply
+Voice chat is on by default (`"voice_chat": true`; turn it off in Settings or
+the tray to dictate instead). While it is on, nothing is typed: each final transcription goes to a local LLM, and its reply
 is spoken by a local TTS server and shown in the overlay. The reply streams and
 plays sentence by sentence. The conversation keeps the last 8 turns and starts
 over after 10 minutes of silence. In continuous listening the microphone is
@@ -238,8 +236,16 @@ A load that takes over 10 minutes is killed. It logs to
 export (downloaded on first use into the Hugging Face cache) or a local
 directory. On a Core Ultra 9 185H, the default answers in under a second at
 ~15 tokens/s on the Arc iGPU (`"llm_device": "GPU"`); if the device fails it
-loads on the CPU. Qwen3's thinking is turned off. `llm_prompt: null` uses the
-built-in voice-assistant prompt.
+loads on the CPU. Qwen3's thinking is turned off. `llm_prompt: null` uses Débora's
+built-in prompt (`DEFAULT_VOICE_CHAT_PROMPT` in `voice_chat.py`): a short,
+friendly reply in the user's language, written only as words to be spoken, with
+no emoji, markdown, lists, brackets or symbols (it says "percent", not "%").
+With `"language": "pt"` she uses her own Brazilian Portuguese prompt
+(`VOICE_CHAT_PROMPTS` in `voice_chat.py`); every other language uses the English
+one and is told which language to answer in. Emoji that still slip through are
+neither shown nor spoken, and dates, times, percentages and numbers
+are spelled out (with `num2words`) before they reach Chatterbox, which reads
+digits badly; the overlay keeps the digits.
 
 The TTS is Chatterbox Multilingual on an NVIDIA GPU, served by
 `debora_whisper/tts_server.py`. It needs torch 2.6 with CUDA, so it never runs in

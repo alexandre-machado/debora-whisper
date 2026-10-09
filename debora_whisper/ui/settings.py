@@ -108,7 +108,7 @@ class SettingsWindow:
         self._input_devices = input_devices
         self._on_apply = on_apply
         self._win: ctk.CTkToplevel | None = None
-        self._model_radio_var = ctk.StringVar(value=config.get("model_size", "base"))
+        self._model_radio_var = ctk.StringVar(value=config.get("model_size", "turbo"))
         self._model_rows_frame: ctk.CTkFrame | None = None
         self._status_label: ctk.CTkLabel | None = None
         self._apply_btn: ctk.CTkButton | None = None

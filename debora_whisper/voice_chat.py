@@ -26,15 +26,72 @@ from pathlib import Path
 from debora_whisper import paths
 from debora_whisper.processes import NO_WINDOW, kill_tree, python_executable
 
+# Débora's persona. Everything she writes goes to a text-to-speech engine
+# that reads characters literally, so the reply must be plain words only.
 DEFAULT_VOICE_CHAT_PROMPT = (
-    "You are a voice assistant. The user talks to you through a speech "
-    "recognizer, so their text may contain recognition mistakes: read it for "
-    "what they most likely said. Your reply is read aloud, so answer in the "
-    "user's language, briefly (one to three short sentences), in plain spoken "
-    "language: no markdown, lists, emoji, code or URLs. You have no internet "
-    "or tools: when asked what you cannot know, such as the weather or the "
-    "news, say so instead of guessing."
+    "You are Débora, the voice assistant of Débora Whisper, a dictation app "
+    "running entirely on the user's computer. You are a woman: in languages "
+    "with grammatical gender, always refer to yourself in the feminine, for "
+    "example in Portuguese a Débora and sua assistente. You are warm, "
+    "friendly and direct. The user talks to you through a speech recognizer, "
+    "so their text may contain recognition mistakes. Fix obvious small "
+    "mistakes silently, but when a sentence does not make sense, say you did "
+    "not understand and ask them to repeat instead of guessing. You do not "
+    "know the user's name unless they tell you. When the user asks about "
+    "their own name, as in what is my name, they mean their name, not yours. "
+    "Everything you write is converted to speech and nobody sees it, so "
+    "write only words meant to be spoken. Answer in the user's language, "
+    "briefly, in one to three short sentences. Use only letters, numbers and "
+    "basic punctuation: periods, commas, question marks and exclamation "
+    "marks. Never use emoji, emoticons, markdown, asterisks, hashes, "
+    "bullets, numbered lists, headings, tables, parentheses, brackets, "
+    "quotation marks, slashes, dashes as separators, code or URLs. Say "
+    "symbols, units and abbreviations as words, for example percent "
+    "instead of the percent sign and degrees instead of the degree sign, "
+    "and write times, dates and amounts the way a person would say them. "
+    "Instead of a list, say the items in one natural sentence. "
+    "You have no internet or tools: when asked what you cannot know, such "
+    "as the weather or the news, say so instead of guessing. "
+    "Most important rule: answer and stop. Never end with an offer of help "
+    "or a question to keep the chat going, such as how can I help, what can "
+    "I do for you today or what would you like to do next. Every extra "
+    "sentence takes time to speak."
 )
+# Her own words in a language, picked by the configured language; any other
+# language uses the English prompt and is told which language to answer in.
+VOICE_CHAT_PROMPTS = {
+    "pt": (
+        "Você é a Débora, a assistente de voz do Débora Whisper, um app de "
+        "ditado que roda inteiro no computador do usuário. Você é mulher e "
+        "sempre fala de si no feminino. Fale português do Brasil, de um jeito "
+        "caloroso, simpático e direto, como numa conversa. O usuário fala com "
+        "você por um reconhecedor de voz, então o texto dele pode ter erros de "
+        "reconhecimento. Corrija em silêncio os errinhos óbvios, mas quando a "
+        "frase não fizer sentido, diga que não entendeu e peça para repetir, "
+        "sem adivinhar. Você não sabe o nome do usuário, a não ser que ele "
+        "diga. Quando o usuário falar do nome dele, como em qual é meu nome, "
+        "ele quer saber o nome dele, não o seu. "
+        "Tudo o que você escreve vira fala e ninguém lê, então escreva só "
+        "palavras para serem ditas, em uma a três frases curtas. Use só "
+        "letras, números e pontuação básica: ponto, vírgula, ponto de "
+        "interrogação e de exclamação. Nunca use emoji, emoticons, markdown, "
+        "asteriscos, cerquilhas, marcadores, listas numeradas, títulos, "
+        "tabelas, parênteses, colchetes, aspas, barras, travessões, código ou "
+        "links. Diga símbolos, unidades e abreviações por extenso, por exemplo "
+        "por cento no lugar do sinal de porcentagem e graus no lugar do sinal "
+        "de grau, e escreva horas, datas e valores do jeito que uma pessoa "
+        "fala. Em vez de uma lista, diga os itens numa frase natural. "
+        "Você não tem internet nem ferramentas: quando perguntarem algo que "
+        "você não tem como saber, como o clima ou as notícias, diga isso em "
+        "vez de chutar. "
+        "Regra mais importante: responda e pare. Nunca termine oferecendo "
+        "ajuda ou puxando assunto, com frases como Como posso ajudar, Em que "
+        "posso ajudar hoje, O que deseja fazer agora ou Vai me dizer o que "
+        "precisa. Cada frase a mais demora para ser falada."
+    ),
+}
+_PT_WEEKDAYS = ("segunda-feira", "terça-feira", "quarta-feira", "quinta-feira",
+                "sexta-feira", "sábado", "domingo")
 LLM_MAX_TOKENS = 400
 # Earlier turns sent with each request, and how long a pause starts a fresh
 # conversation.
@@ -51,6 +108,11 @@ TTS_MIN_CHARS = 16
 
 # A sentence ends at . ! ? … (or a line break) followed by whitespace.
 _SENTENCE_END = re.compile(r"(?<=[.!?…])\s+|\n+")
+# Emoji with their variation selectors, keycaps, skin tones and the zero
+# width joiners between them: Chatterbox would read them out or mumble.
+_EMOJI_CHAR = "\U0001F000-\U0001FAFF☀-➿⬀-⯿"
+_EMOJI = re.compile(f"[{_EMOJI_CHAR}](?:[️⃣\U000E0020-\U000E007F]"
+                    f"|‍?[{_EMOJI_CHAR}])*|️⃣?")
 
 
 def is_http_url(url) -> bool:
@@ -71,6 +133,110 @@ def speakable(text: str) -> str:
     text = "".join(" " if unicodedata.category(c)[0] in "CZ" and c != "‍" else c
                    for c in text)
     return re.sub(r" {2,}", " ", text).strip()
+
+
+# Questions that only offer help or ask for the next task: "Como posso
+# ajudar?", "Pode dizer o que quer que eu faça?". Clarifying questions such
+# as "O que você quer dizer?" are not among them.
+_HELP_OFFER = re.compile(
+    r"\b(posso (te |lhe )?ajudar|em que (mais )?posso"
+    r"|(pode|vai) (me )?dizer o que (você )?(quer|precisa|deseja)"
+    r"|o que (você )?(quer|deseja|gostaria|precisa) que eu"
+    r"|o que (você )?(quer|deseja|gostaria) (de )?fazer"
+    r"|o que podemos fazer"
+    r"|how (can|may) i (help|assist)|what can i do for you|anything else"
+    r"|what would you like (me )?to do)\b", re.IGNORECASE)
+
+
+def is_help_offer(sentence: str) -> bool:
+    sentence = sentence.strip()
+    return sentence.endswith("?") and _HELP_OFFER.search(sentence) is not None
+
+
+def without_emoji(text: str) -> str:
+    """The reply as said aloud: emoji are shown but never spoken."""
+    return re.sub(r" {2,}", " ", _EMOJI.sub(" ", text)).strip()
+
+
+# Chatterbox reads digits badly: "10h18" and "09/10/2026" came out garbled.
+# Only the spoken text is spelled out; the overlay keeps the digits.
+_NUM2WORDS_LANG = {"pt": "pt_BR"}
+_MONTHS = {
+    "pt": ("janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho",
+           "agosto", "setembro", "outubro", "novembro", "dezembro"),
+    "en": ("January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December"),
+}
+_PERCENT = {"pt": "por cento", "en": "percent", "es": "por ciento",
+            "fr": "pour cent", "it": "per cento", "de": "Prozent"}
+# Languages that write 3.5 rather than 3,5.
+_DOT_DECIMAL = {"en", "zh", "ja", "ko", "hi", "he", "ms", "sw"}
+_DATE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
+_TIME = re.compile(r"\b([01]?\d|2[0-3])(?::|h)([0-5]\d)\b")
+_HOURS = re.compile(r"\b([01]?\d|2[0-3])h\b")
+
+
+def spoken_numbers(text: str, language) -> str:
+    """text with dates, times, percentages and numbers written as words in
+    language; unchanged when num2words does not know the language."""
+    if not language or language == "auto" or not re.search(r"\d", text):
+        return text
+    try:
+        from num2words import num2words
+        lang = _NUM2WORDS_LANG.get(language, language)
+        num2words(1, lang=lang)
+    except Exception:
+        return text
+
+    def words(n, to="cardinal"):
+        return num2words(n, lang=lang, to=to)
+
+    def hour(h):
+        spoken = words(int(h))
+        if language == "pt":  # uma hora, duas horas, vinte e uma horas
+            spoken = re.sub(r"\bum$", "uma", re.sub(r"\bdois$", "duas", spoken))
+        return spoken
+
+    def date(m):
+        day, month, year = int(m[1]), int(m[2]), int(m[3])
+        if language not in _MONTHS or not 1 <= month <= 12:
+            return m[0].replace("/", " ")
+        if language == "en":  # 10/09/2026 is October 9th
+            day, month = month, day
+            if not 1 <= month <= 12:
+                return m[0].replace("/", " ")
+            return f"{_MONTHS['en'][month - 1]} {words(day, 'ordinal')}, {words(year, 'year')}"
+        return f"{words(day)} de {_MONTHS['pt'][month - 1]} de {words(year)}"
+
+    def time_of_day(m):
+        h, minutes = m[1], int(m[2])
+        if language == "pt":
+            return f"{hour(h)} horas" if minutes == 0 else f"{hour(h)} e {words(minutes)}"
+        if language == "en":
+            if minutes == 0:
+                return f"{hour(h)} o'clock"
+            return f"{hour(h)} {'oh ' if minutes < 10 else ''}{words(minutes)}"
+        return f"{hour(h)} {words(minutes)}"
+
+    def number(m):
+        digits = m[0]
+        thousands, decimal = (",", ".") if language in _DOT_DECIMAL else (".", ",")
+        digits = digits.replace(thousands, "").replace(decimal, ".")
+        return words(float(digits) if "." in digits else int(digits))
+
+    text = _DATE.sub(date, text)
+    text = _TIME.sub(time_of_day, text)
+    if language == "pt":
+        text = _HOURS.sub(lambda m: f"{hour(m[1])} hora{'s' if int(m[1]) != 1 else ''}", text)
+        # 1º de outubro, 2ª feira
+        text = re.sub(r"\b(\d+)º", lambda m: words(int(m[1]), "ordinal"), text)
+        text = re.sub(r"\b(\d+)ª", lambda m: re.sub(r"o\b", "a", words(int(m[1]), "ordinal")), text)
+    if language in _PERCENT:
+        text = re.sub(r"(\d)\s*%", rf"\1 {_PERCENT[language]}", text)
+    sep = r"\," if language in _DOT_DECIMAL else r"\."
+    dec = r"\." if language in _DOT_DECIMAL else r","
+    return re.sub(rf"\d{{1,3}}(?:{sep}\d{{3}})+(?:{dec}\d+)?|\d+(?:{dec}\d+)?",
+                  number, text)
 
 
 def split_sentences(buffer: str) -> tuple[list[str], str]:
@@ -488,8 +654,16 @@ class VoiceChat:
     def _messages(self, text: str) -> list[dict]:
         if time.time() - self._last_turn > HISTORY_IDLE_RESET_SECONDS:
             self._history = []
-        prompt = self.config.get("llm_prompt") or DEFAULT_VOICE_CHAT_PROMPT
         language = self.config.get("language")
+        own = self.config.get("llm_prompt")
+        if not own and language in VOICE_CHAT_PROMPTS:
+            # Her own words already say the language; the date goes in it too.
+            now = time.localtime()
+            return self._with_history(
+                VOICE_CHAT_PROMPTS[language]
+                + f" Agora é {_PT_WEEKDAYS[now.tm_wday]}, "
+                + time.strftime("%d/%m/%Y, %H:%M.", now), text)
+        prompt = own or DEFAULT_VOICE_CHAT_PROMPT
         if language and language != "auto":
             # A short "Sim." alone does not tell the model the language:
             # it answered in English.
@@ -498,6 +672,9 @@ class VoiceChat:
             prompt += f" The user speaks {name}: reply in {name}."
         # Without it, asked the time at 00:25, it said 10 in the morning.
         prompt += f" It is now {time.strftime('%A, %Y-%m-%d %H:%M')}."
+        return self._with_history(prompt, text)
+
+    def _with_history(self, prompt: str, text: str) -> list[dict]:
         recent = self._history[-2 * HISTORY_TURNS:]
         return [{"role": "system", "content": prompt}, *recent,
                 {"role": "user", "content": text}]
@@ -517,8 +694,19 @@ class VoiceChat:
         clips: queue.Queue = queue.Queue()
         # buffer: the sentence being written; short: finished sentences too
         # short to send alone.
-        state = {"reply": "", "llm_error": None, "buffer": "", "short": "", "tokens": False}
+        # said: whether a sentence was kept, so an offer of help after it can go.
+        state = {"reply": "", "llm_error": None, "buffer": "", "short": "", "tokens": False,
+                 "said": False}
         start = time.time()
+
+        def unwanted(sentence):
+            # The prompt alone did not stop them, and each one kept in the
+            # history made the next reply end the same way.
+            if state["said"] and is_help_offer(sentence):
+                self.log(f"Voice chat: dropped the offer of help {sentence!r}")
+                return True
+            state["said"] = True
+            return False
 
         def on_text(chunk):
             if not state["tokens"]:
@@ -526,6 +714,8 @@ class VoiceChat:
                 self.log(f"Voice chat: first token after {time.time() - start:.1f}s")
             done, state["buffer"] = split_sentences(state["buffer"] + chunk)
             for sentence in done:
+                if unwanted(sentence):
+                    continue
                 sentence = f"{state['short']} {sentence}".strip()
                 if len(speakable(sentence)) < TTS_MIN_CHARS:
                     state["short"] = sentence
@@ -536,6 +726,8 @@ class VoiceChat:
         def write():
             try:
                 self._llm(messages, on_text, stop)
+                if state["buffer"].strip() and unwanted(state["buffer"].strip()):
+                    state["buffer"] = ""
                 rest = f"{state['short']} {state['buffer']}".strip()
                 if rest and not stop.is_set():
                     sentences.put(rest)
@@ -551,13 +743,16 @@ class VoiceChat:
                     sentence = sentences.get()
                     if sentence is None:
                         return
-                    spoken = speakable(sentence)
+                    # Her text is for speech: emoji the prompt did not stop
+                    # are neither said nor shown.
+                    spoken = without_emoji(speakable(sentence))
                     if not spoken:
                         continue
                     state["reply"] = f"{state['reply']} {spoken}".strip()
                     if on_reply:
                         on_reply(state["reply"])
                     self.log(f"Voice chat: reply {spoken!r}")
+                    spoken = spoken_numbers(spoken, self.config.get("language"))
                     if not any(c.isalnum() for c in spoken):
                         continue  # an emoji or punctuation: nothing to say
                     audio = None
@@ -630,7 +825,38 @@ def trim_silence(samples, sample_rate: int, keep_seconds=0.05):
     if len(loud) == 0:
         return samples[:0]
     keep = int(sample_rate * keep_seconds)
-    return samples[max(loud[0] - keep, 0):loud[-1] + keep + 1]
+    samples = samples[max(loud[0] - keep, 0):loud[-1] + keep + 1]
+    return _without_trailing_hiss(samples, sample_rate, keep)
+
+
+# Chatterbox sometimes adds a faint hiss after a pause once the speech is
+# over ("Prazer, Alexandre.": 1 s of silence, then 0.4 s of hiss at -42 dB).
+_FRAME_SECONDS = 0.02
+_TAIL_GAP_SECONDS = 0.3
+_GAP_LEVEL_DB = -50
+_SPEECH_LEVEL_DB = -30
+
+
+def _without_trailing_hiss(samples, sample_rate: int, keep: int):
+    """samples cut at the first long pause after which nothing reaches
+    speech level, with a short fade so the cut does not click."""
+    import numpy as np
+    n = max(int(sample_rate * _FRAME_SECONDS), 1)
+    count = len(samples) // n
+    if count == 0:
+        return samples
+    frames = samples[:count * n].reshape(count, n).astype(np.float64)
+    db = 20 * np.log10(np.sqrt(np.mean(frames ** 2, axis=1)) + 1e-12)
+    gap = max(int(_TAIL_GAP_SECONDS / _FRAME_SECONDS), 1)
+    quiet = 0
+    for i, level in enumerate(db):
+        quiet = quiet + 1 if level < _GAP_LEVEL_DB else 0
+        if quiet >= gap and db[i + 1:].max(initial=-np.inf) < _SPEECH_LEVEL_DB:
+            samples = samples[:(i - quiet + 1) * n + keep].copy()
+            fade = min(len(samples), keep)
+            samples[len(samples) - fade:] *= np.linspace(1, 0, fade, dtype=samples.dtype)
+            return samples
+    return samples
 
 
 class StreamPlayer:

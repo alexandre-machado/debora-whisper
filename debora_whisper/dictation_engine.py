@@ -44,7 +44,7 @@ DEFAULT_CONFIG = {
     # next healthy one. RTX first: turbo transcribes 5-7x faster there than on
     # the NPU (README, "Benchmark"). Edit config.json to reorder.
     "device_priority": ["CUDA", "NPU", "GPU", "CPU"],
-    "model_size": "base",      # tiny, base, small, medium (large not supported on NPU)
+    "model_size": "turbo",     # see MODEL_REGISTRY; turbo: large-v3-turbo
     "language": "en",          # Language code or "auto"
     "hotkey": "ctrl+space",    # Global hotkey to toggle recording
     "auto_enter": False,       # Press Enter after pasting (useful for Claude Code)
@@ -71,7 +71,7 @@ DEFAULT_CONFIG = {
     # Voice chat: instead of typing, each final transcription goes to a local
     # LLM (OpenVINO GenAI, in its own process) and its reply is spoken by the
     # Chatterbox TTS server (debora_whisper/tts_server.py, its own uv env).
-    "voice_chat": False,
+    "voice_chat": True,
     # Silence that ends a sentence in voice chat (dictation: 1.5 s, room to
     # think). The reply cannot start before it has passed.
     "voice_chat_end_silence_seconds": 0.8,
