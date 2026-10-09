@@ -82,8 +82,9 @@ DEFAULT_CONFIG = {
     "llm_prompt": None,            # null: voice_chat.DEFAULT_VOICE_CHAT_PROMPT
     # Reference audio for Chatterbox to clone (~10 s of clean speech): a
     # file path, or a name looked up as <name>.wav in the voices folder
-    # (paths.VOICES_DIR). null: Chatterbox's own voice.
-    "tts_voice": None,
+    # (paths.VOICES_DIR), then among the bundled voices (carol, debora,
+    # isabel, mari). null: Chatterbox's own voice.
+    "tts_voice": "debora",
     "tts_url": "http://127.0.0.1:8765",
     "tts_timeout_seconds": 60,
     # Command that starts the TTS server when nothing answers at tts_url.

@@ -511,6 +511,7 @@ def test_invalid_tts_server_command_is_rejected(command):
 @pytest.fixture
 def voices(monkeypatch, tmp_path):
     monkeypatch.setattr(vc.paths, "VOICES_DIR", tmp_path)
+    monkeypatch.setattr(vc.paths, "BUNDLED_VOICES_DIR", tmp_path / "bundled")
     monkeypatch.setattr(vc.shutil, "which", lambda name: "C:/uv/uv.exe")
     (tmp_path / "isabel.wav").write_bytes(_wav())
     return tmp_path
@@ -541,7 +542,28 @@ def test_missing_voice_falls_back_to_the_default_voice(voices):
 def test_voices_are_listed_by_name(voices):
     (voices / "Carol.wav").write_bytes(_wav())
     (voices / "notas.txt").write_text("x")
-    assert vc.list_voices() == ["Carol", "isabel"]
+    (voices / "bundled").mkdir()
+    (voices / "bundled" / "isabel.wav").write_bytes(_wav())
+    (voices / "bundled" / "mari.wav").write_bytes(_wav())
+    assert vc.list_voices() == ["Carol", "isabel", "mari"]
+
+
+def test_bundled_voice_is_used_unless_the_voices_folder_has_one(voices):
+    (voices / "bundled").mkdir()
+    (voices / "bundled" / "mari.wav").write_bytes(_wav())
+    assert vc.resolve_voice("mari") == voices / "bundled" / "mari.wav"
+    (voices / "mari.wav").write_bytes(_wav())
+    assert vc.resolve_voice("mari") == voices / "mari.wav"
+
+
+def test_the_default_voice_ships_with_the_app():
+    from debora_whisper import paths
+    assert DEFAULT_CONFIG["tts_voice"] == "debora"
+    for name in ("carol", "debora", "isabel", "mari"):
+        path = paths.BUNDLED_VOICES_DIR / f"{name}.wav"
+        assert "debora_whisper" in path.parts
+        with wave.open(str(path)) as w:
+            assert w.getnchannels() == 1 and 8 < w.getnframes() / w.getframerate() < 20
 
 
 @pytest.mark.parametrize("voice, sent", [

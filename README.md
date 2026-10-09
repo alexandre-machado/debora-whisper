@@ -221,7 +221,7 @@ loaded until the app exits, so switching back is instant.
   "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
   "llm_device": "GPU",
   "llm_prompt": null,
-  "tts_voice": null,
+  "tts_voice": "debora",
   "tts_url": "http://127.0.0.1:8765",
   "tts_timeout_seconds": 60,
   "tts_server_command": null
@@ -251,8 +251,10 @@ a few GB, and caches it). It is started only when nothing answers at
 command line (a list of arguments).
 
 `tts_voice` clones a voice from ~10 s of clean speech: a WAV path, or a name
-looked up as `<name>.wav` in the voices folder (see File Paths). `null` uses
-Chatterbox's own voice.
+looked up as `<name>.wav` in the voices folder (see File Paths), then among
+the voices that ship with the app: `carol`, `debora` (the default), `isabel`
+and `mari`. A file of the same name in the voices folder wins. `null` uses
+Chatterbox's own voice. Settings lists them all.
 
 Where each part runs best on a Core Ultra laptop with an 8 GB RTX: Whisper on
 the NPU (`--device NPU`), the LLM on the Arc iGPU, Chatterbox alone on the RTX.

@@ -327,22 +327,27 @@ def synthesize(text: str, config: dict):
 
 def resolve_voice(voice) -> Path | None:
     """tts_voice as a file: a path as given, or a bare name looked up as
-    <name>.wav in the voices folder."""
+    <name>.wav in the voices folder, then among the bundled voices."""
     if not voice:
         return None
     path = Path(voice).expanduser()
     if path.suffix or len(path.parts) > 1:
         return path
-    return paths.VOICES_DIR / f"{voice}.wav"
+    own = paths.VOICES_DIR / f"{voice}.wav"
+    bundled = paths.BUNDLED_VOICES_DIR / f"{voice}.wav"
+    return bundled if not own.is_file() and bundled.is_file() else own
 
 
 def list_voices() -> list[str]:
-    """Names of the reference voices (<name>.wav) in the voices folder."""
-    try:
-        return sorted((p.stem for p in paths.VOICES_DIR.glob("*.wav") if p.is_file()),
-                      key=str.casefold)
-    except OSError:
-        return []
+    """Names of the reference voices (<name>.wav) in the voices folder and
+    among the bundled voices."""
+    names = set()
+    for folder in (paths.VOICES_DIR, paths.BUNDLED_VOICES_DIR):
+        try:
+            names.update(p.stem for p in folder.glob("*.wav") if p.is_file())
+        except OSError:
+            pass
+    return sorted(names, key=str.casefold)
 
 
 def tts_command(config: dict, log=print) -> list[str] | None:
