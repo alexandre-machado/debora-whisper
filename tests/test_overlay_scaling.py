@@ -567,3 +567,28 @@ def test_a_reloaded_or_failed_engine_never_leaves_the_mascot_zooming(show):
     for _ in range(zoom_len + 1):
         overlay._mascot_tick()
     assert overlay._mascot_clip == "loop"
+
+
+def test_text_pulses_from_the_input_until_her_voice_starts():
+    overlay = _overlay(state="recording")
+    pulsing = []
+    overlay._pulse = Mock(side_effect=lambda fill, now: pulsing.append(overlay._state) or fill)
+    overlay._text_canvas = Mock(bbox=Mock(return_value=(0, 0, 10, 10)))
+    overlay._text_font = Mock(return_value=Mock(metrics=Mock(return_value=26),
+                                                measure=Mock(return_value=6)))
+
+    def draws_pulsing():
+        pulsing.clear()
+        overlay._draw_text(300)
+        return bool(pulsing)
+
+    overlay.show_processing("oi", voice_chat=True)
+    assert draws_pulsing()
+    overlay.show_speaking("Olá!")  # her text, but no audio yet
+    assert draws_pulsing()
+    overlay.set_talking("debora", True)
+    assert not draws_pulsing()
+    overlay.set_talking("debora", False)  # a gap between sentences
+    assert not draws_pulsing()
+    overlay.show_processing("e agora?", voice_chat=True)
+    assert draws_pulsing()

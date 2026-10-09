@@ -479,7 +479,10 @@ class OverlayWindow:
         canvas.delete("all")
         font = self._text_font()
         now = monotonic()
-        pulsing = self._state == "processing"
+        # From the input until her voice is ready: her text may arrive
+        # (speaking) well before the audio does.
+        pulsing = (self._state == "processing" or self._state == "speaking"
+                   and not self.__dict__.get("_voice_heard"))
         # One row: "Você: …" then "Débora: …", slid left together, so her
         # reply pushes the user's words under the mascot like new words do.
         items, x = [], 0
@@ -678,6 +681,8 @@ class OverlayWindow:
         talking = self.__dict__.setdefault("_talking", set())
         was = bool(talking)
         (talking.add if active else talking.discard)(who)
+        if who == "debora" and active:
+            self._voice_heard = True
         if talking and not was and self._mascot_clip == "loop":
             self._mascot_clip, self._mascot_index = "zoom", 0
             if self._state not in self._MASCOT_STILL_STATES:
@@ -708,6 +713,8 @@ class OverlayWindow:
             # A replaced or failed engine never reports that the voices
             # stopped; nobody is talking until a new one says so.
             self.__dict__.setdefault("_talking", set()).clear()
+        if state == "processing":
+            self._voice_heard = False  # a new input: pulse until she speaks
         self._state = state
 
     def show_loading(self):
