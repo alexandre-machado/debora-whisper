@@ -68,10 +68,14 @@ DEFAULT_CONFIG = {
     # Continuous listening stops by itself after this long without speech
     # (null: never), so a stray tap does not leave the microphone open.
     "continuous_idle_stop_seconds": 120,
-    # Voice chat: instead of typing, each final transcription goes to a local
-    # LLM (OpenVINO GenAI, in its own process) and its reply is spoken by the
-    # Chatterbox TTS server (debora_whisper/tts_server.py, its own uv env).
+    # Voice chat replies are spoken by the Chatterbox TTS server.
     "voice_chat": True,
+    "voice_chat_backend": "local",  # local (Qwen/OpenVINO) or claude
+    "harness_cwd": None,           # null: the user's home directory
+    "harness_model": None,         # null: Claude Code's default
+    "harness_permission_mode": "acceptEdits",
+    "harness_permission_response": "deny",  # requests not already allowed by Claude
+    "harness_prompt_file": None,   # null: packaged voice-channel rules
     # Silence that ends a sentence in voice chat (dictation: 1.5 s, room to
     # think). The reply cannot start before it has passed.
     "voice_chat_end_silence_seconds": 0.8,
@@ -323,6 +327,17 @@ def validate_config(config: dict):
         value = config.get(key, DEFAULT_CONFIG[key])
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{key} must be a non-empty string, got {value!r}")
+    if config.get("voice_chat_backend", "local") not in ("local", "claude"):
+        raise ValueError("voice_chat_backend must be local or claude")
+    for key in ("harness_cwd", "harness_model", "harness_prompt_file"):
+        value = config.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"{key} must be null or a non-empty string, got {value!r}")
+    from debora_whisper.harness import PERMISSION_MODES
+    if config.get("harness_permission_mode", "acceptEdits") not in PERMISSION_MODES:
+        raise ValueError(f"harness_permission_mode must be one of {PERMISSION_MODES}")
+    if config.get("harness_permission_response", "deny") not in ("deny", "allow"):
+        raise ValueError("harness_permission_response must be deny or allow")
     voice = config.get("tts_voice")
     if voice is not None and (not isinstance(voice, str) or not voice.strip()):
         raise ValueError(f"tts_voice must be null or a file path or name, got {voice!r}")
@@ -3197,7 +3212,8 @@ class DictationApp:
         else:
             log("Voice chat off: dictation types again.")
             self.voice_chat.interrupt()
-            self.voice_chat.reset()
+            if self.config.get("voice_chat_backend", "local") == "local":
+                self.voice_chat.reset()
 
     def _warm_up_voice_chat(self):
         """Start the TTS server and load the LLM ahead of the first reply,
@@ -3210,6 +3226,12 @@ class DictationApp:
         try:
             # The TTS server (its own process, on the RTX) starts now.
             ensure_tts_server(self.config, log, TTS_SERVER_LOG)
+            if self.config.get("voice_chat_backend", "local") == "claude":
+                if self.config.get("voice_chat") and not self._stopping.is_set():
+                    from debora_whisper.harness import start_harness
+                    start_harness(self.config, log)
+                    self._notice("Voice chat: Claude Code ready")
+                return
             if llm_loaded(self.config):
                 self._notice("Voice chat ready")
                 return
@@ -3487,8 +3509,10 @@ def main():
     parser.add_argument("--hotkey", type=str, help="Global hotkey (e.g., ctrl+alt+d)")
     parser.add_argument("--continuous", action="store_true", help="Enable continuous listening (VAD)")
     parser.add_argument("--voice-chat", action="store_true",
-                        help="Talk to a local LLM and hear its reply (voice chat) "
+                        help="Talk and hear the reply (voice chat) "
                              "instead of typing")
+    parser.add_argument("--voice-chat-backend", choices=["local", "claude"], help="Voice chat backend")
+    parser.add_argument("--harness-cwd", help="Claude Code folder (default: home)")
     args = parser.parse_args()
     log_folder_moves()
 
@@ -3513,6 +3537,10 @@ def main():
         config["continuous_listening"] = True
     if args.voice_chat:
         config["voice_chat"] = True
+    if args.voice_chat_backend:
+        config["voice_chat_backend"] = args.voice_chat_backend
+    if args.harness_cwd is not None:
+        config["harness_cwd"] = args.harness_cwd
 
     validate_config(config)
     rotate_logs()

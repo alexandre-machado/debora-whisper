@@ -2,6 +2,8 @@
 
 import customtkinter as ctk
 import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog
 
 
 # Intel blue palette
@@ -325,9 +327,38 @@ class SettingsWindow:
 
         self._voice_chat_var = ctk.BooleanVar(value=self._config.get("voice_chat", False))
         ctk.CTkCheckBox(
-            toggles_frame, text="Voice chat: talk to a local LLM and hear the reply",
+            toggles_frame, text="Voice chat: talk and hear the reply",
             variable=self._voice_chat_var, **chk_opts,
         ).pack(anchor="w", pady=2)
+
+        backends = {"local": "Local (Qwen)", "claude": "Claude Code"}
+        self._backend_var = ctk.StringVar(
+            value=backends.get(self._config.get("voice_chat_backend"), "Local (Qwen)"))
+        self._backend_dropdown = ctk.CTkOptionMenu(
+            toggles_frame, values=list(backends.values()), variable=self._backend_var, **dd_opts,
+        )
+        self._backend_dropdown.pack(fill="x", pady=(4, 8))
+        ctk.CTkLabel(
+            toggles_frame, text="Harness folder", text_color=_SECTION_TEXT,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w")
+        folder_row = ctk.CTkFrame(toggles_frame, fg_color="transparent")
+        folder_row.pack(fill="x", pady=(4, 8))
+        self._harness_cwd = self._config.get("harness_cwd")
+        self._harness_folder_var = ctk.StringVar(
+            value=str(Path(self._harness_cwd).expanduser()) if self._harness_cwd else str(Path.home()))
+        ctk.CTkEntry(
+            folder_row, textvariable=self._harness_folder_var, state="readonly",
+            fg_color=_INPUT_BG, border_color=_INPUT_BORDER, text_color=_DESC_TEXT,
+        ).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            folder_row, text="Browse…", command=self._browse_harness_folder, width=75,
+            fg_color=_BTN_SEC_BG, hover_color=_BTN_SEC_HOVER, text_color=_BTN_SEC_TEXT,
+        ).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(
+            folder_row, text="Use home", command=self._use_harness_home, width=75,
+            fg_color=_BTN_SEC_BG, hover_color=_BTN_SEC_HOVER, text_color=_BTN_SEC_TEXT,
+        ).pack(side="left", padx=(6, 0))
 
         self._balloon_var = ctk.BooleanVar(value=self._config.get("show_balloon", True))
         ctk.CTkCheckBox(
@@ -341,6 +372,18 @@ class SettingsWindow:
         _make_wide_dropdown(self._mic_dropdown, mic_names, None)
         _make_wide_dropdown(self._font_size_dropdown, font_sizes, None)
         _make_wide_dropdown(self._voice_dropdown, voice_names, None)
+        _make_wide_dropdown(self._backend_dropdown, list(backends.values()), None)
+
+    def _browse_harness_folder(self):
+        folder = filedialog.askdirectory(parent=self._win, title="Harness folder",
+                                         initialdir=self._harness_folder_var.get())
+        if folder:
+            self._harness_cwd = folder
+            self._harness_folder_var.set(folder)
+
+    def _use_harness_home(self):
+        self._harness_cwd = None
+        self._harness_folder_var.set(str(Path.home()))
 
     def _voice_choices(self) -> list[str]:
         """Chatterbox's own voice, then each <name>.wav in the voices folder,
@@ -458,6 +501,8 @@ class SettingsWindow:
         new_config["auto_enter"] = self._enter_var.get()
         new_config["inline_drafts"] = self._inline_drafts_var.get()
         new_config["voice_chat"] = self._voice_chat_var.get()
+        new_config["voice_chat_backend"] = "claude" if self._backend_var.get() == "Claude Code" else "local"
+        new_config["harness_cwd"] = self._harness_cwd
         voice = self._voice_var.get()
         new_config["tts_voice"] = None if voice == _DEFAULT_VOICE else voice
         new_config["show_balloon"] = self._balloon_var.get()

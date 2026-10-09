@@ -196,7 +196,50 @@ only works where the editor leaves the typed text and caret alone; editors
 with autocomplete, auto-closing brackets, autocorrect or slow input handling
 (browsers, Word, IDEs) can garble the result.
 
-### Voice chat (OpenVINO LLM + Chatterbox)
+### Voice chat with Claude Code
+
+Choose **Claude Code** and a **Harness folder** in Settings, or run
+`debora-cli --voice-chat --voice-chat-backend claude --harness-cwd D:\my-project`.
+Claude Code must already be installed, authenticated and on PATH. Qwen remains
+the default (`"voice_chat_backend": "local"`); speech recognition and TTS stay local.
+
+```json
+{
+  "voice_chat": true,
+  "voice_chat_backend": "claude",
+  "harness_cwd": null,
+  "harness_model": null,
+  "harness_permission_mode": "acceptEdits",
+  "harness_permission_response": "deny",
+  "harness_prompt_file": null,
+  "language": "pt"
+}
+```
+
+`harness_cwd: null` uses your home folder; **Browse…** selects a project and
+**Use home** restores that default. `harness_model: null` uses Claude's default.
+One Claude process stays alive across turns and receives the raw transcript.
+Its folder supplies project context and settings. Débora supplies voice rules
+from its packaged prompt, plus language and process-start date/time, through a
+temporary file; it creates no context files in the project. `harness_prompt_file`
+overrides those rules (relative paths are resolved from the harness folder).
+
+Permissions already allowed by Claude's mode/settings proceed normally. Pending
+requests are denied and logged by default; `harness_permission_response: "allow"`
+automatically approves them instead. Spoken permission questions are a later phase.
+Tools and decisions appear in `~/.debora/logs/app.log`. Replies stream into the
+existing TTS; fenced code and list markers are removed. After 1.5 seconds without
+text, Débora queues “Um instante.” once. Actual playback depends on TTS readiness.
+
+Session IDs are saved by folder in `~/.debora/harness_session.json` and logged.
+After stopping Débora, open that folder in a terminal and run
+`claude --resume <session-id>` to continue. Restarting Débora resumes the same
+conversation; say “nova conversa” or “new conversation” to start a new one.
+Backend/folder changes take effect on the next turn. This backend has no local
+eight-turn history limit or idle reset. See the
+[protocol findings](docs/benchmarks/harness-2026-10-09/README.md).
+
+### Voice chat with the local OpenVINO LLM + Chatterbox
 
 Voice chat is on by default (`"voice_chat": true`; turn it off in Settings or
 the tray to dictate instead). While it is on, nothing is typed: each final transcription goes to a local LLM, and its reply

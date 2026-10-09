@@ -398,6 +398,11 @@ class GUIApp:
         model_changed = new_config["model_size"] != self._config["model_size"]
         voice_chat = new_config.get("voice_chat", self._config.get("voice_chat"))
         voice_chat_changed = bool(voice_chat) != bool(self._config.get("voice_chat"))
+        harness_changed = any(
+            new_config.get(key, self._config.get(key)) != self._config.get(key)
+            for key in ("voice_chat_backend", "harness_cwd", "harness_model",
+                        "harness_permission_mode", "harness_prompt_file", "harness_permission_response")
+        )
         rebuild = any(
             new_config.get(key, self._config.get(key)) != self._config.get(key)
             for key in self._REBUILD_KEYS
@@ -420,6 +425,9 @@ class GUIApp:
                     f"when it finishes.", "#FF9F0A")
                 return
 
+        if harness_changed:
+            self._engine.voice_chat.interrupt()
+            log("Voice chat: backend settings changed; applied on the next turn.")
         self._config.update(new_config)
         save_config(self._config)
         if voice_chat_changed and not (rebuild and not failure):
@@ -554,8 +562,10 @@ def main():
     parser.add_argument("--hotkey", type=str, help="Global hotkey")
     parser.add_argument("--continuous", action="store_true", help="Enable continuous listening")
     parser.add_argument("--voice-chat", action="store_true",
-                        help="Talk to a local LLM and hear its reply (voice chat) "
+                        help="Talk and hear the reply (voice chat) "
                              "instead of typing")
+    parser.add_argument("--voice-chat-backend", choices=["local", "claude"], help="Voice chat backend")
+    parser.add_argument("--harness-cwd", help="Claude Code folder (default: home)")
     shortcut = parser.add_mutually_exclusive_group()
     shortcut.add_argument("--install-shortcut", action="store_true",
                           help="Add Débora Whisper to the Start Menu, then exit")
@@ -596,6 +606,10 @@ def main():
         config["continuous_listening"] = True
     if args.voice_chat:
         config["voice_chat"] = True
+    if args.voice_chat_backend:
+        config["voice_chat_backend"] = args.voice_chat_backend
+    if args.harness_cwd is not None:
+        config["harness_cwd"] = args.harness_cwd
 
     validate_config(config)
     rotate_logs()

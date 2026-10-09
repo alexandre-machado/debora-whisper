@@ -1,5 +1,5 @@
-"""Voice chat: each final transcription goes to a local LLM (OpenVINO GenAI,
-in debora_whisper/llm_server.py's process) and its reply is spoken aloud by the Chatterbox TTS server
+"""Voice chat: each final transcription goes to a local LLM or Claude Code,
+and its reply is spoken aloud by the Chatterbox TTS server
 (debora_whisper/tts_server.py, in its own uv environment).
 
 The reply is streamed and spoken sentence by sentence: the first sentence
@@ -129,6 +129,8 @@ def speakable(text: str) -> str:
     """Text for the TTS: no markdown marks, control characters or runs of
     spaces."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"(```|~~~).*?(?:\1|$)", "", text, flags=re.DOTALL)
+    text = re.sub(r"(?m)^\s*(?:[-+*]|\d+[.)])\s+", "", text)
     text = re.sub(r"[*_#`~>|]+", "", text)
     text = "".join(" " if unicodedata.category(c)[0] in "CZ" and c != "‍" else c
                    for c in text)
@@ -246,6 +248,26 @@ def split_sentences(buffer: str) -> tuple[list[str], str]:
     """Complete sentences in buffer, and the unfinished rest."""
     parts = _SENTENCE_END.split(buffer)
     return [p for p in parts[:-1] if p.strip()], parts[-1]
+
+
+def speech_markdown(buffer: str, fence: str = "") -> tuple[str, str, str]:
+    """Remove fenced code before sentence splitting, even across deltas."""
+    parts = []
+    start = 0
+    for match in re.finditer(r"```|~~~", buffer):
+        if not fence:
+            parts.append(buffer[start:match.start()])
+            fence = match.group()
+        elif fence == match.group():
+            fence = ""
+            parts.append("\n")
+        start = match.end()
+    tail = buffer[start:]
+    pending = re.search(r"[`~]{1,2}$", tail)
+    rest = pending.group() if pending else ""
+    if not fence:
+        parts.append(tail[:-len(rest)] if rest else tail)
+    return "".join(parts), rest, fence
 
 
 # ---------------------------------------------------------------------------
@@ -640,21 +662,37 @@ class VoiceChat:
         self.tts_log_path = tts_log_path
         # play(samples, rate, stop) per clip; None: a StreamPlayer per reply.
         self._play = play
-        self._llm = llm or (lambda messages, on_text, stop: generate_reply(
-            messages, self.config, on_text, stop, self.log, llm_log_path))
+        self._llm_log_path = llm_log_path
+        self._llm = llm or self._generate
         self._history: list[dict] = []
         self._last_turn = 0.0
         self._interrupt = threading.Event()
         self.speaking = False
 
     def reset(self):
+        self.interrupt()
         self._history = []
+        if self.config.get("voice_chat_backend", "local") == "claude":
+            from debora_whisper.harness import reset_harness
+            reset_harness(self.config, self.log)
+
+    def _generate(self, messages, on_text, stop):
+        if self.config.get("voice_chat_backend", "local") == "claude":
+            from debora_whisper.harness import start_harness
+            start_harness(self.config, self.log).send(messages[-1]["content"], on_text, stop)
+        else:
+            from debora_whisper.harness import stop_harness
+            stop_harness()
+            generate_reply(messages, self.config, on_text, stop, self.log, self._llm_log_path)
 
     def interrupt(self):
         """Stop the reply in progress: no more text, synthesis or audio."""
         self._interrupt.set()
 
     def _messages(self, text: str) -> list[dict]:
+        if self.config.get("voice_chat_backend", "local") == "claude":
+            self._history = []
+            return [{"role": "user", "content": text}]
         if time.time() - self._last_turn > HISTORY_IDLE_RESET_SECONDS:
             self._history = []
         language = self.config.get("language")
@@ -685,12 +723,16 @@ class VoiceChat:
     def respond(self, text: str, on_reply=None) -> str:
         """Ask the LLM, speak its reply and return the text spoken so far
         ("" if the LLM failed). on_reply(text) gets the reply as it grows."""
+        if (self.config.get("voice_chat_backend", "local") == "claude"
+                and text.strip().rstrip(".!?").casefold() in ("nova conversa", "new conversation")):
+            self.reset()
         # A fresh event per turn: an interrupted turn's threads keep seeing
         # theirs set, even after the next turn starts.
         stop = self._interrupt = threading.Event()
         # Voice chat may have been switched on in Settings since startup.
         ensure_tts_server(self.config, self.log, self.tts_log_path)
         messages = self._messages(text)
+        claude = self.config.get("voice_chat_backend", "local") == "claude"
         sentences: queue.Queue = queue.Queue()
         # Unbounded: after an interrupt nobody takes clips, and the renderer
         # must still be able to finish.
@@ -699,22 +741,37 @@ class VoiceChat:
         # short to send alone.
         # said: whether a sentence was kept, so an offer of help after it can go.
         state = {"reply": "", "llm_error": None, "buffer": "", "short": "", "tokens": False,
-                 "said": False}
+                 "said": False, "markdown_pending": "", "fence": ""}
         start = time.time()
+        waiting = object()
+        feedback_lock = threading.Lock()
+        finished = threading.Event()
+
+        def feedback():
+            with feedback_lock:
+                if not state["tokens"] and not stop.is_set() and not finished.is_set():
+                    self.log("Voice chat: waiting for Claude. Um instante.")
+                    sentences.put(waiting)
+
+        timer = threading.Timer(1.5, feedback) if claude else None
 
         def unwanted(sentence):
             # The prompt alone did not stop them, and each one kept in the
             # history made the next reply end the same way.
-            if state["said"] and is_help_offer(sentence):
+            if not claude and state["said"] and is_help_offer(sentence):
                 self.log(f"Voice chat: dropped the offer of help {sentence!r}")
                 return True
             state["said"] = True
             return False
 
         def on_text(chunk):
-            if not state["tokens"]:
-                state["tokens"] = True
-                self.log(f"Voice chat: first token after {time.time() - start:.1f}s")
+            with feedback_lock:
+                if not state["tokens"]:
+                    state["tokens"] = True
+                    self.log(f"Voice chat: first token after {time.time() - start:.1f}s")
+            if claude:
+                chunk, state["markdown_pending"], state["fence"] = speech_markdown(
+                    state["markdown_pending"] + chunk, state["fence"])
             done, state["buffer"] = split_sentences(state["buffer"] + chunk)
             for sentence in done:
                 if unwanted(sentence):
@@ -736,8 +793,15 @@ class VoiceChat:
                     sentences.put(rest)
             except Exception as e:
                 state["llm_error"] = e
+                self.log(f"Voice chat: LLM failed ({e})")
+                if claude and not stop.is_set():
+                    sentences.put("Não consegui falar com o Claude. Confira a pasta e o log da Débora.")
             finally:
-                sentences.put(None)
+                with feedback_lock:
+                    finished.set()
+                    if timer:
+                        timer.cancel()
+                    sentences.put(None)
 
         def render():
             tts_ok = None  # unknown until the first sentence
@@ -746,14 +810,18 @@ class VoiceChat:
                     sentence = sentences.get()
                     if sentence is None:
                         return
+                    is_feedback = sentence is waiting
+                    if is_feedback:
+                        sentence = "Um instante."
                     # Her text is for speech: emoji the prompt did not stop
                     # are neither said nor shown.
                     spoken = without_emoji(speakable(sentence))
                     if not spoken:
                         continue
-                    state["reply"] = f"{state['reply']} {spoken}".strip()
-                    if on_reply:
-                        on_reply(state["reply"])
+                    if not is_feedback:
+                        state["reply"] = f"{state['reply']} {spoken}".strip()
+                        if on_reply:
+                            on_reply(state["reply"])
                     self.log(f"Voice chat: reply {spoken!r}")
                     spoken = spoken_numbers(spoken, self.config.get("language"))
                     if not any(c.isalnum() for c in spoken):
@@ -779,6 +847,9 @@ class VoiceChat:
 
         writer = threading.Thread(target=write, daemon=True)
         renderer = threading.Thread(target=render, daemon=True)
+        if timer:
+            timer.daemon = True
+            timer.start()
         writer.start()
         renderer.start()
         self.speaking = True
@@ -801,6 +872,9 @@ class VoiceChat:
             self.log(f"Voice chat: LLM failed ({state['llm_error']})")
             return ""
         reply = state["reply"]
+        if claude:
+            self.log(f"Voice chat: replied in {time.time() - start:.1f}s")
+            return reply
         if reply and any(turn == {"role": "assistant", "content": reply}
                          for turn in self._history):
             # A copy of an earlier reply. Kept in the history, it made the
