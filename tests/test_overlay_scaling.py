@@ -125,6 +125,26 @@ def test_states_are_told_in_words_only(state, draft, label):
     assert overlay._label()[0] == label
 
 
+def test_text_is_a_soft_white_in_a_legible_font(monkeypatch):
+    import tkinter.font as tkfont
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    overlay._root = None
+    assert OverlayWindow.TEXT.upper() != "#FFFFFF"
+    monkeypatch.setattr(tkfont, "families", lambda root=None: ["Segoe UI", "Segoe UI Semibold",
+                                                                "Segoe UI Variable Text",
+                                                                "Segoe UI Variable Text Semibold"])
+    assert overlay._font(14) == ("Segoe UI Variable Text", 14)
+    assert overlay._font(14, semibold=True) == ("Segoe UI Variable Text Semibold", 14)
+
+
+def test_font_falls_back_to_segoe_ui(monkeypatch):
+    import tkinter.font as tkfont
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    overlay._root = None
+    monkeypatch.setattr(tkfont, "families", lambda root=None: ["Segoe UI", "Arial"])
+    assert overlay._font(14, semibold=True) == ("Segoe UI Semibold", 14)
+
+
 def test_panel_is_flat():
     from debora_whisper.ui.glass import render_pill
     overlay = OverlayWindow.__new__(OverlayWindow)

@@ -35,8 +35,12 @@ class OverlayWindow:
     # --- iOS-inspired dark palette ---
     BG = "#0A0A0A"
     BG_HOVER = "#0A0A0A"
-    TEXT = "#FFFFFF"
-    TEXT_DIM = "#8E8E93"
+    TEXT = "#D8D8DC"      # a slightly gray white, softer than pure white
+    TEXT_DIM = "#9A9AA0"
+    FONT_SIZE = 11
+    # Windows 11's text-optimized Segoe; Segoe UI where it is missing.
+    FONTS = (("Segoe UI Variable Text", "Segoe UI Variable Text Semibold"),
+             ("Segoe UI", "Segoe UI Semibold"))
     GREEN = "#30D158"
     RED = "#FF453A"
     VIOLET = "#8B5CF6"
@@ -299,6 +303,20 @@ class OverlayWindow:
         bg = _hex_to_rgba(self.BG)[:3]
         return {"bg_top": bg, "bg_bottom": bg, "border_width": 0}
 
+    def _font(self, size: int, semibold: bool = False) -> tuple:
+        """(family, size) in the most legible installed family."""
+        families = getattr(self, "_font_families", None)
+        if families is None:
+            try:
+                import tkinter.font as tkfont
+                installed = set(tkfont.families(self._root))
+            except Exception:
+                installed = set()
+            families = next((pair for pair in self.FONTS if pair[0] in installed),
+                            self.FONTS[-1])
+            self._font_families = families
+        return (families[1] if semibold else families[0], size)
+
     def _label(self) -> tuple[str, str, bool]:
         """(text, color, bold) for the current state."""
         state = self._state
@@ -312,7 +330,7 @@ class OverlayWindow:
             draft = getattr(self, "_draft_text", "")
             if draft:
                 return draft[-40:], self.TEXT, False
-            return "Listening...", self.TEXT_DIM, False
+            return "🐝 Listening...", self.TEXT_DIM, False
         if state == "processing":
             return "Transcribing...", self.TEXT, True
         if state == "speaking":
@@ -329,7 +347,7 @@ class OverlayWindow:
         c.delete("all")
         self._photo_refs.clear()
         s = self._scale
-        font_size = self._font_pixels(10, s)
+        font_size = self._font_pixels(self.FONT_SIZE, s)
         w, h = int(self._cur_w), int(self._cur_h)
         r = min(int(self.RADIUS * s), h // 2)
         mid = h // 2
@@ -342,7 +360,7 @@ class OverlayWindow:
         label, fill, bold = self._label()
         text_items = []  # (x, y, text, fill, font, anchor) — drawn after image
         if label:
-            font = ("Segoe UI", font_size, "bold") if bold else ("Segoe UI", font_size)
+            font = self._font(font_size, semibold=bold)
             text_items.append((w // 2, mid, label, fill, font, "center"))
 
         # Flatten to RGB on transparent background and place as one image
@@ -551,7 +569,7 @@ class OverlayWindow:
 
         # Measure text to determine balloon size
         tmp_id = canvas.create_text(
-            0, 0, text=text, font=("Segoe UI", fsize),
+            0, 0, text=text, font=self._font(fsize),
             width=max_w - 2 * pad, anchor="nw",
         )
         bbox = canvas.bbox(tmp_id)
@@ -576,7 +594,7 @@ class OverlayWindow:
 
         # Draw text
         canvas.create_text(
-            pad, pad, text=text, font=("Segoe UI", fsize),
+            pad, pad, text=text, font=self._font(fsize),
             fill=self.TEXT, width=max_w - 2 * pad, anchor="nw",
         )
 

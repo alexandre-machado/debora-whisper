@@ -6,14 +6,14 @@ from PIL import Image, ImageDraw
 
 ICON_SIZE = 64
 
-# Cores solicitadas
-C_ERROR = "#EF4444"      # Vermelho
-C_READY = "#22C55E"      # Verde
-C_RECORDING_IDLE = "#7E22CE"   # Roxo mais escuro (Ocioso/Escutando sem áudio)
-C_RECORDING_ACTIVE = "#A855F7" # Roxo vibrante (Escutando com áudio passando)
-C_PROCESSING = "#8B5CF6" # Roxo (animado)
-C_LOADING = "#808080"    # Cinza (animado)
-C_SPEAKING = "#0A84FF"   # Azul (animado): o chat de voz fala a resposta
+# Cores da nova identidade visual (Dourado, Roxo e Azul Ciano)
+C_ERROR = "#EF4444"            # Vermelho (mantido para clareza de erro)
+C_READY = "#FBBF24"            # Dourado (Pronto)
+C_RECORDING_IDLE = "#7E22CE"   # Roxo Escuro (Escutando em silêncio)
+C_RECORDING_ACTIVE = "#A855F7" # Roxo Vibrante (Captando voz ativamente)
+C_PROCESSING = "#06B6D4"       # Ciano Brilhante (Transcrevendo/Holograma)
+C_LOADING = "#3B82F6"          # Azul Elétrico (Carregando modelo)
+C_SPEAKING = "#0EA5E9"         # Azul/Ciano Vivo (Assistente falando)
 
 def render_bars(color, heights, size=ICON_SIZE):
     """Renderiza um ícone com 5 barras verticais de tamanhos variáveis."""
