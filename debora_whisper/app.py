@@ -195,10 +195,8 @@ class GUIApp:
         elif state == AppState.PROCESSING:
             self._stop_audio_polling()
             self._tray.update_state(state_name, "Débora Whisper — Transcribing...")
-            if getattr(self._engine, "config", self._config).get("voice_chat"):
-                self._overlay.show_processing(text="Pensando...")
-            else:
-                self._overlay.show_processing()
+            # The balloon is only for what was said; status stays in the pill.
+            self._overlay.show_processing()
 
         elif state == AppState.ERROR:
             self._stop_audio_polling()

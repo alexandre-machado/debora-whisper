@@ -252,8 +252,9 @@ class OverlayWindow:
         except Exception:
             return self._win.winfo_screenwidth()
 
-    def _monitor_work_area(self, x, y):
-        """Use the same nearest-monitor lookup for the pill and its balloon."""
+    def _monitor_work_area(self, x, y, full=False):
+        """Use the same nearest-monitor lookup for the pill and its balloon.
+        full: the whole monitor, taskbar included, not just the work area."""
         try:
             import ctypes
             from ctypes import wintypes
@@ -277,7 +278,8 @@ class OverlayWindow:
             mi = MONITORINFO()
             mi.cbSize = ctypes.sizeof(MONITORINFO)
             if user32.GetMonitorInfoW(hMonitor, ctypes.byref(mi)):
-                return mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom
+                rect = mi.rcMonitor if full else mi.rcWork
+                return rect.left, rect.top, rect.right, rect.bottom
         except Exception:
             pass
         return 0, 0, self._win.winfo_screenwidth(), self._win.winfo_screenheight()
@@ -288,7 +290,9 @@ class OverlayWindow:
         h = int(self._cur_h)
         center = self._get_screen_width() // 2 if self._pos_x is None else self._pos_x
         x, y = center - w // 2, self._pos_y
-        wl, wt, wr, wb = self._monitor_work_area(center, y + h // 2)
+        # The whole monitor: clamped to the work area, a pill the user dragged
+        # onto the taskbar jumped back up on the next state change.
+        wl, wt, wr, wb = self._monitor_work_area(center, y + h // 2, full=True)
         x = max(wl, min(x, wr - w))
         y = max(wt, min(y, wb - h))
         self._pos_x, self._pos_y = x + w // 2, y
