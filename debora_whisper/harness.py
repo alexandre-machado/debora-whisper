@@ -19,6 +19,30 @@ HARNESS_PROMPT = Path(__file__).with_name("harness_prompt.md")
 PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan")
 MEMORY_MAX_LINES = 100
 MEMORY_MAX_BYTES = 8192
+# Exact forms deliberately avoid writable flags (git branch -D, --output,
+# nvidia-smi -pl) and indefinite reads (Get-Content -Wait).
+DEFAULT_ALLOWED_TOOLS = tuple(
+    f"{tool}({command})"
+    for tool in ("Bash", "PowerShell")
+    for command in (
+        "git status", "git status --short", "git status --porcelain",
+        "git log", "git log --oneline", "git log -5 --oneline",
+        "git diff", "git diff --stat", "git diff --cached", "git show",
+        "git branch", "git branch --all", "git branch --show-current",
+        "docker ps", "docker ps --all", "docker ps -a", "docker info",
+        "docker images", "docker version", "docker compose ps",
+        "docker compose ps --all", "wsl -l -v", "wsl --list",
+        "wsl --list --verbose", "zellij list-sessions", "nvidia-smi",
+        "Get-ChildItem", "Get-ChildItem -Force", "Get-ChildItem -Path .",
+        "Get-Content README.md", "Get-Content -Path README.md",
+        "Get-Process", "Get-Service", "Test-Path .", "Test-Path -Path .",
+    )
+)
+
+
+def harness_allowed_tools(config: dict) -> tuple[str, ...]:
+    rules = config.get("harness_allowed_tools")
+    return DEFAULT_ALLOWED_TOOLS if rules is None else tuple(rules)
 
 
 def harness_command(config: dict, session_id: str, resume: bool) -> list[str]:
@@ -36,6 +60,9 @@ def harness_command(config: dict, session_id: str, resume: bool) -> list[str]:
         command += ["--add-dir", str(config_dir)]
     if config.get("harness_model"):
         command += ["--model", config["harness_model"]]
+    rules = harness_allowed_tools(config)
+    if rules:
+        command += ["--allowedTools", *rules]
     return command
 
 
@@ -56,7 +83,7 @@ def harness_key(config: dict) -> tuple:
             config.get("harness_permission_mode", "acceptEdits"),
             config.get("harness_prompt_file"), config.get("language"),
             config.get("harness_permission_response", "deny"),
-            os.path.normcase(str(harness_memory_file(config))))
+            os.path.normcase(str(harness_memory_file(config))), harness_allowed_tools(config))
 
 
 def voice_prompt(prompt: str, language: str | None, now: str) -> str:

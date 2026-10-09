@@ -111,6 +111,73 @@ O Claude confirmou a negação, não tentou outro comando, e `result` incluiu
 o Bash em `permission_denials`. A aplicação usa o mesmo formato, nega
 pedidos por padrão e registra ferramentas, pedidos e decisões em `app.log`.
 
+## Regras de diagnóstico sem pergunta
+
+Prova manual do feedback de 2026-10-09, com `claude.exe` **2.1.295**, modelo
+`claude-opus-5-5`, `acceptEdits` e o mesmo transporte stream-json da aplicação.
+O [probe](probe_allowed_tools.py) usa `HarnessSession.send`, o
+`permission_handler` real (sempre retorna `False`) e `permission_response` da
+Débora. Cada processo tem cwd, memória, prompt e arquivo de sessões temporários.
+`--setting-sources "" --strict-mcp-config --tools PowerShell` isola as regras de
+settings pessoais/projeto e conectores; a rodada Bash troca apenas a ferramenta.
+Nenhuma instância da Débora ou do servidor TTS foi iniciada ou encerrada.
+
+```powershell
+.venv/Scripts/python.exe docs/benchmarks/harness-2026-10-09/probe_allowed_tools.py none
+.venv/Scripts/python.exe docs/benchmarks/harness-2026-10-09/probe_allowed_tools.py exact
+.venv/Scripts/python.exe docs/benchmarks/harness-2026-10-09/probe_allowed_tools.py colon
+.venv/Scripts/python.exe docs/benchmarks/harness-2026-10-09/probe_allowed_tools.py glob
+.venv/Scripts/python.exe docs/benchmarks/harness-2026-10-09/probe_allowed_tools.py packaged
+.venv/Scripts/python.exe docs/benchmarks/harness-2026-10-09/probe_allowed_tools.py packaged Bash
+```
+
+Argumentos são elementos separados de argv, sem shell intermediário. Por exemplo:
+
+```text
+--allowedTools "PowerShell(docker info:*)" "PowerShell(docker ps:*)"
+```
+
+Resultados observados (número de chamadas ao handler, todas negadas):
+
+| Regras / ferramenta | `docker ps` | `docker ps --all` | `docker info; docker ps` | `docker rm debora-permission-probe-<uuid>` |
+|---|---:|---:|---:|---:|
+| Nenhuma regra adicional / PowerShell | 0 | 0 | 1 | 1 |
+| `PowerShell(docker info)`, `PowerShell(docker ps)` | 0 | 0 | 0 | 1 |
+| `PowerShell(docker info:*)`, `PowerShell(docker ps:*)` | 0 | 0 | 0 | 1 |
+| `PowerShell(docker info *)`, `PowerShell(docker ps *)` | 0 | 0 | 0 | 1 |
+| Padrão empacotado / PowerShell | 0 | 0 | 0 | 1 |
+| Padrão empacotado / Bash | 0 | 0 | 0 | 1 |
+
+**As três sintaxes funcionaram no composto do PowerShell.** O padrão usa formas
+exatas, sem wildcard de argumentos. As duas rodadas `packaged` usaram o próprio
+`harness_command` e também executaram `docker info` sozinho sem pedido. As
+rodadas iniciais de comparação começaram por `docker ps`; o script inclui agora
+`docker info` como primeiro comando para facilitar a reprodução.
+
+`docker ps` isolado já passa pela política interna do CLI sem nossa regra;
+portanto, sozinho não prova que `--allowedTools` funcionou. O composto foi a
+comparação decisiva: sem regras, negado; com uma regra para cada parte, executado
+em uma única chamada PowerShell. A execução retornou exit code 1 porque o daemon
+Docker estava indisponível (`dockerDesktopLinuxEngine` não encontrado), mas o
+cliente rodou e `docker info` informou versão **29.8.2**. Não iniciamos o Docker.
+
+O comando não listado chegou como `control_request.request.subtype: can_use_tool`
+ao handler da Débora, com `tool_name: PowerShell` (ou `Bash` na rodada equivalente).
+O resultado da ferramenta foi `Permissão negada pela Débora.`; nenhuma remoção
+foi executada. O nome de container descartável usa UUID em vez de um nome real.
+Não aceitamos as sugestões de persistir regras em `localSettings`.
+
+`harness_allowed_tools: null` seleciona `DEFAULT_ALLOWED_TOOLS`; `[]` não
+acrescenta regras; uma lista substitui o padrão. O padrão inclui somente formas
+de diagnóstico escolhidas, sem variantes de escrita (`git branch -D`,
+`--output`, `nvidia-smi -pl`) nem leitura contínua (`-f`, `Get-Content -Wait`).
+Get-Content fica restrito a README.md e Test-Path a `.`, com variantes `-Path`;
+outros caminhos podem ser acrescentados explicitamente na configuração.
+As regras são aditivas às permissões do CLI: não revogam permissões preexistentes.
+Essas provas verificam o transporte e os casos descritos, não todos os comandos
+da lista nem uma revisão de segurança. Interface multi-monitor/DPI e áudio
+continuam sem validação visual/auditiva nesta passada.
+
 ## Memória de voz e `--add-dir`
 
 Verificação manual em 2026-10-09 com o mesmo `claude.exe` 2.1.295, usando

@@ -401,7 +401,8 @@ class GUIApp:
         harness_changed = any(
             new_config.get(key, self._config.get(key)) != self._config.get(key)
             for key in ("voice_chat_backend", "harness_cwd", "harness_model",
-                        "harness_permission_mode", "harness_prompt_file", "harness_permission_response")
+                        "harness_permission_mode", "harness_prompt_file", "harness_permission_response",
+                        "harness_allowed_tools")
         )
         rebuild = any(
             new_config.get(key, self._config.get(key)) != self._config.get(key)

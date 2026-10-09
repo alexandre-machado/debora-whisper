@@ -5,6 +5,17 @@
 > 2026-10-08 (Qwen como atendente que repassa trabalho por tool call) foi
 > substituída pela decisão abaixo.
 
+## Teste de 2026-10-09 — pontos anotados
+
+1. Resposta parece um tooltip e pula para outro monitor — corrigido neste commit: balão compartilhado, atualização da mesma janela e posição limitada ao monitor da pílula.
+2. Texto quebra antes de ocupar a largura do balão — corrigido neste commit: medição e desenho usam toda a largura interna, com padding e fonte escalados por DPI.
+3. Animação diferente durante a fala — conferido, sem alteração: gravação usa `mascot_loop.webp`; fala começa com `mascot_zoom.webp` e depois volta ao loop; `mascot.png` é a imagem estática.
+4. Diagnósticos de shell sem perguntar — corrigido neste commit: `harness_allowed_tools`, padrões conservadores para Bash/PowerShell e prova com o CLI real; pedidos restantes continuam no handler.
+5. TTS começar mais cedo a partir do stream — em análise, separadamente.
+
+As mudanças visuais ainda precisam de confirmação no app, inclusive em monitores
+com DPI diferente. Não foram executados suíte de testes nem revisão de segurança.
+
 ## Decisão
 
 A Débora fica só com a voz: STT (Whisper) e TTS (Chatterbox). Toda a

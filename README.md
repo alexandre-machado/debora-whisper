@@ -211,6 +211,7 @@ the default (`"voice_chat_backend": "local"`); speech recognition and TTS stay l
   "harness_model": null,
   "harness_permission_mode": "acceptEdits",
   "harness_permission_response": "deny",
+  "harness_allowed_tools": null,
   "harness_prompt_file": null,
   "harness_memory_file": null,
   "harness_hotwords": true,
@@ -247,6 +248,25 @@ captured when recording starts (including continuous listening); dictation and l
 Qwen receive no hints. Set it to `false` to disable. OpenVINO uses a hotwords string
 (or `initial_prompt` on older runtimes); faster-whisper uses hotwords when supported.
 Parakeet skips hints and logs that once; hint changes log counts, never the terms.
+
+`harness_allowed_tools: null` adds the packaged read-only diagnostic rules via
+`--allowedTools`, for both `Bash(...)` and `PowerShell(...)`. These are exact
+command forms: git status/log/diff/show/branch, Docker ps/info/images/version
+and compose ps, WSL list, zellij list-sessions, nvidia-smi, Get-ChildItem,
+Get-Process and Get-Service, plus `Get-Content README.md` and `Test-Path .`
+(including their `-Path` forms). Common variants such as `git status --short`,
+`git branch --all`, `docker ps -a` and `wsl -l -v` are included; the complete
+list is `DEFAULT_ALLOWED_TOOLS` in `debora_whisper/harness.py`. Exact forms
+avoid granting arbitrary flags that write files, delete branches, change GPU
+settings or follow logs indefinitely.
+
+A list replaces these defaults, for example
+`["PowerShell(docker info:*)", "PowerShell(docker ps:*)", "Bash(docker ps:*)"]`.
+Use `[]` to add no rules. Add explicit file paths for other Get-Content reads.
+Changing the list restarts the harness on the next turn. In CLI 2.1.295,
+`PowerShell(docker info)` and `PowerShell(docker ps)` also allow the compound
+`docker info; docker ps`; both `:*` and ` *` prefix forms worked in the manual
+[CLI probe](docs/benchmarks/harness-2026-10-09/README.md#regras-de-diagnóstico-sem-pergunta).
 
 Permissions already allowed by Claude's mode/settings proceed normally. Pending
 requests are denied and logged by default; `harness_permission_response: "allow"`

@@ -169,6 +169,7 @@ class OverlayWindow:
             return
         scale = self._get_scale()
         if scale == self._scale:
+            self._position_balloon()
             return
         ratio = scale / self._scale
         self._scale = scale
@@ -251,19 +252,8 @@ class OverlayWindow:
         except Exception:
             return self._win.winfo_screenwidth()
 
-    def _position(self):
-        """Position the window, keeping it centered on its anchor point."""
-        w = int(self._cur_w)
-        h = int(self._cur_h)
-        if self._pos_x is None:
-            # Default: center horizontally at top of screen
-            x = (self._get_screen_width() - w) // 2
-        else:
-            # Keep centered on the user's chosen position
-            x = self._pos_x - w // 2
-        y = self._pos_y
-
-        # Clamp to the working area of the monitor where the window currently belongs
+    def _monitor_work_area(self, x, y):
+        """Use the same nearest-monitor lookup for the pill and its balloon."""
         try:
             import ctypes
             from ctypes import wintypes
@@ -281,23 +271,27 @@ class OverlayWindow:
             user32.MonitorFromPoint.restype = wintypes.HANDLE
             user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
             user32.GetMonitorInfoW.restype = wintypes.BOOL
-            pt = POINT(x + w // 2, y + h // 2)
+            pt = POINT(x, y)
             hMonitor = user32.MonitorFromPoint(pt, 2) # MONITOR_DEFAULTTONEAREST
             
             mi = MONITORINFO()
             mi.cbSize = ctypes.sizeof(MONITORINFO)
             if user32.GetMonitorInfoW(hMonitor, ctypes.byref(mi)):
-                wl, wt, wr, wb = mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom
-                if x < wl: x = wl
-                if x + w > wr: x = wr - w
-                if y < wt: y = wt
-                if y + h > wb: y = wb - h
-                
-                # Update logical position so it doesn't try to escape on next resize
-                self._pos_x = x + w // 2
-                self._pos_y = y
+                return mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom
         except Exception:
             pass
+        return 0, 0, self._win.winfo_screenwidth(), self._win.winfo_screenheight()
+
+    def _position(self):
+        """Position the window, keeping it centered on its anchor point."""
+        w = int(self._cur_w)
+        h = int(self._cur_h)
+        center = self._get_screen_width() // 2 if self._pos_x is None else self._pos_x
+        x, y = center - w // 2, self._pos_y
+        wl, wt, wr, wb = self._monitor_work_area(center, y + h // 2)
+        x = max(wl, min(x, wr - w))
+        y = max(wt, min(y, wb - h))
+        self._pos_x, self._pos_y = x + w // 2, y
 
         self._win.geometry(f"{w}x{h}+{x}+{y}")
         self._canvas.configure(width=w, height=h)
@@ -647,46 +641,57 @@ class OverlayWindow:
     # --- Balloon popup ----------------------------------------------------
 
     def _show_balloon_popup(self, text: str):
-        """Show a dark tooltip-style balloon below the pill with full text."""
-        self._dismiss_balloon()
+        """Show transcription or the growing reply in the pill's balloon."""
+        if self._balloon_id:
+            self._root.after_cancel(self._balloon_id)
+            self._balloon_id = None
         self._balloon_text = text
 
-        bw = self._balloon_win = tk.Toplevel(self._root)
-        bw.overrideredirect(True)
-        bw.attributes("-topmost", True)
-        bw.configure(bg=_TRANSPARENT)
-        try:
-            bw.attributes("-transparentcolor", _TRANSPARENT)
-        except Exception:
-            pass
-        try:
-            bw.attributes("-alpha", self.OPACITY)
-        except Exception:
-            pass
+        bw = self._balloon_win
+        if bw is None:
+            bw = self._balloon_win = tk.Toplevel(self._root)
+            bw.withdraw()  # map only after positioning on the pill's monitor
+            bw.overrideredirect(True)
+            bw.attributes("-topmost", True)
+            bw.configure(bg=_TRANSPARENT)
+            try:
+                bw.attributes("-transparentcolor", _TRANSPARENT)
+            except Exception:
+                pass
+            try:
+                bw.attributes("-alpha", self.OPACITY)
+            except Exception:
+                pass
+            self._balloon_canvas = tk.Canvas(bw, bg=_TRANSPARENT, highlightthickness=0)
+            self._balloon_canvas.pack(fill="both", expand=True)
 
         s = self._scale
         pad = int(self.BALLOON_PAD * s)
         r = int(self.BALLOON_RADIUS * s)
-        max_w = int(self.BALLOON_MAX_W * s)
+        pill_x, pill_y = self._win.winfo_x(), self._win.winfo_y()
+        wl, wt, wr, wb = self._monitor_work_area(
+            pill_x + int(self._cur_w) // 2, pill_y + int(self._cur_h) // 2)
+        max_w = min(int(max(self.BALLOON_MAX_W, self.EXPANDED_W) * s), wr - wl)
+        inner_w = max(1, max_w - 2 * pad)
         fsize = self._font_pixels(self.BALLOON_FONT_SIZE, s)
 
-        canvas = tk.Canvas(bw, bg=_TRANSPARENT, highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
+        canvas = self._balloon_canvas
+        canvas.delete("all")
+        canvas.configure(bg=_TRANSPARENT)
 
         # Measure text to determine balloon size
         tmp_id = canvas.create_text(
             0, 0, text=text, font=self._font(fsize),
-            width=max_w - 2 * pad, anchor="nw",
+            width=inner_w, anchor="nw",
         )
         bbox = canvas.bbox(tmp_id)
         canvas.delete(tmp_id)
 
-        text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
-        bw_w = text_w + 2 * pad
-        bw_h = text_h + 2 * pad
-        # Clamp minimum width
-        bw_w = max(bw_w, int(120 * s))
+        bw_w = max_w
+        gap = int(self.BALLOON_GAP * s)
+        available_h = max(pill_y - gap - wt, wb - pill_y - int(self._cur_h) - gap)
+        bw_h = min(text_h + 2 * pad, max(1, available_h))
 
         canvas.configure(width=bw_w, height=bw_h)
 
@@ -701,20 +706,20 @@ class OverlayWindow:
         # Draw text
         canvas.create_text(
             pad, pad, text=text, font=self._font(fsize),
-            fill=self.TEXT, width=max_w - 2 * pad, anchor="nw",
+            fill=self.TEXT, width=bw_w - 2 * pad, anchor="nw",
         )
+        # Keep long replies within this monitor; the newest sentence stays visible.
+        canvas.configure(scrollregion=(0, 0, bw_w, text_h + 2 * pad))
+        if text_h + 2 * pad > bw_h:
+            canvas.configure(bg=self.BG)
+        canvas.yview_moveto(1.0)
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-int(e.delta / 120), "units"))
 
         # Click anywhere on balloon to dismiss
         canvas.bind("<ButtonPress-1>", lambda e: self._dismiss_balloon())
 
-        # Position below the pill
-        pill_x = self._win.winfo_x()
-        pill_y = self._win.winfo_y()
-        pill_w = int(self._cur_w)
-        pill_h = int(self._cur_h)
-        bx = pill_x + (pill_w - bw_w) // 2
-        by = pill_y + pill_h + int(self.BALLOON_GAP * s)
-        bw.geometry(f"{bw_w}x{bw_h}+{bx}+{by}")
+        self._balloon_size = bw_w, bw_h
+        self._position_balloon()
 
         # Apply no-focus flags
         try:
@@ -729,9 +734,27 @@ class OverlayWindow:
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
         except Exception:
             pass
+        bw.deiconify()
 
-        # Auto-dismiss
-        self._balloon_id = self._root.after(self.BALLOON_DURATION, self._dismiss_balloon)
+        # A spoken reply remains visible until the next state, including long TTS.
+        if self._state != "speaking":
+            self._balloon_id = self._root.after(self.BALLOON_DURATION, self._dismiss_balloon)
+
+    def _position_balloon(self):
+        if self._balloon_win is None:
+            return
+        bw_w, bw_h = self._balloon_size
+        pill_x, pill_y = self._win.winfo_x(), self._win.winfo_y()
+        pill_w, pill_h = int(self._cur_w), int(self._cur_h)
+        wl, wt, wr, wb = self._monitor_work_area(
+            pill_x + pill_w // 2, pill_y + pill_h // 2)
+        gap = int(self.BALLOON_GAP * self._scale)
+        bx = max(wl, min(pill_x + (pill_w - bw_w) // 2, wr - bw_w))
+        by = pill_y + pill_h + gap
+        if by + bw_h > wb:
+            by = pill_y - gap - bw_h
+        by = max(wt, min(by, wb - bw_h))
+        self._balloon_win.geometry(f"{bw_w}x{bw_h}+{bx}+{by}")
 
     def _dismiss_balloon(self):
         """Destroy the balloon popup if it exists."""
