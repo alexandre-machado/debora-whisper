@@ -220,17 +220,21 @@ def make_handler(model, default_language: str):
         def do_POST(self):
             if self.path != "/tts":
                 return self._error(404, "not found")
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > MAX_BODY_BYTES:
+                return self._error(413, "body missing or too large")
+            # Read the body even when refusing it: closing a socket with
+            # unread data makes Windows reset the connection, and the client
+            # sees that instead of the 403.
+            body = self.rfile.read(length)
             # Web pages can POST to 127.0.0.1 too: browsers send an Origin,
             # and a JSON body would need a CORS preflight this server never
             # answers.
             if self.headers.get("Origin") is not None or not (
                     self.headers.get("Content-Type") or "").startswith("application/json"):
                 return self._error(403, "only local JSON clients")
-            length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0 or length > MAX_BODY_BYTES:
-                return self._error(413, "body missing or too large")
             try:
-                request = json.loads(self.rfile.read(length).decode("utf-8"))
+                request = json.loads(body.decode("utf-8"))
                 text = str(request["text"]).strip()[:MAX_TEXT_CHARS]
                 language = str(request.get("language") or default_language)
                 voice = check_voice(request.get("voice"))

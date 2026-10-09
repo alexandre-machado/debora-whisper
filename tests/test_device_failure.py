@@ -790,6 +790,25 @@ def test_large_logs_are_rotated(tmp_path, monkeypatch):
     assert de.TELEMETRY_LOG.read_bytes() == b"small"
 
 
+def test_lines_logged_from_many_threads_stay_whole(tmp_path, monkeypatch):
+    import threading
+    monkeypatch.setattr(de, "LOG_FILE", tmp_path / "app.log")
+    monkeypatch.setattr("builtins.print", lambda *a, **k: None)
+
+    def write(n):
+        for i in range(50):
+            de.log(f"thread {n} line {i} " + "x" * (n * 7))
+
+    threads = [threading.Thread(target=write, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    lines = de.LOG_FILE.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 400
+    assert all(line.startswith("[") and " thread " in line for line in lines)
+
+
 def test_tests_never_write_the_real_app_log():
     from debora_whisper import paths
     assert paths.LOG_DIR not in de.LOG_FILE.parents

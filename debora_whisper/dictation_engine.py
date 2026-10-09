@@ -229,18 +229,25 @@ class AppState(Enum):
     ERROR = "error"            # Device lost or load failed
 
 
+# On Windows, append mode seeks to the end and then writes: two threads
+# logging at once could write at the same offset, and the shorter line
+# overwrote the start of the longer one ("ore transcription...").
+_log_lock = threading.Lock()
+
+
 def log(msg: str):
     """Simple logging to file and console."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
-    print(line)
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        target_file = TELEMETRY_LOG if "[Telemetry]" in msg else LOG_FILE
-        with open(target_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    with _log_lock:
+        print(line)
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            target_file = TELEMETRY_LOG if "[Telemetry]" in msg else LOG_FILE
+            with open(target_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
 
 def rotate_logs():
