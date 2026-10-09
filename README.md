@@ -152,7 +152,7 @@ Stored at `~/.debora/config.json`:
 ```json
 {
   "device_priority": ["CUDA", "NPU", "GPU", "CPU"],
-  "model_size": "base",
+  "model_size": "turbo",
   "language": "en",
   "hotkey": "ctrl+space",
   "tap_action": "continuous",
@@ -198,8 +198,8 @@ with autocomplete, auto-closing brackets, autocorrect or slow input handling
 
 ### Voice chat (OpenVINO LLM + Chatterbox)
 
-With `"voice_chat": true` (or `--voice-chat`, or **Voice chat** in Settings),
-nothing is typed: each final transcription goes to a local LLM, and its reply
+Voice chat is on by default (`"voice_chat": true`; turn it off in Settings or
+the tray to dictate instead). While it is on, nothing is typed: each final transcription goes to a local LLM, and its reply
 is spoken by a local TTS server and shown in the overlay. The reply streams and
 plays sentence by sentence. The conversation keeps the last 8 turns and starts
 over after 10 minutes of silence. In continuous listening the microphone is
@@ -219,7 +219,7 @@ loaded until the app exits, so switching back is instant.
   "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
   "llm_device": "GPU",
   "llm_prompt": null,
-  "tts_voice": null,
+  "tts_voice": "debora_v2",
   "tts_url": "http://127.0.0.1:8765",
   "tts_timeout_seconds": 60,
   "tts_server_command": null
@@ -236,8 +236,16 @@ A load that takes over 10 minutes is killed. It logs to
 export (downloaded on first use into the Hugging Face cache) or a local
 directory. On a Core Ultra 9 185H, the default answers in under a second at
 ~15 tokens/s on the Arc iGPU (`"llm_device": "GPU"`); if the device fails it
-loads on the CPU. Qwen3's thinking is turned off. `llm_prompt: null` uses the
-built-in voice-assistant prompt.
+loads on the CPU. Qwen3's thinking is turned off. `llm_prompt: null` uses Débora's
+built-in prompt (`DEFAULT_VOICE_CHAT_PROMPT` in `voice_chat.py`): a short,
+friendly reply in the user's language, written only as words to be spoken, with
+no emoji, markdown, lists, brackets or symbols (it says "percent", not "%").
+With `"language": "pt"` she uses her own Brazilian Portuguese prompt
+(`VOICE_CHAT_PROMPTS` in `voice_chat.py`); every other language uses the English
+one and is told which language to answer in. Emoji that still slip through are
+neither shown nor spoken, and dates, times, percentages and numbers
+are spelled out (with `num2words`) before they reach Chatterbox, which reads
+digits badly; the overlay keeps the digits.
 
 The TTS is Chatterbox Multilingual on an NVIDIA GPU, served by
 `debora_whisper/tts_server.py`. It needs torch 2.6 with CUDA, so it never runs in
@@ -249,8 +257,10 @@ a few GB, and caches it). It is started only when nothing answers at
 command line (a list of arguments).
 
 `tts_voice` clones a voice from ~10 s of clean speech: a WAV path, or a name
-looked up as `<name>.wav` in the voices folder (see File Paths). `null` uses
-Chatterbox's own voice.
+looked up as `<name>.wav` in the voices folder (see File Paths), then among
+the voices that ship with the app: `carol`, `debora`, `debora_v2` (the
+default), `isabel` and `mari`. A file of the same name in the voices folder wins. `null` uses
+Chatterbox's own voice. Settings lists them all.
 
 Where each part runs best on a Core Ultra laptop with an 8 GB RTX: Whisper on
 the NPU (`--device NPU`), the LLM on the Arc iGPU, Chatterbox alone on the RTX.
@@ -413,6 +423,52 @@ Code lives in the `debora_whisper` package: `app.py` (tray app, `debora`),
 `dictation_engine.py` (engine and console mode, `debora-cli`) and `ui/`.
 Dependencies are declared in `pyproject.toml`: runtime by default, plus the
 `cuda` (RTX), `export` (custom model export) and `test` extras.
+
+### Clean install from a branch
+
+To try a branch the way a user would get it, not from an editable install,
+quit the app first (tray → Quit, so it does not save its config on exit), then:
+
+```powershell
+# 1. Remove the current install
+uv tool uninstall debora-whisper
+
+# 2. Start from a fresh config (logs and config only; models stay put)
+Rename-Item $HOME\.debora $HOME\.debora.bak
+
+# 3. With MODELS_DIR set, hide your voices there so the bundled ones are used
+#    (a voice of the same name in the voices folder wins)
+if ($env:MODELS_DIR) { Rename-Item "$env:MODELS_DIR\voices" voices.off }
+
+# 4a. Install the pushed branch (exactly what others would get)...
+uv tool install "git+https://github.com/alexandre-machado/debora-whisper@<branch>"
+# 4b. ...or the local checkout, without pushing
+uv tool install --reinstall .
+
+# 5. Run as Administrator (global hotkeys)
+debora
+```
+
+What to check: Settings lists the bundled voices (`carol`, `debora`,
+`debora_v2`, `isabel`, `mari`) with `debora_v2` selected, and voice chat
+speaks with it.
+
+What this does not cover: with `MODELS_DIR` set, models still come from that
+folder (unsetting it downloads several GB of models again), and the
+uv and Hugging Face caches keep the Chatterbox environment and weights, which a
+new machine downloads on first use.
+
+Back to development:
+
+```powershell
+uv tool uninstall debora-whisper
+Remove-Item -Recurse $HOME\.debora; Rename-Item $HOME\.debora.bak $HOME\.debora
+if ($env:MODELS_DIR) { Rename-Item "$env:MODELS_DIR\voices.off" voices }
+uv tool install --editable .
+```
+
+`docs/` is source material (branding, voice recordings) and is not part of the
+wheel or the sdist; the voices the app uses ship in `debora_whisper/voices/`.
 
 ### Releasing
 

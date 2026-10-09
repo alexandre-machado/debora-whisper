@@ -5,6 +5,8 @@ import json
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -110,9 +112,9 @@ def test_reply_is_streamed_and_spoken_sentence_by_sentence(server):
     assert _tts_texts(server) == ["A capital é Canberra.", "Fica no sul! Mais algo?"]
     assert played == [(2400, 24000)] * 2
     assert llm.calls[0] == [
-        {"role": "system", "content": vc.DEFAULT_VOICE_CHAT_PROMPT +
-         " The user speaks Portuguese: reply in Portuguese." +
-         time.strftime(" It is now %A, %Y-%m-%d %H:%M.")},
+        {"role": "system", "content": vc.VOICE_CHAT_PROMPTS["pt"] +
+         f" Agora é {vc._PT_WEEKDAYS[time.localtime().tm_wday]}, " +
+         time.strftime("%d/%m/%Y, %H:%M.")},
         {"role": "user", "content": "qual é a capital da austrália"}]
     assert [b["language"] for p, b in server.requests if p == "/tts"] == ["pt"] * 2
 
@@ -123,10 +125,34 @@ def test_a_short_reply_is_still_spoken(server):
     assert _tts_texts(server) == ["Opa! Sim."] and len(played) == 1
 
 
-def test_emoji_is_shown_but_not_spoken(server):
+def test_emoji_is_neither_shown_nor_spoken(server):
     chat, played = _chat(server, FakeLLM(["Tudo certo por aqui, e você?\n😊"]))
-    assert chat.respond("oi") == "Tudo certo por aqui, e você? 😊"
+    assert chat.respond("oi") == "Tudo certo por aqui, e você?"
+    assert chat._history[-1]["content"] == "Tudo certo por aqui, e você?"
     assert _tts_texts(server) == ["Tudo certo por aqui, e você?"]
+
+
+def test_emoji_inside_a_sentence_is_not_spoken():
+    assert vc.without_emoji("Oi 😊, tudo bem? 👍🏽 Família 👨‍👩‍👧 e ❤️ 1️⃣") == \
+        "Oi , tudo bem? Família e 1"
+    assert vc.without_emoji("ação ‍ 25° ©") == "ação ‍ 25° ©"
+
+
+def test_other_languages_get_the_english_prompt_and_their_language(server):
+    llm = FakeLLM(["Hola, ¿qué tal?"])
+    chat, _ = _chat(server, llm, language="es")
+    chat.respond("hola")
+    assert llm.calls[0][0]["content"] == vc.DEFAULT_VOICE_CHAT_PROMPT + \
+        " The user speaks Spanish: reply in Spanish." + \
+        time.strftime(" It is now %A, %Y-%m-%d %H:%M.")
+
+
+def test_configured_prompt_wins_over_her_portuguese_one(server):
+    llm = FakeLLM(["ok"])
+    chat, _ = _chat(server, llm, llm_prompt="Seja breve.")
+    chat.respond("oi")
+    assert llm.calls[0][0]["content"].startswith(
+        "Seja breve. The user speaks Portuguese: reply in Portuguese.")
 
 
 def test_configured_prompt_is_used(server):
@@ -511,6 +537,7 @@ def test_invalid_tts_server_command_is_rejected(command):
 @pytest.fixture
 def voices(monkeypatch, tmp_path):
     monkeypatch.setattr(vc.paths, "VOICES_DIR", tmp_path)
+    monkeypatch.setattr(vc.paths, "BUNDLED_VOICES_DIR", tmp_path / "bundled")
     monkeypatch.setattr(vc.shutil, "which", lambda name: "C:/uv/uv.exe")
     (tmp_path / "isabel.wav").write_bytes(_wav())
     return tmp_path
@@ -538,6 +565,105 @@ def test_missing_voice_falls_back_to_the_default_voice(voices):
     assert "not found" in logged[0]
 
 
+def test_voices_are_listed_by_name(voices):
+    (voices / "Carol.wav").write_bytes(_wav())
+    (voices / "notas.txt").write_text("x")
+    (voices / "bundled").mkdir()
+    (voices / "bundled" / "isabel.wav").write_bytes(_wav())
+    (voices / "bundled" / "mari.wav").write_bytes(_wav())
+    assert vc.list_voices() == ["Carol", "isabel", "mari"]
+
+
+def test_bundled_voice_is_used_unless_the_voices_folder_has_one(voices):
+    (voices / "bundled").mkdir()
+    (voices / "bundled" / "mari.wav").write_bytes(_wav())
+    assert vc.resolve_voice("mari") == voices / "bundled" / "mari.wav"
+    (voices / "mari.wav").write_bytes(_wav())
+    assert vc.resolve_voice("mari") == voices / "mari.wav"
+
+
+def test_the_default_voice_ships_with_the_app():
+    from debora_whisper import paths
+    assert DEFAULT_CONFIG["tts_voice"] == "debora_v2"
+    for name in ("carol", "debora", "debora_v2", "isabel", "mari"):
+        path = paths.BUNDLED_VOICES_DIR / f"{name}.wav"
+        assert "debora_whisper" in path.parts
+        with wave.open(str(path)) as w:
+            assert w.getnchannels() == 1 and 8 < w.getnframes() / w.getframerate() < 20
+
+
+@pytest.mark.parametrize("voice, sent", [
+    ("isabel", "isabel.wav"),  # a name in the voices folder
+    (None, ""),                # Chatterbox's own voice
+    ("ninguem", None),         # missing: the server keeps its voice
+])
+def test_each_request_names_the_voice(voices, server, voice, sent):
+    """A voice picked in Settings speaks the next sentence, without
+    restarting the TTS server."""
+    vc.synthesize("Olá, tudo bem com você?", {**DEFAULT_CONFIG, "tts_url": server.tts_url,
+                                               "tts_voice": voice})
+    body = server.requests[-1][1]
+    if sent is None:
+        assert "voice" not in body
+    elif sent:
+        assert body["voice"] == str((voices / sent).resolve())
+    else:
+        assert body["voice"] == ""
+
+
+# --- TTS server: voice per request --------------------------------------------
+
+def test_tts_server_accepts_only_audio_files_as_voice(voices):
+    from debora_whisper import tts_server
+    assert tts_server.check_voice(None) is None
+    assert tts_server.check_voice("") == ""
+    assert tts_server.check_voice(str(voices / "isabel.wav")) == str(voices / "isabel.wav")
+    (voices / "segredo.txt").write_text("x")
+    for bad in (str(voices / "segredo.txt"), str(voices / "falta.wav"), 3,
+                r"\\attacker\share\x.wav", "//attacker/share/x.wav"):
+        with pytest.raises(ValueError):
+            tts_server.check_voice(bad)
+
+
+@pytest.mark.parametrize("headers, status", [
+    ({"Content-Type": "application/json"}, 400),  # gets past the gate: empty text
+    ({"Content-Type": "text/plain"}, 403),
+    ({"Content-Type": "application/json", "Origin": "https://evil.example"}, 403),
+])
+def test_tts_server_refuses_requests_from_web_pages(headers, status):
+    from debora_whisper import tts_server
+    model = type("Model", (), {"sr": 24000, "conds": None})()
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), tts_server.make_handler(model, "pt"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{srv.server_port}/tts", data=b'{"text": ""}', headers=headers)
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+        assert error.value.code == status
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_numbers_too_big_to_spell_are_left_as_digits():
+    big = "1" * 40
+    assert vc.spoken_numbers(f"São {big} estrelas.", "pt") == f"São {big} estrelas."
+
+
+def test_tts_server_prepares_each_voice_once(voices):
+    from debora_whisper import tts_server
+    model = MagicMock(conds="startup", builtin_conds="builtin")
+    model.prepare_conditionals.side_effect = lambda path: setattr(model, "conds", f"conds:{path}")
+    chosen = tts_server.Voices(model)
+    isabel = str(voices / "isabel.wav")
+    for voice, conds in [(isabel, f"conds:{isabel}"), ("", "builtin"),
+                         (None, "startup"), (isabel, f"conds:{isabel}")]:
+        chosen.use(voice)
+        assert model.conds == conds
+    model.prepare_conditionals.assert_called_once_with(isabel)
+
+
 def test_configured_command_wins(voices):
     assert vc.tts_command({**DEFAULT_CONFIG, "tts_server_command": ["x"]}) == ["x"]
 
@@ -552,7 +678,11 @@ def test_without_uv_nothing_is_started(no_tts_process, monkeypatch):
     with patch("subprocess.Popen") as popen:
         vc.ensure_tts_server({**DEFAULT_CONFIG, "tts_url": _closed_port_url()},
                              log=lambda m: None)
-    popen.assert_not_called()
+    # Only the TTS server counts: telemetry threads left by other tests may
+    # run nvidia-smi meanwhile.
+    started = [c for c in popen.call_args_list if str(vc.TTS_SERVER_SCRIPT) in map(str, c.args[0])]
+    assert started == []
+    assert vc._tts_process is None
 
 
 def test_bundled_server_declares_its_own_environment():
@@ -818,6 +948,73 @@ def test_silence_around_a_clip_is_trimmed():
     assert len(vc.trim_silence(np.zeros(100, np.float32), rate)) == 0
 
 
+def test_hiss_after_the_speech_is_cut():
+    rate = 1000
+    speech = np.full(500, 0.2, dtype=np.float32)
+    hiss = np.full(400, 0.008, dtype=np.float32)  # -42 dB, like Chatterbox's
+    clip = np.concatenate([speech, np.zeros(1000, np.float32), hiss])
+    trimmed = vc.trim_silence(clip, rate)
+    assert len(trimmed) == 500 + 50  # the speech and 50 ms of its pause
+    assert trimmed[-1] == 0 and trimmed[0] == np.float32(0.2)
+
+
+def test_a_pause_before_more_speech_is_kept():
+    rate = 1000
+    speech = np.full(500, 0.2, dtype=np.float32)
+    clip = np.concatenate([speech, np.zeros(1000, np.float32), speech])
+    assert len(vc.trim_silence(clip, rate)) == 2000
+
+
+@pytest.mark.parametrize("language, text, spoken", [
+    ("pt", "Hoje é sexta-feira, dia 09 outubro de 2026, às 10h18.",
+     "Hoje é sexta-feira, dia nove outubro de dois mil e vinte e seis, às dez e dezoito."),
+    ("pt", "Em 09/10/2026, às 21:05, 1h ou 2h.",
+     "Em nove de outubro de dois mil e vinte e seis, às vinte e uma e cinco, "
+     "uma hora ou duas horas."),
+    ("pt", "O 1º lugar, 3,5% e 1.500 reais.",
+     "O primeiro lugar, três vírgula cinco por cento e mil e quinhentos reais."),
+    ("en", "It is 10/09/2026 at 10:05, 3.5%.",
+     "It is October ninth, twenty twenty-six at ten oh five, three point five percent."),
+    ("auto", "Oi 2", "Oi 2"),
+    ("xx", "Oi 2", "Oi 2"),
+])
+def test_numbers_are_spoken_as_words(language, text, spoken):
+    assert vc.spoken_numbers(text, language) == spoken
+
+
+@pytest.mark.parametrize("sentence, offer", [
+    ("Como posso te ajudar hoje?", True),
+    ("Pode dizer o que quer que eu faça?", True),
+    ("Vai me dizer o que precisa?", True),
+    ("O que deseja fazer agora?", True),
+    ("How can I help you today?", True),
+    ("O que você quer dizer com isso?", False),
+    ("Posso ajudar com o ditado.", False),
+    ("Pode repetir?", False),
+])
+def test_offers_of_help_are_recognized(sentence, offer):
+    assert vc.is_help_offer(sentence) is offer
+
+
+def test_a_closing_offer_of_help_is_neither_said_nor_remembered(server):
+    llm = FakeLLM(["Que legal, Alexandre! Pode dizer o que quer que eu faça?"])
+    chat, _ = _chat(server, llm)
+    assert chat.respond("eu sou o Alexandre") == "Que legal, Alexandre!"
+    assert _tts_texts(server) == ["Que legal, Alexandre!"]
+    assert chat._history[-1] == {"role": "assistant", "content": "Que legal, Alexandre!"}
+
+
+def test_a_reply_that_is_only_an_offer_of_help_is_kept(server):
+    chat, _ = _chat(server, FakeLLM(["Como posso ajudar você hoje?"]))
+    assert chat.respond("oi Débora") == "Como posso ajudar você hoje?"
+
+
+def test_the_overlay_keeps_digits_but_the_tts_gets_words(server):
+    chat, _ = _chat(server, FakeLLM(["Hoje é dia 9 de outubro, às 10h18."]))
+    assert chat.respond("que dia é hoje") == "Hoje é dia 9 de outubro, às 10h18."
+    assert _tts_texts(server) == ["Hoje é dia nove de outubro, às dez e dezoito."]
+
+
 class FakeStream:
     instances = []
 
@@ -872,3 +1069,31 @@ def test_reply_plays_through_one_stream_player(server, stream, monkeypatch):
                         llm=FakeLLM(["A capital é Canberra. Fica no sul do país."]))
     assert chat.respond("capital") == "A capital é Canberra. Fica no sul do país."
     assert len(stream) == 1 and stream[0].ended == "drained"
+
+
+@pytest.mark.shipped_defaults
+def test_voice_chat_with_turbo_is_what_users_get():
+    assert DEFAULT_CONFIG["voice_chat"] is True
+    assert DEFAULT_CONFIG["model_size"] == "turbo"
+    de.validate_config(DEFAULT_CONFIG)
+
+
+def test_debora_prompt_asks_for_speakable_text_only():
+    prompt = vc.DEFAULT_VOICE_CHAT_PROMPT
+    assert prompt.startswith("You are Débora")
+    for rule in ("emoji", "markdown", "parentheses", "URLs", "percent"):
+        assert rule in prompt
+
+
+def test_debora_prompt_fixes_what_the_last_chat_got_wrong():
+    prompt = vc.DEFAULT_VOICE_CHAT_PROMPT
+    for rule in ("feminine", "ask them to repeat", "do not know the user's name",
+                 "offer of help"):
+        assert rule in prompt
+    assert "most likely said" not in prompt
+    pt = vc.VOICE_CHAT_PROMPTS["pt"]
+    assert pt.startswith("Você é a Débora")
+    for rule in ("feminino", "emoji", "peça para repetir", "não sabe o nome",
+                 "qual é meu nome",
+                 "oferecendo ajuda", "por cento"):
+        assert rule in pt

@@ -237,3 +237,84 @@ def test_mascot_ships_inside_the_package():
     assert "debora_whisper" in MASCOT_PATH.parts
     with Image.open(MASCOT_PATH) as img:
         assert img.size[0] == img.size[1] >= 64
+
+
+@pytest.mark.parametrize("clip", ["loop", "zoom"])
+def test_mascot_clips_ship_and_load(clip):
+    from debora_whisper.ui import overlay as ov
+    path = ov.MASCOT_LOOP_PATH if clip == "loop" else ov.MASCOT_ZOOM_PATH
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    assert "debora_whisper" in path.parts
+    frames = overlay._mascot_frames(34, radius=6, clip=clip)
+    assert len(frames) > 1
+    assert all(f.size == (60, 34) and f.mode == "RGBA" for f in frames)  # 16:9
+    assert frames[0].getpixel((0, 0))[3] < 16  # outside the rounded corner
+
+
+def test_mascot_falls_back_to_the_still_image(monkeypatch, tmp_path):
+    import debora_whisper.ui.overlay as ov
+    monkeypatch.setattr(ov, "MASCOT_LOOP_PATH", tmp_path / "missing.webp")
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    frames = overlay._mascot_frames(34)
+    assert len(frames) == 1 and frames[0].size == (60, 34)  # square still, cropped
+
+
+@pytest.mark.parametrize("state, animated", [
+    ("recording", True), ("speaking", True),
+    ("ready", False), ("processing", False), ("loading", False), ("error", False),
+])
+def test_mascot_moves_only_while_listening_or_speaking(state, animated):
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    overlay._root = Mock()
+    overlay._root.after.return_value = "timer"
+    overlay._state = state
+    overlay._mascot_index = 5
+    overlay._mascot_clip = "loop"
+    overlay._mascot_anim_id = None
+    overlay._sync_mascot_animation()
+    assert overlay._root.after.called is animated
+    if not animated:
+        assert overlay._mascot_index == 0
+
+
+def test_leaving_an_animated_state_stops_the_timer():
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    overlay._root = Mock()
+    overlay._state = "ready"
+    overlay._mascot_index = 7
+    overlay._mascot_clip = "zoom"
+    overlay._mascot_anim_id = "timer"
+    overlay._sync_mascot_animation()
+    overlay._root.after_cancel.assert_called_once_with("timer")
+    assert overlay._mascot_anim_id is None and overlay._mascot_index == 0
+    assert overlay._mascot_clip == "loop"
+
+
+def test_speaking_plays_the_zoom_once_then_the_loop():
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    overlay._state = "recording"
+    overlay._show_balloon = False
+    overlay._cancel_timers = Mock()
+    overlay._animate = Mock()
+    overlay._redraw = Mock()
+    overlay.show_speaking("Oi!")
+    assert (overlay._mascot_clip, overlay._mascot_index) == ("zoom", 0)
+    zoom_len = len(overlay._mascot_frames(1, clip="zoom"))
+    for _ in range(zoom_len - 1):
+        overlay._mascot_tick()
+    assert overlay._mascot_clip == "zoom"
+    overlay._mascot_tick()
+    assert (overlay._mascot_clip, overlay._mascot_index) == ("loop", 0)
+    # More of the reply does not restart the zoom.
+    overlay.show_speaking("Oi! Tudo bem?")
+    assert overlay._mascot_clip == "loop"
+
+
+def test_mascot_edge_fades_into_the_panel():
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    hard = overlay._mascot_frames(34, radius=6)[0]
+    soft = overlay._mascot_frames(34, feather=2, radius=6)[0]
+    # The center stays opaque; the rim is fainter than a hard edge's.
+    assert soft.getpixel((30, 17))[3] == 255
+    rim = [(30, 0), (0, 17), (59, 17), (30, 33)]
+    assert sum(soft.getpixel(p)[3] for p in rim) < sum(hard.getpixel(p)[3] for p in rim) / 2

@@ -43,3 +43,18 @@ def _reset_device_failure_latch():
     dictation_engine._reset_device_failure_for_tests()
     yield
     dictation_engine._reset_device_failure_for_tests()
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "shipped_defaults: sees DEFAULT_CONFIG as users get it")
+
+
+@pytest.fixture(autouse=True)
+def _dictation_by_default(request, monkeypatch):
+    """Users get voice chat on by default; tests exercise dictation unless
+    they turn it on, and never start the real LLM or TTS server by accident."""
+    if request.node.get_closest_marker("shipped_defaults"):
+        return
+    from debora_whisper import dictation_engine
+    monkeypatch.setitem(dictation_engine.DEFAULT_CONFIG, "voice_chat", False)

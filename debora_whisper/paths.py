@@ -78,3 +78,6 @@ DATA_DIR = (_migrated(Path(_shared) / "debora-whisper", Path(_shared) / "npu-whi
 MODEL_DIR = DATA_DIR / "models"
 CACHE_DIR = DATA_DIR / "ov-cache"
 VOICES_DIR = Path(_shared) / "voices" if _shared else CONFIG_DIR / "voices"
+# Voices shipped inside the package, so every install has them; one of the
+# same name in VOICES_DIR wins.
+BUNDLED_VOICES_DIR = Path(__file__).parent / "voices"

@@ -80,3 +80,33 @@ of `mascot_concept_matrix.jpg` (gold and cyan), not the violet emphasis above.
 
 Save the result as `docs/assets/branding/mascot_v2_bust.png` (1024×1024). The
 app ships a 128 px crop of it as `debora_whisper/ui/assets/mascot.png`.
+
+## Entrance Animation Prompt (Match to Loop)
+
+This prompt extends the Official Mascot Prompt to create an entrance animation that seamlessly transitions into the idle hovering loop.
+
+> **Subject:** A digital holographic tech fairy/bee hybrid mascot named Débora.
+> **Action & Motion:** The animation MUST start with an empty, dark frame (the character is completely absent). Then, the mascot dynamically materializes/spawns into the center of the scene from thin air, constructing herself from swirling glowing data particles and a burst of bioluminescent light (like a hologram turning on). Once fully materialized, she settles smoothly into her signature ethereal hovering posture. The final hovering pose must hold perfectly stable with her wings fluttering rapidly, serving as a seamless match cut into her standard idle loop.
+> **Pose & Body:** Tinkerbell's graceful, delicate flight silhouette. Delicate fairy/bee wings.
+> **Aesthetic:** Cortana from Halo. Glowing digital AI construct, scanlines, digital glitch artifacts, subtle hexagonal honeycomb mesh patterns across the construct, translucent wireframe elements.
+> **Palette:** Heavy emphasis on deep violet/purple bioluminescence, combined with liquid gold circuit traces, and electric cyan/blue neon data streams.
+> **Lighting & Environment:** Clean dark navy/black background to isolate the character. High contrast, emphasizing her internal glow, neon rim lighting, and the holographic particle effects of her entrance.
+
+## Voice Synthesis (ElevenLabs)
+
+Débora's voice must reflect her identity: a quiet, ethereal, and helpful AI fairy. She "whispers", so her voice should be soft, close-mic, and non-intrusive, avoiding any loud, energetic or harsh tones.
+
+### Voice Design / Remix Prompt
+
+Use this prompt in ElevenLabs (Voice Design) to generate or remix the base voice:
+
+> A soft, calm, and ethereal young adult female voice. She speaks gently with a breathy, almost whispering texture (ASMR-adjacent), yet perfectly clear, precise, and articulate. Her tone is friendly, warm, and highly intelligent, sounding like a benevolent holographic AI assistant. Subtle Brazilian accent.
+
+### Test Script (Roteiro de Validação)
+
+Use this script to test the generation. It covers her standard interactions: greetings, technical status updates, and a slightly longer conversational piece to evaluate her cadence and warmth.
+
+> "Olá. Sistemas iniciados com sucesso. 
+> Estou processando o áudio localmente, garantindo a sua privacidade.
+> A captação está limpa, pode começar a ditar quando quiser... Eu estarei aqui, ouvindo.
+> Parece que o volume do microfone está um pouco baixo. Não se preocupe, estou ajustando o ganho automaticamente."
