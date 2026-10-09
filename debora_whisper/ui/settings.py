@@ -21,6 +21,9 @@ _BTN_SEC_TEXT = "#374151"      # Gray-700
 _BADGE_OK = "#10B981"          # Emerald-500 for "Downloaded"
 _BADGE_DL = "#9CA3AF"          # Gray-400 for "Download"
 
+# tts_voice null: Chatterbox's own voice.
+_DEFAULT_VOICE = "Chatterbox default"
+
 
 def _make_wide_dropdown(om, values, on_select):
     """Patch CTkOptionMenu to show a full-width popup aligned with the field."""
@@ -269,6 +272,30 @@ class SettingsWindow:
         )
         self._font_size_dropdown.pack(padx=20, pady=(4, 0), fill="x")
 
+        # --- Voice chat voice ---
+        ctk.CTkLabel(
+            scroll, text="Voice chat voice", fg_color="transparent",
+            font=ctk.CTkFont(size=13, weight="bold"), text_color=_SECTION_TEXT,
+        ).pack(**pad, anchor="w")
+        voice_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        voice_row.pack(padx=20, pady=(4, 0), fill="x")
+        voice_names = self._voice_choices()
+        self._voice_var = ctk.StringVar(
+            value=self._config.get("tts_voice") or _DEFAULT_VOICE)
+        self._voice_dropdown = ctk.CTkOptionMenu(
+            voice_row, values=voice_names, variable=self._voice_var, **dd_opts,
+        )
+        self._voice_dropdown.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            voice_row, text="Open folder", command=self._open_voices_folder, width=100,
+            fg_color=_BTN_SEC_BG, hover_color=_BTN_SEC_HOVER,
+            text_color=_BTN_SEC_TEXT, border_color=_CARD_BORDER, border_width=1,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(
+            scroll, text="A ~10 s recording of one voice, saved as <name>.wav in that folder.",
+            font=ctk.CTkFont(size=11), text_color=_DESC_TEXT, fg_color="transparent",
+        ).pack(padx=20, pady=(2, 0), anchor="w")
+
         # --- Toggles ---
         toggles_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         toggles_frame.pack(padx=20, pady=(10, 10), fill="x")
@@ -313,6 +340,26 @@ class SettingsWindow:
                             self._on_language_change)
         _make_wide_dropdown(self._mic_dropdown, mic_names, None)
         _make_wide_dropdown(self._font_size_dropdown, font_sizes, None)
+        _make_wide_dropdown(self._voice_dropdown, voice_names, None)
+
+    def _voice_choices(self) -> list[str]:
+        """Chatterbox's own voice, then each <name>.wav in the voices folder,
+        and the configured voice even when it is a path elsewhere."""
+        from debora_whisper.voice_chat import list_voices
+        names = [_DEFAULT_VOICE] + list_voices()
+        current = self._config.get("tts_voice")
+        if current and current not in names:
+            names.append(current)
+        return names
+
+    def _open_voices_folder(self):
+        import os
+        from debora_whisper import paths
+        try:
+            paths.VOICES_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(paths.VOICES_DIR)
+        except OSError as e:
+            self.update_status(f"Cannot open {paths.VOICES_DIR}: {e}", "#FF453A")
 
     def update_status(self, text: str, color: str = "gray60"):
         """Update the status label (called from app.py on state changes)."""
@@ -411,6 +458,8 @@ class SettingsWindow:
         new_config["auto_enter"] = self._enter_var.get()
         new_config["inline_drafts"] = self._inline_drafts_var.get()
         new_config["voice_chat"] = self._voice_chat_var.get()
+        voice = self._voice_var.get()
+        new_config["tts_voice"] = None if voice == _DEFAULT_VOICE else voice
         new_config["show_balloon"] = self._balloon_var.get()
         try:
             new_config["balloon_font_size"] = int(self._font_size_var.get())

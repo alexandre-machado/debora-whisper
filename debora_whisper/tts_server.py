@@ -30,7 +30,9 @@ from "tts_voice" in config.json, and stops it on exit.
 
 Endpoints (127.0.0.1 only):
     GET  /health -> {"ok": true, "sample_rate": ...}
-    POST /tts    {"text": "...", "language": "pt"} -> audio/wav (16-bit mono)
+    POST /tts    {"text": "...", "language": "pt", "voice": "C:/voices/ana.wav"}
+                 -> audio/wav (16-bit mono). "voice" is optional: "" is
+                 Chatterbox's own voice, no "voice" the one from --voice.
 
 Log lines look like app.log's: "[YYYY-MM-DD HH:MM:SS] message".
 """
@@ -49,6 +51,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_TEXT_CHARS = 1000
 MAX_BODY_BYTES = 64_000
+VOICE_SUFFIXES = (".wav", ".flac", ".mp3", ".ogg")
+# Prepared voices kept in memory (a few MB each on the GPU).
+MAX_CACHED_VOICES = 8
 
 log = logging.getLogger("tts_server").info
 
@@ -122,6 +127,7 @@ def load_model(device: str, voice: str | None):
     start = time.time()
     model = ChatterboxMultilingualTTS.from_pretrained(device=device)
     _stub_sklearn()
+    model.builtin_conds = model.conds
     if voice:
         model.prepare_conditionals(voice)
     log(f"Chatterbox loaded on {device} in {time.time() - start:.1f}s")
@@ -140,10 +146,56 @@ def to_wav(samples, sample_rate: int) -> bytes:
     return out.getvalue()
 
 
+class Voices:
+    """Chatterbox's conditionals per reference file, so each request can pick
+    its voice without reloading the model. Call under the generation lock."""
+
+    def __init__(self, model):
+        self.model = model
+        self.startup = model.conds
+        self.cache = {}  # (path, mtime) -> conditionals
+
+    def use(self, voice: str | None):
+        """Point the model at voice: None keeps the startup voice, "" is
+        Chatterbox's own, anything else a reference file."""
+        if voice is None:
+            conds = self.startup
+        elif voice == "":
+            conds = self.model.builtin_conds
+        else:
+            path = os.path.abspath(voice)
+            key = (path, os.path.getmtime(path))
+            conds = self.cache.get(key)
+            if conds is None:
+                start = time.time()
+                self.model.prepare_conditionals(path)
+                conds = self.model.conds
+                if len(self.cache) >= MAX_CACHED_VOICES:
+                    self.cache.pop(next(iter(self.cache)))
+                self.cache[key] = conds
+                log(f"Voice {path} prepared in {time.time() - start:.1f}s")
+        if conds is None:
+            raise ValueError("no voice: pass a reference file")
+        self.model.conds = conds
+
+
+def check_voice(voice) -> str | None:
+    """The request's "voice", or ValueError: a reference audio file, never
+    anything else on disk."""
+    if voice is None or voice == "":
+        return voice
+    if not isinstance(voice, str) or not voice.lower().endswith(VOICE_SUFFIXES):
+        raise ValueError(f"voice must be one of {', '.join(VOICE_SUFFIXES)} files")
+    if not os.path.isfile(voice):
+        raise ValueError(f"voice {voice!r} not found")
+    return voice
+
+
 def make_handler(model, default_language: str):
     # One generation at a time: the GPU is shared and Chatterbox is not
     # thread-safe.
     lock = threading.Lock()
+    voices = Voices(model)
 
     class Handler(BaseHTTPRequestHandler):
         def _reply(self, code, body: bytes, content_type="application/json"):
@@ -171,6 +223,7 @@ def make_handler(model, default_language: str):
                 request = json.loads(self.rfile.read(length).decode("utf-8"))
                 text = str(request["text"]).strip()[:MAX_TEXT_CHARS]
                 language = str(request.get("language") or default_language)
+                voice = check_voice(request.get("voice"))
             except Exception as e:
                 return self._error(400, f"bad request: {e}")
             if not text:
@@ -178,6 +231,11 @@ def make_handler(model, default_language: str):
             import torch
             with lock:
                 start = time.time()
+                try:
+                    voices.use(voice)
+                except Exception as e:
+                    log(f"Voice {voice!r} unusable: {type(e).__name__}: {e}")
+                    return self._error(400, f"voice unusable: {e}")
                 try:
                     drop_attention_spies(model)
                     with torch.inference_mode():

@@ -295,6 +295,14 @@ def synthesize(text: str, config: dict):
     body = {"text": text}
     if config.get("language") and config["language"] != "auto":
         body["language"] = config["language"]
+    # Sent on every request, so a voice picked in Settings speaks the next
+    # sentence: "" is Chatterbox's own voice; a missing file leaves the
+    # server on the voice it started with.
+    voice = resolve_voice(config.get("tts_voice"))
+    if voice is None:
+        body["voice"] = ""
+    elif voice.is_file():
+        body["voice"] = str(voice.resolve())
     request = urllib.request.Request(
         url.rstrip("/") + "/tts", data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"})
@@ -326,6 +334,15 @@ def resolve_voice(voice) -> Path | None:
     if path.suffix or len(path.parts) > 1:
         return path
     return paths.VOICES_DIR / f"{voice}.wav"
+
+
+def list_voices() -> list[str]:
+    """Names of the reference voices (<name>.wav) in the voices folder."""
+    try:
+        return sorted((p.stem for p in paths.VOICES_DIR.glob("*.wav") if p.is_file()),
+                      key=str.casefold)
+    except OSError:
+        return []
 
 
 def tts_command(config: dict, log=print) -> list[str] | None:

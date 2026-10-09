@@ -538,6 +538,57 @@ def test_missing_voice_falls_back_to_the_default_voice(voices):
     assert "not found" in logged[0]
 
 
+def test_voices_are_listed_by_name(voices):
+    (voices / "Carol.wav").write_bytes(_wav())
+    (voices / "notas.txt").write_text("x")
+    assert vc.list_voices() == ["Carol", "isabel"]
+
+
+@pytest.mark.parametrize("voice, sent", [
+    ("isabel", "isabel.wav"),  # a name in the voices folder
+    (None, ""),                # Chatterbox's own voice
+    ("ninguem", None),         # missing: the server keeps its voice
+])
+def test_each_request_names_the_voice(voices, server, voice, sent):
+    """A voice picked in Settings speaks the next sentence, without
+    restarting the TTS server."""
+    vc.synthesize("Olá, tudo bem com você?", {**DEFAULT_CONFIG, "tts_url": server.tts_url,
+                                               "tts_voice": voice})
+    body = server.requests[-1][1]
+    if sent is None:
+        assert "voice" not in body
+    elif sent:
+        assert body["voice"] == str((voices / sent).resolve())
+    else:
+        assert body["voice"] == ""
+
+
+# --- TTS server: voice per request --------------------------------------------
+
+def test_tts_server_accepts_only_audio_files_as_voice(voices):
+    from debora_whisper import tts_server
+    assert tts_server.check_voice(None) is None
+    assert tts_server.check_voice("") == ""
+    assert tts_server.check_voice(str(voices / "isabel.wav")) == str(voices / "isabel.wav")
+    (voices / "segredo.txt").write_text("x")
+    for bad in (str(voices / "segredo.txt"), str(voices / "falta.wav"), 3):
+        with pytest.raises(ValueError):
+            tts_server.check_voice(bad)
+
+
+def test_tts_server_prepares_each_voice_once(voices):
+    from debora_whisper import tts_server
+    model = MagicMock(conds="startup", builtin_conds="builtin")
+    model.prepare_conditionals.side_effect = lambda path: setattr(model, "conds", f"conds:{path}")
+    chosen = tts_server.Voices(model)
+    isabel = str(voices / "isabel.wav")
+    for voice, conds in [(isabel, f"conds:{isabel}"), ("", "builtin"),
+                         (None, "startup"), (isabel, f"conds:{isabel}")]:
+        chosen.use(voice)
+        assert model.conds == conds
+    model.prepare_conditionals.assert_called_once_with(isabel)
+
+
 def test_configured_command_wins(voices):
     assert vc.tts_command({**DEFAULT_CONFIG, "tts_server_command": ["x"]}) == ["x"]
 
