@@ -55,3 +55,13 @@ PyPI availability checked 2026-10-08: `debora-whisper`, `debora`,
 - [ ] Rename the GitHub repo to `debora-whisper` (README and pyproject URLs already point there)
 - [ ] Add a PyPI trusted publisher for the new `debora-whisper` project before the first `v*` tag
 - `npu-whisper` was never published on PyPI, so no redirect release is needed.
+
+## Official Mascot Prompt (Concept 02)
+
+This is the definitive prompt to generate the chosen version of the Débora mascot:
+
+> **Subject:** A digital holographic tech fairy/bee hybrid mascot.
+> **Pose & Body:** Tinkerbell's graceful, delicate flight silhouette and ethereal hovering posture. Delicate fairy/bee wings.
+> **Aesthetic:** Cortana from Halo. Glowing digital AI construct, scanlines, digital glitch artifacts, subtle hexagonal honeycomb mesh patterns across the construct, translucent wireframe elements.
+> **Palette:** Heavy emphasis on deep violet/purple bioluminescence, combined with liquid gold circuit traces, and electric cyan/blue neon data streams.
+

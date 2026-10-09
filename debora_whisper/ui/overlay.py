@@ -330,7 +330,7 @@ class OverlayWindow:
             draft = getattr(self, "_draft_text", "")
             if draft:
                 return draft[-40:], self.TEXT, False
-            return "🐝 Listening...", self.TEXT_DIM, False
+            return "", self.TEXT_DIM, False
         if state == "processing":
             return "Transcribing...", self.TEXT, True
         if state == "speaking":
@@ -357,11 +357,38 @@ class OverlayWindow:
         # Work on a copy so the cache stays clean
         frame = pill.copy()
 
+        # Draw the mascot thumbnail on the left
+        try:
+            if not hasattr(self, "_mascot_img"):
+                from PIL import Image
+                import os
+                path = os.path.join(os.path.dirname(__file__), "..", "..", "docs", "assets", "branding", "mascot_v2_thumbnail.png")
+                self._mascot_img = Image.open(path).convert("RGBA")
+            
+            icon_size = h - int(4 * s) # 2px padding top/bottom
+            if getattr(self, "_last_icon_size", 0) != icon_size:
+                from PIL import Image, ImageDraw
+                img = self._mascot_img.resize((icon_size, icon_size), Image.LANCZOS)
+                mask = Image.new('L', (icon_size, icon_size), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, icon_size, icon_size), fill=255)
+                circular_img = Image.new('RGBA', (icon_size, icon_size), (0, 0, 0, 0))
+                circular_img.paste(img, (0, 0), mask)
+                self._mascot_thumb = circular_img
+                self._last_icon_size = icon_size
+            
+            frame.alpha_composite(self._mascot_thumb, (int(2 * s), int(2 * s)))
+        except Exception as e:
+            pass
+
         label, fill, bold = self._label()
         text_items = []  # (x, y, text, fill, font, anchor) — drawn after image
         if label:
             font = self._font(font_size, semibold=bold)
-            text_items.append((w // 2, mid, label, fill, font, "center"))
+            # Shift text center to account for the mascot on the left
+            icon_w = h
+            remaining_w = w - icon_w
+            text_cx = icon_w + remaining_w // 2
+            text_items.append((text_cx, mid, label, fill, font, "center"))
 
         # Flatten to RGB on transparent background and place as one image
         composited = composite_on_transparent(frame)
