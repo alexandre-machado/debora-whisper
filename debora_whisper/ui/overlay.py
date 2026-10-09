@@ -595,11 +595,13 @@ class OverlayWindow:
         self._draft_text = draft_text
         self._redraw()
 
-    def show_processing(self):
+    def show_processing(self, text: str = ""):
         """Amber dot — transcribing."""
         self._cancel_timers()
         self._state = "processing"
         self._animate(self.EXPANDED_W, self.COMPACT_H)
+        if self._show_balloon and text.strip():
+            self._show_balloon_popup(text)
 
     def show_result(self, text: str):
         """Green dot — transcription done. Text shown in balloon only."""

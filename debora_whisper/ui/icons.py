@@ -6,13 +6,13 @@ from PIL import Image, ImageDraw
 
 ICON_SIZE = 64
 
-# Cores da nova identidade visual (Dourado, Roxo e Azul Ciano)
+# Cores da nova identidade visual
 C_ERROR = "#EF4444"            # Vermelho (mantido para clareza de erro)
-C_READY = "#FBBF24"            # Dourado (Pronto)
+C_READY = "#9CA3AF"            # Cinza (Pronto, aguardando hotkey)
 C_RECORDING_IDLE = "#7E22CE"   # Roxo Escuro (Escutando em silêncio)
 C_RECORDING_ACTIVE = "#A855F7" # Roxo Vibrante (Captando voz ativamente)
 C_PROCESSING = "#06B6D4"       # Ciano Brilhante (Transcrevendo/Holograma)
-C_LOADING = "#3B82F6"          # Azul Elétrico (Carregando modelo)
+C_LOADING = "#FBBF24"          # Dourado (Carregando modelo)
 C_SPEAKING = "#0EA5E9"         # Azul/Ciano Vivo (Assistente falando)
 
 def draw_hexagon(draw, cx, cy, size, fill):
