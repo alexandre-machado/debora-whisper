@@ -1597,6 +1597,9 @@ class AudioRecorder:
         self.paused = False
         # time.time() of the last block the VAD classified as speech.
         self.last_speech_time = 0.0
+        # on_voice(bool) when the user starts or stops talking (VAD thread).
+        self.on_voice = None
+        self._voice_shown = False
 
         # Continuous VAD properties
         self.capacity = int(sample_rate * self.config.get("ring_buffer_seconds", 30))
@@ -1761,6 +1764,18 @@ class AudioRecorder:
             self.paused = True
             self.continuous = False
             self.endpoint.finish()
+        self._show_voice(False)
+
+    def _show_voice(self, active: bool):
+        """Tell on_voice when the user starts or stops talking, once per change."""
+        if active == self._voice_shown:
+            return
+        self._voice_shown = active
+        if self.on_voice:
+            try:
+                self.on_voice(active)
+            except Exception:
+                pass  # never let the UI break the VAD
 
     def wait_ready(self, timeout=3.0):
         if not self._audio_ready.wait(timeout):
@@ -1804,7 +1819,10 @@ class AudioRecorder:
         last_draft_time = 0.0
         segment_id = 0
         extension_logged = False
-        
+        # Talking stops a short pause before the segment is cut.
+        voice_quiet = int(self.sample_rate * 0.3)
+        show_voice = self._show_voice
+
         log("VAD thread started.")
         try:
             while not self._stop_vad:
@@ -1833,6 +1851,7 @@ class AudioRecorder:
                 # Silero VAD prefers 512 frames for 16kHz
                 block_size = 512
                 for i in range(0, len(new_data), block_size):
+                    show_voice(is_speaking and silence_frames < voice_quiet)
                     block = new_data[i:i+block_size]
                     block_len = len(block)
                     if len(block) < block_size:
@@ -1941,6 +1960,7 @@ class AudioRecorder:
                             
                     if cut_segment:
                         is_speaking = False
+                        show_voice(False)
                         self.endpoint.finish()
                         if self.neural_vad: self.neural_vad.reset_state()
                         # Extract segment
@@ -1968,6 +1988,8 @@ class AudioRecorder:
         except Exception as e:
             import traceback
             log(f"CRITICAL ERROR in VAD loop: {e}\n{traceback.format_exc()}")
+        finally:
+            show_voice(False)
 
 
     def start(self):
@@ -2463,6 +2485,8 @@ class DictationApp:
         self._draft_target = None
         self.voice_chat = VoiceChat(config, log=log, tts_log_path=TTS_SERVER_LOG,
                                     llm_log_path=LLM_SERVER_LOG)
+        self.recorder.on_voice = lambda active: self._talking("user", active)
+        self.voice_chat.on_audio = lambda active: self._talking("debora", active)
         self._voice_chat_loading = threading.Lock()
         self._voice_lock = threading.RLock()
         self._voice_pending = []
@@ -3395,6 +3419,17 @@ class DictationApp:
         for cb in self._callbacks:
             try:
                 cb(self._state, {"notice": text})
+            except Exception:
+                pass
+
+    def _talking(self, who: str, active: bool):
+        """The user's voice or Débora's started or stopped; the state does
+        not change."""
+        if self._stopping.is_set():
+            return
+        for cb in self._callbacks:
+            try:
+                cb(self._state, {"talking": who, "active": active})
             except Exception:
                 pass
 

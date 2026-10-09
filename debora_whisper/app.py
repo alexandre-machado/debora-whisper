@@ -160,6 +160,9 @@ class GUIApp:
         if data.get("notice"):
             self._tray.update_state(state.value, f"Débora Whisper — {data['notice']}")
             return
+        if "talking" in data:
+            self._overlay.set_talking(data["talking"], data["active"])
+            return
         state_name = state.value
 
         if state == AppState.LOADING:

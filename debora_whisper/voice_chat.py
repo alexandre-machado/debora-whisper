@@ -701,6 +701,19 @@ class VoiceChat:
         self._waiting_clip = None
         self._tts_warmed = False
         self.speaking = False
+        # on_audio(bool) when her voice starts or stops coming out.
+        self.on_audio = None
+        self._audio_shown = False
+
+    def _show_audio(self, active: bool):
+        if active == self._audio_shown:
+            return
+        self._audio_shown = active
+        if self.on_audio:
+            try:
+                self.on_audio(active)
+            except Exception:
+                pass
 
     def _select_tts_cache(self, config):
         """Called under the cache lock; settings changes discard the old voice."""
@@ -860,6 +873,7 @@ class VoiceChat:
         def playback_started(timing):
             nonlocal first_audio
             timing["play"] = time.perf_counter() - started
+            self._show_audio(True)
             self._remember_spoken(timing["spoken"], timing["audio"])
             if first_audio is None:
                 first_audio = timing["play"]
@@ -1024,6 +1038,9 @@ class VoiceChat:
                 try:
                     clip = clips.get(timeout=0.1)
                 except queue.Empty:
+                    # The last clip has played out; the next is still being
+                    # synthesized.
+                    self._show_audio(False)
                     continue
                 if clip is None or stop.is_set():
                     break
@@ -1039,6 +1056,7 @@ class VoiceChat:
                 if hasattr(play, "close"):
                     play.close(interrupted=stop.is_set())  # waits for the last clip
             finally:
+                self._show_audio(False)
                 self.speaking = False
                 stop.set()  # stops the writer and renderer threads
                 # Drain Claude's result / local cancellation before the next

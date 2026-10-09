@@ -9,14 +9,14 @@ from time import monotonic
 
 from debora_whisper.ui.glass import (
     TRANSPARENT_COLOR, PillCache, composite_on_transparent, pil_to_photo,
-    _hex_to_rgba,
+    _hex_to_rgba, render_pill,
 )
 
 # Débora's face, shown at the panel's left edge.
 MASCOT_PATH = Path(__file__).parent / "assets" / "mascot.png"
 # Her animated bust, 12 fps, 228x128, cut from a generated video: a calm
 # loop (played forward then back, so it has no seam) and a zoom into her face
-# and back, repeated while recording or speaking.
+# and back, repeated while someone talks (the user or her voice).
 MASCOT_LOOP_PATH = Path(__file__).parent / "assets" / "mascot_loop.webp"
 MASCOT_ZOOM_PATH = Path(__file__).parent / "assets" / "mascot_zoom.webp"
 
@@ -48,8 +48,9 @@ class OverlayWindow:
     BLUE = "#0A84FF"
     GRAY = "#48484A"
 
-    # The mascot moves only while she listens or speaks.
-    _MASCOT_ANIMATED_STATES = ("recording", "speaking")
+    # The mascot flaps its wings in silence and zooms while someone talks;
+    # it stands still only while loading or after an error.
+    _MASCOT_STILL_STATES = ("loading", "error")
     MASCOT_FPS = 12
     MASCOT_FEATHER = 2  # logical px of haze where the mascot meets the panel
     MASCOT_ASPECT = 16 / 9  # the whole video frame, uncropped
@@ -67,6 +68,16 @@ class OverlayWindow:
     BALLOON_FONT_SIZE = 16
     BALLOON_DURATION = 2500  # the former result -> ready auto-dismiss delay
     SLIDE_SECONDS = 0.2
+
+    # --- Resize grip: a small glass capsule at the right edge ---
+    GRIP_W = 4
+    GRIP_H = 24
+    GRIP_INSET = 4      # from the window's right edge
+    GRIP_HIT_W = 16     # invisible hit area, centered on the capsule
+    GRIP_IDLE = 0.2     # white opacity over the panel
+    GRIP_ACTIVE = 0.5   # hover and drag
+    GRIP_FADE_MS = 150
+    GRIP_STEPS = 5
 
     def __init__(self, root, on_toggle=None, pos_x=None, pos_y=10, on_pos_changed=None,
                  balloon_width=None, on_width_changed=None):
@@ -106,6 +117,7 @@ class OverlayWindow:
         self._mascot_clip = "loop"
         self._mascot_index = 0
         self._mascot_anim_id = None
+        self._talking = set()  # "user" and/or "debora" while their voice is heard
         self._user_text = ""
         self._reply_text = ""
         self._voice_turn = False
@@ -115,6 +127,9 @@ class OverlayWindow:
         self._show_balloon = True
         self._slide_id = None
         self._slides = {}
+        self._grip_level = 0  # 0 idle .. GRIP_STEPS active
+        self._grip_hover = False
+        self._grip_fade_id = None
 
         # PIL rendering state
         self._pill_cache = PillCache()
@@ -278,11 +293,63 @@ class OverlayWindow:
     def _text_geometry(self, width):
         mascot_right = self._mascot_geometry()[2]
         gap = round(self.BALLOON_GAP * self._scale)
-        bar_width = max(1, round(self._scale))
-        bar_left = width - round(3 * self._scale) - bar_width
+        bar_width = max(1, round(self.GRIP_W * self._scale))
+        bar_left = width - round(self.GRIP_INSET * self._scale) - bar_width
         text_left = mascot_right + gap
         text_right = max(text_left, bar_left - gap)
         return text_left, text_right, bar_left, bar_width
+
+    def _grip_image(self, level, height):
+        """The resize capsule at fade level 0 (idle) .. GRIP_STEPS (hover,
+        drag), pre-blended over the flat panel: Tk images have no alpha."""
+        from PIL import Image
+        s = self._scale
+        width = max(1, round(self.GRIP_W * s))
+        height = max(1, min(round(self.GRIP_H * s), height))
+        cache = self.__dict__.setdefault("_grip_cache", {})
+        key = (width, height, level)
+        if key not in cache:
+            opacity = self.GRIP_IDLE + (self.GRIP_ACTIVE - self.GRIP_IDLE) * level / self.GRIP_STEPS
+            capsule = render_pill(width, height, radius=max(1, round(2 * s)),
+                                  bg_top=(255, 255, 255), bg_bottom=(216, 216, 222),
+                                  border_width=0)
+            capsule.putalpha(capsule.getchannel("A").point(lambda a: round(a * opacity)))
+            image = Image.new("RGBA", (width, height), _hex_to_rgba(self.BG))
+            image.alpha_composite(capsule)
+            cache[key] = image
+        return cache[key]
+
+    def _set_grip_active(self, active):
+        """Fade the capsule toward its hover/drag look, or back to idle."""
+        active = active or getattr(self, "_dragging", False) and self._press_region == "resize"
+        if active == self._grip_hover:
+            return
+        self._grip_hover = active
+        if self._grip_fade_id is None:
+            self._grip_fade_id = self._root.after(
+                self.GRIP_FADE_MS // self.GRIP_STEPS, self._grip_fade_tick)
+
+    def _grip_fade_tick(self):
+        self._grip_fade_id = None
+        target = self.GRIP_STEPS if self._grip_hover else 0
+        if self._grip_level == target:
+            return
+        self._grip_level += 1 if target > self._grip_level else -1
+        self._draw_grip()
+        self._grip_fade_id = self._root.after(
+            self.GRIP_FADE_MS // self.GRIP_STEPS, self._grip_fade_tick)
+
+    def _draw_grip(self):
+        c = self._canvas
+        c.delete("grip")
+        w, h = int(self._cur_w), int(self._cur_h)
+        left, right, bar, _ = self._text_geometry(w)
+        if not self._conversation_lines() or right <= left:
+            return
+        image = self._grip_image(self._grip_level, h - 2 * round(self.BALLOON_PAD * self._scale))
+        photo = pil_to_photo(image)
+        self.__dict__["_grip_photo"] = photo
+        c.create_image(bar, (h - image.height) // 2, image=photo, anchor="nw", tags="grip")
 
     def _conversation_lines(self):
         if not self._show_balloon or self._text_dismissed:
@@ -375,8 +442,7 @@ class OverlayWindow:
         c.create_image(0, 0, image=photo, anchor="nw")
         left, right, bar, bar_w = self._text_geometry(w)
         if self._conversation_lines() and right > left:
-            c.create_rectangle(bar, round(6 * s), bar + bar_w, h - round(6 * s),
-                               fill="#FFFFFF", outline="")
+            self._draw_grip()
             self._text_canvas.place(x=left, y=round(self.BALLOON_PAD * s),
                                     width=right - left,
                                     height=h - 2 * round(self.BALLOON_PAD * s))
@@ -446,7 +512,8 @@ class OverlayWindow:
     def _hit_region(self, x):
         _, _, bar, bar_w = self._text_geometry(int(self._cur_w))
         if self._conversation_lines() and self._cur_w > self._mascot_geometry()[3]:
-            if bar - 4 * self._scale <= x <= bar + bar_w + 4 * self._scale:
+            reach = (self.GRIP_HIT_W * self._scale - bar_w) / 2
+            if bar - reach <= x <= bar + bar_w + reach:
                 return "resize"
             if x >= self._mascot_geometry()[2]:
                 return "text"
@@ -458,6 +525,8 @@ class OverlayWindow:
         self._dragging = False
         self._drag_offset_x, self._drag_offset_y = event.x, event.y
         self._resize_start = (self._cur_w - self._mascot_geometry()[3]) / self._scale
+        if self._press_region == "resize":
+            self._set_grip_active(True)
 
     def _on_drag_move(self, event):
         if self._press_region == "text":
@@ -484,6 +553,7 @@ class OverlayWindow:
         if self._dragging:
             self._dragging = False
             if self._press_region == "resize":
+                self._set_grip_active(self._hit_region(event.x) == "resize")
                 if self._on_width_changed:
                     self._on_width_changed(self._balloon_width)
             elif self._on_pos_changed:
@@ -496,12 +566,14 @@ class OverlayWindow:
 
     def _on_leave(self, event):
         self._canvas.configure(cursor="")
+        self._set_grip_active(False)
 
     def _on_mouse_move(self, event):
         region = self._hit_region(event.x)
         cursor = "sb_h_double_arrow" if region == "resize" else (
             "hand2" if region == "text" or self._state in self._CLICK_STATES else "")
         self._canvas.configure(cursor=cursor)
+        self._set_grip_active(region == "resize")
 
     # --- Mascot -----------------------------------------------------------
 
@@ -549,9 +621,9 @@ class OverlayWindow:
         return frames
 
     def _sync_mascot_animation(self):
-        """Run the mascot's frame timer only in the animated states; the
-        other states show the loop's first frame and cost nothing."""
-        animate = self._state in self._MASCOT_ANIMATED_STATES
+        """Run the mascot's frame timer except while loading or after an
+        error, where it shows the loop's first frame and costs nothing."""
+        animate = self._state not in self._MASCOT_STILL_STATES
         running = self.__dict__.get("_mascot_anim_id")
         if animate and not running:
             self._mascot_anim_id = self._root.after(
@@ -565,12 +637,29 @@ class OverlayWindow:
 
     def _mascot_tick(self):
         self._mascot_anim_id = None
-        self._mascot_index += 1
-        if self._mascot_index >= len(self._mascot_frames(1, clip=self._mascot_clip)):
-            # Recording and speaking both repeat the zoom (the user liked it
-            # better than the calmer loop).
+        count = len(self._mascot_frames(1, clip=self._mascot_clip))
+        talking = bool(self.__dict__.get("_talking"))
+        step = 1
+        if self._mascot_clip == "zoom" and not talking and self._mascot_index < count // 2:
+            # Silence early in the zoom: play it back out, never jump mid-zoom.
+            step = -1
+        self._mascot_index += step
+        if self._mascot_index < 0 or self._mascot_index >= count:
+            # A clip boundary: the zoom repeats while someone talks.
+            self._mascot_clip = "zoom" if talking else "loop"
             self._mascot_index = 0
         self._redraw()  # reschedules through _sync_mascot_animation
+
+    def set_talking(self, who: str, active: bool):
+        """who ("user" or "debora") started or stopped talking. The zoom
+        starts at once and ends at a clip boundary (see _mascot_tick)."""
+        talking = self.__dict__.setdefault("_talking", set())
+        was = bool(talking)
+        (talking.add if active else talking.discard)(who)
+        if talking and not was and self._mascot_clip == "loop":
+            self._mascot_clip, self._mascot_index = "zoom", 0
+            if self._state not in self._MASCOT_STILL_STATES:
+                self._redraw()
 
     # --- Public state API -------------------------------------------------
 
@@ -593,8 +682,6 @@ class OverlayWindow:
         self._text_dismissed = False
 
     def _set_state(self, state):
-        if state != self._state and state in self._MASCOT_ANIMATED_STATES:
-            self._mascot_clip, self._mascot_index = "zoom", 0
         self._state = state
 
     def show_loading(self):

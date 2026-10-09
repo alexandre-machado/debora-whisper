@@ -394,10 +394,10 @@ def test_mascot_falls_back_to_the_still_image(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("state, animated", [
-    ("recording", True), ("speaking", True),
-    ("ready", False), ("processing", False), ("loading", False), ("error", False),
+    ("recording", True), ("speaking", True), ("ready", True), ("processing", True),
+    ("loading", False), ("error", False),
 ])
-def test_mascot_moves_only_while_listening_or_speaking(state, animated):
+def test_mascot_flaps_in_silence_and_stands_still_only_loading_or_failed(state, animated):
     overlay = OverlayWindow.__new__(OverlayWindow)
     overlay._root = Mock()
     overlay._root.after.return_value = "timer"
@@ -411,10 +411,10 @@ def test_mascot_moves_only_while_listening_or_speaking(state, animated):
         assert overlay._mascot_index == 0
 
 
-def test_leaving_an_animated_state_stops_the_timer():
+def test_an_error_stops_the_timer():
     overlay = OverlayWindow.__new__(OverlayWindow)
     overlay._root = Mock()
-    overlay._state = "ready"
+    overlay._state = "error"
     overlay._mascot_index = 7
     overlay._mascot_clip = "zoom"
     overlay._mascot_anim_id = "timer"
@@ -424,19 +424,109 @@ def test_leaving_an_animated_state_stops_the_timer():
     assert overlay._mascot_clip == "loop"
 
 
-def test_speaking_repeats_the_zoom():
+@pytest.mark.parametrize("state", ["ready", "recording", "processing", "speaking"])
+def test_silence_loops_whatever_the_state(state):
+    overlay = _overlay(state=state)
+    overlay.show_speaking("Oi!") if state == "speaking" else None
+    loop_len = len(overlay._mascot_frames(1, clip="loop"))
+    for _ in range(loop_len + 3):
+        overlay._mascot_tick()
+    assert (overlay._mascot_clip, overlay._mascot_index) == ("loop", 3)
+
+
+@pytest.mark.parametrize("who", ["user", "debora"])
+def test_talking_zooms_and_repeats_until_it_stops(who):
     overlay = _overlay(state="recording")
-    overlay._show_balloon = False
-    overlay.show_speaking("Oi!")
+    for _ in range(3):
+        overlay._mascot_tick()
+    overlay.set_talking(who, True)
     assert (overlay._mascot_clip, overlay._mascot_index) == ("zoom", 0)
     zoom_len = len(overlay._mascot_frames(1, clip="zoom"))
-    for _ in range(zoom_len):
+    for _ in range(zoom_len + 2):
         overlay._mascot_tick()
-    assert (overlay._mascot_clip, overlay._mascot_index) == ("zoom", 0)
-    # More of the reply does not restart the zoom.
-    overlay._mascot_tick()
+    assert (overlay._mascot_clip, overlay._mascot_index) == ("zoom", 2)
+    # A new state (more of the reply, a draft) never restarts the zoom.
     overlay.show_speaking("Oi! Tudo bem?")
-    assert (overlay._mascot_clip, overlay._mascot_index) == ("zoom", 1)
+    overlay.show_recording("e você")
+    assert (overlay._mascot_clip, overlay._mascot_index) == ("zoom", 2)
+
+
+def test_silence_early_in_the_zoom_plays_it_back_out_to_the_loop():
+    overlay = _overlay(state="speaking")
+    overlay.set_talking("debora", True)
+    for _ in range(3):
+        overlay._mascot_tick()
+    overlay.set_talking("debora", False)
+    shown = []
+    for _ in range(4):
+        overlay._mascot_tick()
+        shown.append((overlay._mascot_clip, overlay._mascot_index))
+    assert shown == [("zoom", 2), ("zoom", 1), ("zoom", 0), ("loop", 0)]
+
+
+def test_silence_late_in_the_zoom_finishes_it_then_loops():
+    overlay = _overlay(state="recording")
+    overlay.set_talking("user", True)
+    zoom_len = len(overlay._mascot_frames(1, clip="zoom"))
+    for _ in range(zoom_len - 2):
+        overlay._mascot_tick()
+    overlay.set_talking("user", False)
+    overlay._mascot_tick()
+    assert (overlay._mascot_clip, overlay._mascot_index) == ("zoom", zoom_len - 1)
+    overlay._mascot_tick()
+    assert (overlay._mascot_clip, overlay._mascot_index) == ("loop", 0)
+
+
+def test_zoom_lasts_while_either_one_talks():
+    overlay = _overlay(state="speaking")
+    overlay.set_talking("debora", True)
+    overlay.set_talking("user", True)  # barge-in
+    overlay.set_talking("debora", False)
+    zoom_len = len(overlay._mascot_frames(1, clip="zoom"))
+    for _ in range(zoom_len + 1):
+        overlay._mascot_tick()
+    assert overlay._mascot_clip == "zoom"
+
+
+@pytest.mark.parametrize("scale", [1.0, 2.0])
+def test_resize_grip_is_a_small_glass_capsule(scale):
+    overlay = _overlay(scale)
+    h = round(60 * scale)
+    idle, active = overlay._grip_image(0, h), overlay._grip_image(overlay.GRIP_STEPS, h)
+    assert idle.size == active.size == (round(4 * scale), round(24 * scale))
+    bg = int(overlay.BG[1:3], 16)
+    middle = (idle.width // 2, idle.height // 2)
+    assert abs(idle.getpixel(middle)[0] - (bg + 0.2 * (255 - bg))) <= 6  # soft gradient
+    assert abs(active.getpixel(middle)[0] - (bg + 0.5 * (255 - bg))) <= 12
+    assert idle.getpixel((0, 0))[0] < idle.getpixel(middle)[0]  # rounded caps
+    # A short balloon never gets a capsule taller than its text area.
+    assert overlay._grip_image(0, 10).height == 10
+
+
+@pytest.mark.parametrize("scale", [1.0, 2.0])
+def test_resize_grip_hit_area_and_hover_fade(scale):
+    overlay = _overlay(scale)
+    overlay._draw_grip = Mock()
+    overlay.show_result("texto")
+    _, _, bar, bar_w = overlay._text_geometry(overlay._cur_w)
+    assert bar == overlay._cur_w - round(4 * scale) - bar_w
+    center = bar + bar_w / 2
+    reach = 8 * scale
+    assert overlay._hit_region(center - reach) == "resize"
+    assert overlay._hit_region(center + reach) == "resize"
+    assert overlay._hit_region(center - reach - 1) == "text"
+    overlay._on_mouse_move(SimpleNamespace(x=center, y=10))
+    overlay._canvas.configure.assert_called_with(cursor="sb_h_double_arrow")
+    delay, tick = overlay._root.after.call_args.args
+    assert delay == overlay.GRIP_FADE_MS // overlay.GRIP_STEPS
+    for _ in range(overlay.GRIP_STEPS + 1):
+        overlay._grip_fade_tick()
+    assert overlay._grip_level == overlay.GRIP_STEPS
+    assert overlay._draw_grip.call_count == overlay.GRIP_STEPS  # nothing else is redrawn
+    overlay._on_leave(SimpleNamespace(x=0, y=0))
+    for _ in range(overlay.GRIP_STEPS + 1):
+        overlay._grip_fade_tick()
+    assert overlay._grip_level == 0
 
 
 def test_mascot_edge_fades_into_the_panel():

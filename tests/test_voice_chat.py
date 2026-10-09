@@ -1135,6 +1135,24 @@ def test_notice_shows_only_in_the_tray_without_changing_state():
     gui._tray.update_state.assert_called_once_with("recording", "Débora Whisper — Voice chat ready")
 
 
+def test_talking_only_animates_the_mascot():
+    gui = _gui()
+    gui._update_ui(de.AppState.SPEAKING, {"talking": "debora", "active": True})
+    gui._overlay.set_talking.assert_called_once_with("debora", True)
+    gui._overlay.show_speaking.assert_not_called()
+    gui._tray.update_state.assert_not_called()
+
+
+def test_engine_wires_both_voices_to_the_ui():
+    events = []
+    app = de.DictationApp.__new__(de.DictationApp)
+    app._stopping = threading.Event()
+    app._state = de.AppState.RECORDING
+    app._callbacks = [lambda state, data: events.append(data)]
+    app._talking("user", True)
+    assert events == [{"talking": "user", "active": True}]
+
+
 # --- Latency and playback -------------------------------------------------------
 
 def test_voice_chat_ends_a_sentence_after_a_shorter_silence():
@@ -1343,3 +1361,14 @@ def test_claude_keeps_an_interrupted_reserved_message_and_drains_before_next(tmp
     assert [m["type"] for m in sent] == ["user", "control_request", "user"]
     assert [m["message"]["content"] for m in sent if m["type"] == "user"] == [
         "sobre o projeto...", "quero mudar a interface"]
+
+
+def test_on_audio_marks_when_her_voice_is_heard(server):
+    """The mascot zooms from her first clip to the end of the reply."""
+    events = []
+    chat, played = _chat(server, FakeLLM(["A capital é Canberra. ", "Fica no sul, perto do mar."]))
+    chat.on_audio = lambda active: events.append((active, len(played)))
+    chat.respond("qual é a capital da austrália")
+    assert events[0] == (True, 0)  # before the first clip plays
+    assert events[-1] == (False, 2)  # after the last one
+    assert all(a != b for (a, _), (b, _) in zip(events, events[1:]))  # once per change
