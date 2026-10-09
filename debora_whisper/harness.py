@@ -31,6 +31,9 @@ def harness_command(config: dict, session_id: str, resume: bool) -> list[str]:
                "--add-dir", str(harness_memory_file(config).parent),
                "--append-system-prompt-file", str(config.get("harness_prompt_file") or HARNESS_PROMPT),
                "--system-prompt-snapshot", "off"]
+    config_dir = paths.CONFIG_DIR.resolve()
+    if not config_dir.is_relative_to(harness_cwd(config)):
+        command += ["--add-dir", str(config_dir)]
     if config.get("harness_model"):
         command += ["--model", config["harness_model"]]
     return command
@@ -60,6 +63,17 @@ def voice_prompt(prompt: str, language: str | None, now: str) -> str:
     return (prompt.rstrip() + f"\nIdioma configurado: {language or 'auto'} "
             "(auto: acompanhe o idioma do usuário)."
             + f"\nData e hora local ao iniciar este processo: {now}.\n")
+
+
+def _self_prompt(config: dict) -> str:
+    logs = paths.LOG_DIR.resolve()
+    return ("\n## Sobre a própria Débora\n"
+            "Você pode ler e editar estes arquivos para diagnosticar e corrigir a Débora:\n"
+            f"Configuração: {paths.CONFIG_FILE.resolve()}\n"
+            f"Inicialização, tempos de transcrição, hardware e turnos de voz: {logs / 'app.log'}\n"
+            f"CPU/RAM/VRAM e buffer de áudio: {logs / 'telemetry.log'}\n"
+            f"Servidor de voz: {logs / 'tts_server.log'}\n"
+            f"Memória de voz: {harness_memory_file(config)}\n")
 
 
 def memory_terms(text: str) -> list[str]:
@@ -206,6 +220,7 @@ class HarnessSession:
                 source = self.cwd / source
             prompt = voice_prompt(source.read_text(encoding="utf-8"), config.get("language"),
                                   time.strftime("%A, %Y-%m-%d %H:%M"))
+            prompt += _self_prompt(config)
             prompt += _memory_prompt(harness_memory_file(config), log)
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".md",
                                              prefix="debora-voice-", delete=False) as file:
@@ -263,6 +278,19 @@ class HarnessSession:
         if callback:
             callback(kind, message)
 
+    def _permission_denied(self, denial: dict, denials_seen: set, on_event):
+        tool_id = denial.get("tool_use_id")
+        if tool_id and tool_id in denials_seen:
+            return
+        if tool_id:
+            denials_seen.add(tool_id)
+        tool_input = denial.get("tool_input", denial.get("input", {}))
+        detail = tool_input.get("command", tool_input) if isinstance(tool_input, dict) else tool_input
+        detail = f"{denial.get('tool_name', 'unknown')} {detail}"
+        if len(detail) > 200:
+            detail = detail[:197] + "..."
+        self._notice("permission", f"Claude permission denied: {detail}", on_event)
+
     def interrupt(self):
         self._send({"type": "control_request", "request_id": str(uuid.uuid4()),
                     "request": {"subtype": "interrupt"}})
@@ -278,6 +306,7 @@ class HarnessSession:
             interrupted = None
             last_event = time.monotonic()
             tools_seen = set()
+            denials_seen = set()
             try:
                 while True:
                     now = time.monotonic()
@@ -306,8 +335,10 @@ class HarnessSession:
                                 allow = bool(self.permission_handler(request))
                             allow = allow and not stop.is_set()
                             self._send(permission_response(message["request_id"], request, allow))
-                            self.log(f"Voice chat: Claude permission {'allowed' if allow else 'denied'}: "
-                                     f"{request['tool_name']}")
+                            if allow:
+                                self.log(f"Voice chat: Claude permission allowed: {request['tool_name']}")
+                            else:
+                                self._permission_denied(request, denials_seen, on_event)
                         else:
                             self._send({"type": "control_response", "response": {
                                 "subtype": "error", "request_id": message["request_id"],
@@ -334,7 +365,7 @@ class HarnessSession:
                         except OSError as e:
                             self.log(f"Voice chat: cannot save Claude session {self.session_id} ({e})")
                         for denial in message.get("permission_denials", []):
-                            self._notice("permission", f"Claude permission denied: {denial}", on_event)
+                            self._permission_denied(denial, denials_seen, on_event)
                         if message.get("is_error") and not stop.is_set():
                             raise RuntimeError("; ".join(message.get("errors", [])) or "Claude turn failed")
                         return
