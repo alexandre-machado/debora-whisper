@@ -851,7 +851,8 @@ class VoiceChat:
 
     def respond(self, text: str, on_reply=None, stop=None) -> str:
         """Ask the LLM, speak its reply and return the text spoken so far
-        ("" if the LLM failed). on_reply(text) gets the reply as it grows."""
+        ("" if the LLM failed). on_reply(text) gets the reply as it grows,
+        each sentence when its audio starts (at once if it has no audio)."""
         started = time.perf_counter()
         turn = time.monotonic_ns()
         timings = []
@@ -874,10 +875,19 @@ class VoiceChat:
                 self.log(f"Voice chat: TTS turn={turn} chunk={timing['chunk']} {fields}"
                          + (" cached" if timing.get("cached") else ""))
 
+        shown = []
+
+        def show(timing):
+            # Her words enter the balloon together with her voice.
+            if timing.get("shown") and on_reply:
+                shown.append(timing["shown"])
+                on_reply(" ".join(shown))
+
         def playback_started(timing):
             nonlocal first_audio
             timing["play"] = time.perf_counter() - started
             self._show_audio(True)
+            show(timing)
             self._remember_spoken(timing["spoken"], timing["audio"])
             if first_audio is None:
                 first_audio = timing["play"]
@@ -991,8 +1001,7 @@ class VoiceChat:
                         continue
                     if not is_feedback:
                         state["reply"] = f"{state['reply']} {spoken}".strip()
-                        if on_reply:
-                            on_reply(state["reply"])
+                        timing["shown"] = spoken
                     self.log(f"Voice chat: reply {spoken!r}")
                     spoken = spoken_numbers(spoken, self.config.get("language"))
                     if not any(c.isalnum() for c in spoken):
@@ -1025,6 +1034,7 @@ class VoiceChat:
                         clips.put((trim_silence(*audio), audio[1], timing))
                     else:
                         log_timing(timing)
+                        clips.put(((), None, timing))  # text only, in order
             finally:
                 clips.put(None)
 
@@ -1048,13 +1058,14 @@ class VoiceChat:
                     continue
                 if clip is None or stop.is_set():
                     break
-                if len(clip[0]):
-                    if self._play is None:
-                        play(clip[0], clip[1], stop,
-                             on_start=lambda timing=clip[2]: playback_started(timing))
-                    else:
-                        playback_started(clip[2])
-                        play(clip[0], clip[1], stop)
+                if not len(clip[0]):
+                    show(clip[2])  # nothing to hear (no TTS, or only silence)
+                elif self._play is None:
+                    play(clip[0], clip[1], stop,
+                         on_start=lambda timing=clip[2]: playback_started(timing))
+                else:
+                    playback_started(clip[2])
+                    play(clip[0], clip[1], stop)
         finally:
             try:
                 if hasattr(play, "close"):

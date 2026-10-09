@@ -1438,3 +1438,21 @@ def test_short_answers_after_her_sentence_are_not_echo(text, started, echo, monk
     chat = vc.VoiceChat({"language": "pt"})
     chat._spoken = [(10.0, 12.0, "Sim, ela disse que quê mesmo")]
     assert chat.is_echo(text, started, started + 0.4) is echo
+
+
+def test_her_text_enters_the_balloon_with_her_voice(server):
+    shown = []
+    chat, played = _chat(server, FakeLLM(["A capital é Canberra. ", "Fica no sul, perto do mar."]))
+    chat.respond("qual é a capital da austrália",
+                 on_reply=lambda text: shown.append((text, len(played))))
+    # Each sentence appears as its clip starts, never while it is synthesized.
+    assert shown == [("A capital é Canberra.", 0),
+                     ("A capital é Canberra. Fica no sul, perto do mar.", 1)]
+
+
+def test_her_text_still_shows_without_a_voice(server, monkeypatch):
+    monkeypatch.setattr(vc, "wait_tts_server", lambda config, *a, **kw: False)
+    shown = []
+    chat, played = _chat(server, FakeLLM(["A capital é Canberra."]))
+    chat.respond("capital", on_reply=shown.append)
+    assert shown == ["A capital é Canberra."] and played == []
