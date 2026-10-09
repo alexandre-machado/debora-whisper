@@ -1,80 +1,127 @@
-# Ideia: tools, MCP e controle de um harness por voz
+# Plano: conversar com o Claude Code pela Débora
 
-> Ideia estacionada em 2026-10-08. Nada foi implementado ainda.
+> Revisado em 2026-10-09. Nada foi implementado ainda. A versão de
+> 2026-10-08 (Qwen como atendente que repassa trabalho por tool call) foi
+> substituída pela decisão abaixo.
 
-## Objetivo
+## Decisão
 
-No voice chat, o LLM local (Qwen3-8B no OpenVINO) vira o atendente de voz e
-repassa o trabalho pesado a um harness de mercado: Claude Code primeiro, Codex
-depois. Você fala, o Qwen decide se responde sozinho ou se repassa. Quando o
-harness termina, o Qwen resume o resultado em uma ou duas frases faladas.
-Diffs, código e logs ficam no overlay e no log, não vão para o TTS.
+A Débora fica só com a voz: STT (Whisper) e TTS (Chatterbox). Toda a
+inteligência vai para um harness de mercado, e o primeiro é o **Claude
+Code**. O LLM local (Qwen3-8B) deixa de ser o cérebro do chat de voz.
 
-Uma tarefa no harness leva minutos, então ela roda em segundo plano. A
-ferramenta só responde "enviado". Os eventos do harness, como "terminou" ou
-"quer rodar `git push`, autoriza?", chegam depois como notificações faladas.
+Motivo: o Qwen3-8B se comportava mal como persona, e cada regra a mais no
+prompt piorava as respostas (ver `docs/benchmarks/llm-2026-10-09/`). O
+harness já conhece o repositório, as ferramentas e a memória do usuário.
 
-## O que foi verificado (2026-10-08)
+## O que aprendemos (2026-10-09)
 
-- **OpenVINO GenAI 2026.4.1:** `Tokenizer.apply_chat_template(history,
-  add_generation_prompt, chat_template, tools=..., extra_context=...)` aceita
-  `tools`. O Qwen3 responde com `<tool_call>{"name": ..., "arguments":
-  ...}</tool_call>`.
-- **Claude Code 2.1.294:** `claude -p --input-format stream-json
-  --output-format stream-json --verbose --resume <session-id>` mantém uma
-  sessão viva por stdio, com JSON por linha nos dois sentidos. Falta
-  confirmar se os pedidos de permissão chegam pelo stdio; o Agent SDK faz
-  isso.
-- **Codex CLI 0.160:** não tem mais `codex mcp-server`. Tem `codex exec`, com
-  `resume`, e `codex app-server`, um JSON-RPC por stdio ainda experimental.
-- **SDK `mcp` em Python:** não está no ambiente do app.
-- **Limitação:** o app não consegue pilotar um terminal interativo que já
-  está aberto. Ele roda a própria sessão headless, que depois pode ser aberta
-  no terminal com `claude --resume <id>`.
+### Mandar a transcrição crua
 
-## Fases propostas
+Um LLM local limpando a transcrição antes do harness piora o pedido: ele
+corrige o óbvio, mas erra o que é do projeto ("dictêixon engine" virou
+"Decision Engine"), e soma ~1 s. O Claude Code entendeu os quatro pedidos
+crus porque tem o contexto do repositório (`dictation_engine.py`,
+`tests/test_voice_chat.py`). **Recomendação:** mandar o texto cru, com um
+aviso no prompt de sistema de que ele vem de reconhecimento de voz e pode
+ter erros. Tabela completa no README do benchmark.
 
-0. **Provas de conceito**, em scripts fora do app:
-   - quanto o Qwen3-8B int4 acerta a ferramenta e os argumentos em português,
-     e quanto isso custa em latência;
-   - uma sessão do Claude Code em stream-json: mensagens seguidas,
-     interrupção e permissões;
-   - um turno e uma aprovação pelo `codex app-server`.
-1. **Tool calling no `llm_server`:**
-   - o pedido passa a levar `tools`;
-   - ao aparecer `<tool_call>`, o servidor segura o stream e manda
-     `{"id", "tool_call": {...}}`, para o TTS nunca falar o JSON;
-   - o `voice_chat` ganha um registro de ferramentas e o laço chamada →
-     mensagem `tool` → nova geração, com limite de rodadas. Cada rodada custa
-     uns 1–2 s.
-2. **Adaptador do Claude Code:**
-   - uma `HarnessSession` em processo próprio, no mesmo padrão do
-     `llm_server`, com `start(pasta, resume)`, `send`, `interrupt` e eventos;
-   - ferramentas para o Qwen: `harness_enviar`, `harness_status`,
-     `harness_aprovar` e `harness_parar`.
-3. **Adaptador do Codex:** pelo `app-server`. Se ele estiver instável, uso o
-   `codex exec --json` com `resume`, que não tem aprovação interativa e
-   precisa do sandbox `workspace-write`.
-4. **Cliente MCP genérico:** um `"mcp_servers"` no `config.json`, no formato
-   do Claude, cujas ferramentas entram no mesmo registro.
+### Latência dos harnesses
+
+Uma pergunta curta, processo novo a cada chamada:
+
+| CLI | Versão | Tempo |
+|---|---|---|
+| `claude -p` | 2.1.295 | 6.1 s |
+| `codex exec` | 0.161.0 | 6.1 s |
+| `copilot -s -p` | 1.0.93 | 7.9 s |
+| `agy -p` | 1.3.2 | 9.3 s |
+
+O Qwen local dava o primeiro token em ~0.5 s. Os ~6 s são quase todos de
+partida do processo, então o processo do Claude precisa ficar vivo entre
+os turnos, e a Débora precisa dar um retorno enquanto espera (um som curto
+ou "um instante").
+
+### Como manter o Claude Code vivo
+
+O `claude` 2.1.295 tem tudo para um processo persistente por stdio, com
+JSON por linha nos dois sentidos:
+
+```
+claude -p --input-format stream-json --output-format stream-json --verbose \
+  --include-partial-messages \
+  --session-id <uuid> | --resume <id> \
+  --permission-mode acceptEdits \
+  --permission-prompts host
+```
+
+- `--include-partial-messages`: o texto chega aos pedaços, e o TTS pode
+  começar pela primeira frase, como faz hoje com o Qwen.
+- `--session-id` / `--resume`: a mesma conversa entre reinícios do app; o
+  usuário pode abrir a sessão no terminal com `claude --resume <id>`.
+- `--permission-mode`: `acceptEdits`, `auto`, `bypassPermissions`,
+  `manual`, `dontAsk` ou `plan`.
+- `--permission-prompts host`: os pedidos de permissão vão para o
+  "host", ou seja, para quem fala o protocolo do SDK pelo stdio (ou para uma
+  `--permission-prompt-tool`). `none` nega automaticamente tudo o que
+  pediria permissão. **Ainda não testado na prática:** é a primeira coisa a
+  provar.
+
+O `agy` também aceita `--input-format stream-json`; o `copilot` só tem
+`-p --output-format json --resume`, com um processo por turno.
+
+### Limitações
+
+- O app não pilota um terminal do Claude que já está aberto; ele roda a
+  própria sessão headless.
+- Respostas do Claude vêm em markdown, com código e listas. Só a parte
+  falável vai para o TTS; o resto fica no overlay e no log. O prompt de
+  sistema deve pedir respostas curtas e faladas.
+- O `language` do `config.json` vale para o Whisper: com `"en"`, fala em
+  português sai traduzida para inglês antes de chegar ao harness.
+
+## Fases
+
+0. **Prova de conceito** (script fora do app, `docs/benchmarks/` ou
+   scratch):
+   - sessão em stream-json: duas mensagens seguidas no mesmo processo,
+     tempo até o primeiro pedaço de texto com o processo já quente;
+   - interrupção no meio de uma resposta (o usuário fala por cima);
+   - `--permission-prompts host`: qual mensagem chega pelo stdout quando o
+     Claude quer rodar um comando, e como responder sim ou não pelo stdin.
+1. **`HarnessSession`** em `debora_whisper/harness.py`, no mesmo padrão do
+   `LLMProcess` em `voice_chat.py`: `start(pasta, resume)`, `send(texto)`,
+   `interrupt()`, `stop()` e eventos (texto, ferramenta em uso, pedido de
+   permissão, fim do turno).
+2. **Ligar ao `VoiceChat`:** um `"voice_chat_backend": "claude"` no
+   `config.json` troca o `self._llm` (o construtor já aceita um `llm`
+   alternativo) por um que manda o texto ao Claude. O histórico fica no
+   Claude, não no `_history` local. O que já existe se reaproveita:
+   `speakable`, `without_emoji`, `spoken_numbers`, `split_sentences` e o
+   `StreamPlayer`.
+3. **Permissões por voz:** a Débora fala "quer rodar `git push`, autoriza?",
+   e o próximo turno (sim ou não) responde ao pedido em vez de virar uma
+   mensagem nova.
+4. **Outros harnesses**, depois: Codex (`codex app-server` ou `codex exec
+   --json` com `resume`), `agy`, `copilot`.
 
 ## Decisões em aberto (com recomendação)
 
-- **Roteamento:** o Qwen decide por tool call, e "Claude, …" ou "Codex, …"
-  força o repasse. A alternativa é um modo harness, em que tudo vai direto
-  para o harness.
+- **Transcrição crua ou limpa:** crua (ver acima). Falta a confirmação do
+  usuário.
 - **Permissões:** `acceptEdits`, com sim ou não por voz para comandos de
-  shell. As alternativas são pedir autorização para tudo, ou deixar tudo
-  liberado numa pasta isolada.
-- **Ordem:** Claude Code antes do Codex.
+  shell.
+- **Pasta de trabalho:** uma pasta fixa no `config.json`
+  (`"harness_cwd"`), com o repositório da Débora como padrão no começo.
+- **O Qwen local:** fica como modo offline. Se for mantido, trocar pelo
+  Gemma 4 E4B, que foi o melhor no benchmark mas exige `VLMPipeline` no
+  `llm_server.py`.
 
-## Nota relacionada: velocidade do TTS
+## Fora deste plano, mas relacionado
 
-O T3 do Chatterbox é limitado pelo CPU: cada token leva uns 37 ms, a maior
-parte disparando kernels pequenos, com a GPU quase parada.
-
-- Trocar o resto das camadas para sdpa não deu ganho mensurável: o ruído
-  entre rodadas iguais foi de ±15%.
-- O vazamento de hooks de atenção foi corrigido no commit `3b31210`.
-- O ganho grande que resta é capturar o passo do T3 em CUDA graphs com KV
-  cache estático. Isso não foi tentado.
+- **Fim de turno:** testar o Smart Turn v3 junto do Silero
+  (`docs/benchmarks/turn-detection-2026-10-09.md`). Com um harness lento,
+  cortar o turno cedo demais custa caro.
+- **Velocidade do TTS:** o T3 do Chatterbox é limitado pelo CPU (~37 ms por
+  token, GPU quase parada). O ganho grande que resta é CUDA graphs com KV
+  cache estático; não foi tentado.
