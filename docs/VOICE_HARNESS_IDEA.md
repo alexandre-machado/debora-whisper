@@ -88,6 +88,19 @@ pacote, ou de `harness_prompt_file`. A Débora acrescenta idioma e data/hora
 ao iniciar o processo e passa um arquivo temporário via
 `--append-system-prompt-file`. Não usa o prompt local nem reenvia histórico.
 
+A memória de erros de reconhecimento fica separada da auto-memory compartilhada:
+`harness_memory_file: null` cria `~/.debora/harness/voice_memory.md` com um cabeçalho
+no primeiro uso; caminhos relativos partem de `harness_cwd`. Só os processos
+iniciados pela Débora recebem seu conteúdo no prompt (últimas 100 linhas, até
+8 KiB, com log de truncamento). Claude mantém menos de 100 linhas e registra cada
+correção no formato `- "o que foi ouvido" → termo correto (contexto opcional)`;
+`memory_terms(text)` extrai os termos sem contexto, ainda sem ligação ao Whisper.
+Editar o conteúdo não reinicia o processo: a próxima inicialização o relê.
+Mudar o caminho reinicia no próximo turno, inclusive para trocar a permissão de
+`--add-dir`, que abrange só a pasta da memória. Use uma pasta dedicada para um
+caminho personalizado. Isso não reduz permissões preexistentes: com a pasta
+pessoal como `harness_cwd`, `~/.debora` já está dentro do diretório de trabalho.
+
 O conhecimento do projeto permanece na pasta: seus arquivos de instruções
 (`CLAUDE.md`/`AGENTS.md` conforme a configuração do Claude), skills e settings
 continuam sob responsabilidade do CLI. A Débora não escreve contexto na pasta.

@@ -3,6 +3,7 @@ import atexit
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -16,6 +17,8 @@ from debora_whisper.processes import NO_WINDOW, kill_tree
 
 HARNESS_PROMPT = Path(__file__).with_name("harness_prompt.md")
 PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan")
+MEMORY_MAX_LINES = 100
+MEMORY_MAX_BYTES = 8192
 
 
 def harness_command(config: dict, session_id: str, resume: bool) -> list[str]:
@@ -25,6 +28,7 @@ def harness_command(config: dict, session_id: str, resume: bool) -> list[str]:
                "--resume" if resume else "--session-id", session_id,
                "--permission-mode", config.get("harness_permission_mode", "acceptEdits"),
                "--permission-prompts", "host", "--permission-prompt-tool", "stdio",
+               "--add-dir", str(harness_memory_file(config).parent),
                "--append-system-prompt-file", str(config.get("harness_prompt_file") or HARNESS_PROMPT),
                "--system-prompt-snapshot", "off"]
     if config.get("harness_model"):
@@ -36,17 +40,61 @@ def harness_cwd(config: dict) -> Path:
     return Path(config.get("harness_cwd") or Path.home()).expanduser().resolve()
 
 
+def harness_memory_file(config: dict) -> Path:
+    path = Path(config.get("harness_memory_file") or
+                paths.CONFIG_DIR / "harness" / "voice_memory.md").expanduser()
+    if not path.is_absolute():
+        path = harness_cwd(config) / path
+    return path.resolve()
+
+
 def harness_key(config: dict) -> tuple:
     return (os.path.normcase(str(harness_cwd(config))), config.get("harness_model"),
             config.get("harness_permission_mode", "acceptEdits"),
             config.get("harness_prompt_file"), config.get("language"),
-            config.get("harness_permission_response", "deny"))
+            config.get("harness_permission_response", "deny"),
+            os.path.normcase(str(harness_memory_file(config))))
 
 
 def voice_prompt(prompt: str, language: str | None, now: str) -> str:
     return (prompt.rstrip() + f"\nIdioma configurado: {language or 'auto'} "
             "(auto: acompanhe o idioma do usuário)."
             + f"\nData e hora local ao iniciar este processo: {now}.\n")
+
+
+def memory_terms(text: str) -> list[str]:
+    """Extract unique correction terms, in order, without optional context."""
+    terms = []
+    for line in text.splitlines():
+        match = re.fullmatch(r'- "(?:[^"\\]|\\.)+" → (.+?)(?: \([^()]*\))?', line)
+        if match:
+            term = match[1].strip()
+            if term and term not in terms:
+                terms.append(term)
+    return terms
+
+
+def _memory_prompt(path: Path, log) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("x", encoding="utf-8") as file:
+            file.write("# Memória de reconhecimento de voz\n")
+    except FileExistsError:
+        pass
+    lines = path.read_text(encoding="utf-8").splitlines()
+    kept, size = [], 0
+    for line in reversed(lines[-MEMORY_MAX_LINES:]):
+        length = len((line + "\n").encode("utf-8"))
+        if size + length > MEMORY_MAX_BYTES:
+            break
+        kept.append(line)
+        size += length
+    if len(kept) < len(lines):
+        log(f"Voice chat: memory truncated for prompt: {path} "
+            f"({len(kept)}/{len(lines)} lines, {size} bytes)")
+    content = "\n".join(reversed(kept))
+    return (f"\n## Erros de reconhecimento já conhecidos\n"
+            f"Arquivo de memória de voz: {path}\n\n{content}\n")
 
 
 def permission_response(request_id: str, request: dict, allow: bool) -> dict:
@@ -114,6 +162,7 @@ class HarnessSession:
                 source = self.cwd / source
             prompt = voice_prompt(source.read_text(encoding="utf-8"), config.get("language"),
                                   time.strftime("%A, %Y-%m-%d %H:%M"))
+            prompt += _memory_prompt(harness_memory_file(config), log)
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".md",
                                              prefix="debora-voice-", delete=False) as file:
                 self._prompt_file = Path(file.name)

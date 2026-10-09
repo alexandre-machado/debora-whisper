@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
     "harness_permission_mode": "acceptEdits",
     "harness_permission_response": "deny",  # requests not already allowed by Claude
     "harness_prompt_file": None,   # null: packaged voice-channel rules
+    "harness_memory_file": None,   # null: ~/.debora/harness/voice_memory.md
     # Silence that ends a sentence in voice chat (dictation: 1.5 s, room to
     # think). The reply cannot start before it has passed.
     "voice_chat_end_silence_seconds": 0.8,
@@ -329,7 +330,7 @@ def validate_config(config: dict):
             raise ValueError(f"{key} must be a non-empty string, got {value!r}")
     if config.get("voice_chat_backend", "local") not in ("local", "claude"):
         raise ValueError("voice_chat_backend must be local or claude")
-    for key in ("harness_cwd", "harness_model", "harness_prompt_file"):
+    for key in ("harness_cwd", "harness_model", "harness_prompt_file", "harness_memory_file"):
         value = config.get(key)
         if value is not None and (not isinstance(value, str) or not value.strip()):
             raise ValueError(f"{key} must be null or a non-empty string, got {value!r}")

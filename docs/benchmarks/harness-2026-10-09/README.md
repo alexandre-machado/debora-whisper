@@ -111,6 +111,37 @@ O Claude confirmou a negação, não tentou outro comando, e `result` incluiu
 o Bash em `permission_denials`. A aplicação usa o mesmo formato, nega
 pedidos por padrão e registra ferramentas, pedidos e decisões em `app.log`.
 
+## Memória de voz e `--add-dir`
+
+Verificação manual em 2026-10-09 com o mesmo `claude.exe` 2.1.295, usando
+`HarnessSession` já com a memória integrada, cwd temporário e estes argumentos
+além do comando base: `--permission-prompt-tool stdio --add-dir
+C:\Users\alexandre-machado\.debora\harness`. O arquivo configurado foi
+`~/.debora/harness/voice-memory-probe-<uuid>.md`, descartável para não alterar
+a memória do usuário. A inicialização criou somente o cabeçalho e incluiu o
+caminho/conteúdo no prompt datado.
+
+| Operação real sob `acceptEdits` | Pedidos stdio | Resultado no disco |
+|---|---:|---|
+| `Read` + `Write` da correção no arquivo de memória | 0 | Conteúdo gravado |
+| `Read` + `Edit` de `dictation_engine.py` para `dictation_engine` | 0 | Conteúdo alterado |
+| `Write` em `~/.debora/voice-memory-outside-<uuid>.md` | 1, negado | Arquivo não criado |
+
+O pedido externo foi `can_use_tool`, ferramenta `Write`, com
+`decision_reason_type: "workingDir"` e motivo
+`Path is outside allowed working directories`; sugeria acrescentar
+`~/.debora` às pastas permitidas. O host negou e não aceitou essa sugestão.
+Arquivos de prova foram removidos ao terminar. `--add-dir` funcionou como
+esperado; nenhuma alternativa foi necessária. Isso verifica permissões de
+edição, não isolamento de leitura nem uma sandbox: permissões existentes
+continuam valendo, e `harness_cwd` na pasta pessoal já inclui `~/.debora`.
+
+A injeção retém as últimas 100 linhas completas dentro de 8 KiB e registra
+truncamento. O conteúdo é relido em cada início de processo, inclusive retomadas;
+editar a memória não reinicia um processo vivo. Só o caminho resolvido entra
+em `harness_key`, pois trocá-lo exige atualizar o prompt e a pasta permitida.
+Não foram executados suíte de testes nem revisão de segurança nesta tarefa.
+
 ## Prompt, retomada e integração
 
 `--append-system-prompt-file` funciona com stdin em stream-json: o arquivo

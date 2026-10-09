@@ -212,6 +212,7 @@ the default (`"voice_chat_backend": "local"`); speech recognition and TTS stay l
   "harness_permission_mode": "acceptEdits",
   "harness_permission_response": "deny",
   "harness_prompt_file": null,
+  "harness_memory_file": null,
   "language": "pt"
 }
 ```
@@ -223,6 +224,19 @@ Its folder supplies project context and settings. Débora supplies voice rules
 from its packaged prompt, plus language and process-start date/time, through a
 temporary file; it creates no context files in the project. `harness_prompt_file`
 overrides those rules (relative paths are resolved from the harness folder).
+
+Voice recognition corrections have their own memory, separate from Claude's shared
+auto-memory: `harness_memory_file: null` creates `~/.debora/harness/voice_memory.md`
+with a header on first use. A custom path is resolved from the harness folder;
+its parent should be a dedicated memory directory, passed to Claude with `--add-dir`.
+Only Débora launches inject this file (last 100 lines, at most 8 KiB; truncation is
+logged). Claude records recurring or user-corrected mistakes as
+`- "dictêixon engine" → dictation_engine.py (debora-whisper)` and keeps fewer than
+100 lines. Content edits do not restart Claude; the next process start reloads them.
+Changing the file path restarts it on the next turn. Ordinary terminal sessions
+are not configured to load this file. `--add-dir` adds edit permission for the memory
+directory; it does not restrict existing permissions or the working directory
+(using your home as `harness_cwd` already includes `~/.debora`).
 
 Permissions already allowed by Claude's mode/settings proceed normally. Pending
 requests are denied and logged by default; `harness_permission_response: "allow"`
