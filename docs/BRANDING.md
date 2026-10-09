@@ -52,7 +52,7 @@ PyPI availability checked 2026-10-08: `debora-whisper`, `debora`,
 - [x] Pre-rename "NPU Whisper" Start Menu/Startup shortcuts replaced by `--install-shortcut`
 - [x] Display strings: tray, overlay, settings, history, onboarding, README, AGENTS.md
 - [x] Workflows smoke-test `debora` / `debora-cli`
-- [ ] Rename the GitHub repo to `debora-whisper` (README and pyproject URLs already point there)
+- [x] GitHub repo renamed to `alexandre-machado/debora-whisper`
 - [ ] Add a PyPI trusted publisher for the new `debora-whisper` project before the first `v*` tag
 - `npu-whisper` was never published on PyPI, so no redirect release is needed.
 

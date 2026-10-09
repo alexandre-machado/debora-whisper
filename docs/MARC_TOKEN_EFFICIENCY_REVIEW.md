@@ -19,8 +19,8 @@ Depois da invocação explícita de `$marc:tech-lead`, foram usados especialista
 via `dispatch_agent.py`, com implementação, revisão de segurança e revisão
 de correção funcional.
 
-- Issue principal: https://github.com/alexandre-machado/npu-whisper/issues/11
-- PR: https://github.com/alexandre-machado/npu-whisper/pull/12
+- Issue principal: https://github.com/alexandre-machado/debora-whisper/issues/11
+- PR: https://github.com/alexandre-machado/debora-whisper/pull/12
 - Commit final revisado: `c95350b6ab7a312488a384cf571c78086f9f38b9`.
 - Base do trabalho: `bab51c3c2b51857788cb64b4c0eb3bf18cb17bb3`.
 - Houve três rodadas de implementação/revisão; seis relatórios de revisão.
@@ -232,8 +232,8 @@ gravidade e relação com o objetivo.
 
 As revisões finais estão publicadas em:
 
-- https://github.com/alexandre-machado/npu-whisper/pull/12#issuecomment-5998798281
-- https://github.com/alexandre-machado/npu-whisper/pull/12#issuecomment-5998798701
+- https://github.com/alexandre-machado/debora-whisper/pull/12#issuecomment-5998798281
+- https://github.com/alexandre-machado/debora-whisper/pull/12#issuecomment-5998798701
 
 ## Pedido para a segunda opinião do Claude Code
 
