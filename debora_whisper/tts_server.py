@@ -186,6 +186,10 @@ def check_voice(voice) -> str | None:
         return voice
     if not isinstance(voice, str) or not voice.lower().endswith(VOICE_SUFFIXES):
         raise ValueError(f"voice must be one of {', '.join(VOICE_SUFFIXES)} files")
+    # Opening \\host\share\x.wav would make Windows log in to that host with
+    # the user's credentials (NTLM).
+    if voice.startswith(("\\\\", "//")) or os.path.abspath(voice).startswith(("\\\\", "//")):
+        raise ValueError("voice must be a local file, not a network path")
     if not os.path.isfile(voice):
         raise ValueError(f"voice {voice!r} not found")
     return voice
@@ -216,6 +220,12 @@ def make_handler(model, default_language: str):
         def do_POST(self):
             if self.path != "/tts":
                 return self._error(404, "not found")
+            # Web pages can POST to 127.0.0.1 too: browsers send an Origin,
+            # and a JSON body would need a CORS preflight this server never
+            # answers.
+            if self.headers.get("Origin") is not None or not (
+                    self.headers.get("Content-Type") or "").startswith("application/json"):
+                return self._error(403, "only local JSON clients")
             length = int(self.headers.get("Content-Length") or 0)
             if length <= 0 or length > MAX_BODY_BYTES:
                 return self._error(413, "body missing or too large")

@@ -222,7 +222,10 @@ def spoken_numbers(text: str, language) -> str:
         digits = m[0]
         thousands, decimal = (",", ".") if language in _DOT_DECIMAL else (".", ",")
         digits = digits.replace(thousands, "").replace(decimal, ".")
-        return words(float(digits) if "." in digits else int(digits))
+        try:
+            return words(float(digits) if "." in digits else int(digits))
+        except Exception:  # OverflowError past 10**36: read the digits
+            return m[0]
 
     text = _DATE.sub(date, text)
     text = _TIME.sub(time_of_day, text)

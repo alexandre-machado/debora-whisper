@@ -5,6 +5,8 @@ import json
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -617,9 +619,36 @@ def test_tts_server_accepts_only_audio_files_as_voice(voices):
     assert tts_server.check_voice("") == ""
     assert tts_server.check_voice(str(voices / "isabel.wav")) == str(voices / "isabel.wav")
     (voices / "segredo.txt").write_text("x")
-    for bad in (str(voices / "segredo.txt"), str(voices / "falta.wav"), 3):
+    for bad in (str(voices / "segredo.txt"), str(voices / "falta.wav"), 3,
+                r"\\attacker\share\x.wav", "//attacker/share/x.wav"):
         with pytest.raises(ValueError):
             tts_server.check_voice(bad)
+
+
+@pytest.mark.parametrize("headers, status", [
+    ({"Content-Type": "application/json"}, 400),  # gets past the gate: empty text
+    ({"Content-Type": "text/plain"}, 403),
+    ({"Content-Type": "application/json", "Origin": "https://evil.example"}, 403),
+])
+def test_tts_server_refuses_requests_from_web_pages(headers, status):
+    from debora_whisper import tts_server
+    model = type("Model", (), {"sr": 24000, "conds": None})()
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), tts_server.make_handler(model, "pt"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{srv.server_port}/tts", data=b'{"text": ""}', headers=headers)
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+        assert error.value.code == status
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_numbers_too_big_to_spell_are_left_as_digits():
+    big = "1" * 40
+    assert vc.spoken_numbers(f"São {big} estrelas.", "pt") == f"São {big} estrelas."
 
 
 def test_tts_server_prepares_each_voice_once(voices):
