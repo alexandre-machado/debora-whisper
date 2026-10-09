@@ -130,3 +130,22 @@ def test_real_tk_text_and_balloon_ignore_other_monitors_font_scale(
         measurements.append((pill_bbox, bbox, width, height))
     assert measurements[0] == measurements[1]
     overlay._dismiss_balloon()
+
+
+def test_speaking_stays_until_the_next_state_and_shows_the_reply():
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    overlay._state = "processing"
+    overlay._show_balloon = True
+    overlay._cancel_timers = Mock()
+    overlay._animate = Mock()
+    overlay._show_balloon_popup = Mock()
+    overlay._root = Mock()
+
+    overlay.show_speaking("Oi,")
+    overlay.show_speaking("Oi, tudo bem!")
+
+    assert overlay._state == "speaking"
+    overlay._cancel_timers.assert_called_once()
+    overlay._animate.assert_called_once()
+    overlay._root.after.assert_not_called()  # no auto-return to Ready
+    assert overlay._show_balloon_popup.call_args.args == ("Oi, tudo bem!",)

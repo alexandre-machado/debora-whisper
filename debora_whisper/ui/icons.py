@@ -13,6 +13,7 @@ C_RECORDING_IDLE = "#7E22CE"   # Roxo mais escuro (Ocioso/Escutando sem áudio)
 C_RECORDING_ACTIVE = "#A855F7" # Roxo vibrante (Escutando com áudio passando)
 C_PROCESSING = "#8B5CF6" # Roxo (animado)
 C_LOADING = "#808080"    # Cinza (animado)
+C_SPEAKING = "#0A84FF"   # Azul (animado): o chat de voz fala a resposta
 
 def render_bars(color, heights, size=ICON_SIZE):
     """Renderiza um ícone com 5 barras verticais de tamanhos variáveis."""
@@ -60,6 +61,12 @@ for i in range(8):
     h = [0.5 + 0.35 * math.sin(offset + (j * math.pi / 2.5)) for j in range(5)]
     _LOADING_FRAMES.append(render_bars(C_LOADING, h))
 
+_SPEAKING_FRAMES = []
+for i in range(12):
+    offset = i * (2 * math.pi / 12)
+    h = [0.45 + 0.4 * abs(math.sin(offset + j * 1.3)) for j in range(5)]
+    _SPEAKING_FRAMES.append(render_bars(C_SPEAKING, h))
+
 # Matriz de volume dinâmico (pré-gerada para poupar CPU)
 # 11 níveis de volume (0.0 a 1.0)
 _VOLUME_MATRIX = []
@@ -104,6 +111,8 @@ def get_icon(state: str, frame: int = 0) -> Image.Image:
         return _LOADING_FRAMES[frame % len(_LOADING_FRAMES)]
     elif state == "processing":
         return _PROCESSING_FRAMES[frame % len(_PROCESSING_FRAMES)]
+    elif state == "speaking":
+        return _SPEAKING_FRAMES[frame % len(_SPEAKING_FRAMES)]
     elif state == "recording":
         return _ICON_RECORDING_IDLE
     elif state == "error":
@@ -123,6 +132,7 @@ def icon_ready() -> Image.Image: return get_icon("ready", 0)
 def icon_recording() -> Image.Image: return get_icon("recording", 0)
 def icon_processing() -> Image.Image: return get_icon("processing", 0)
 def icon_error() -> Image.Image: return get_icon("error", 0)
+def icon_speaking() -> Image.Image: return get_icon("speaking", 0)
 
 STATE_ICONS = {
     "loading": icon_loading,
@@ -130,4 +140,5 @@ STATE_ICONS = {
     "recording": icon_recording,
     "processing": icon_processing,
     "error": icon_error,
+    "speaking": icon_speaking,
 }

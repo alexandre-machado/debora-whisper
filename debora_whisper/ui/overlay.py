@@ -45,6 +45,7 @@ class OverlayWindow:
     RED = "#FF453A"
     VIOLET = "#8B5CF6"
     AMBER = "#FF9F0A"
+    BLUE = "#0A84FF"
     GRAY = "#48484A"
     WAVE_COLOR = "#A78BFA"
 
@@ -389,6 +390,12 @@ class OverlayWindow:
             text_items.append((w // 2 + int(6 * s), mid, "Transcribing...",
                                self.TEXT, ("Segoe UI", font_size, "bold"), "center"))
 
+        elif self._state == "speaking":
+            dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.BLUE))
+            self._paste_centered(frame, dot, bx, mid)
+            text_items.append((w // 2 + int(6 * s), mid, "Speaking...",
+                               self.TEXT, ("Segoe UI", font_size, "bold"), "center"))
+
         elif self._state == "result":
             dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.GREEN))
             self._paste_centered(frame, dot, bx, mid)
@@ -418,7 +425,7 @@ class OverlayWindow:
 
     def _on_drag_start(self, event):
         """Click on dot -> toggle recording. Click elsewhere -> start drag."""
-        if event.x <= self._DOT_HIT_X * self._scale and self._state in ("ready", "recording"):
+        if event.x <= self._DOT_HIT_X * self._scale and self._state in ("ready", "recording", "speaking"):
             # Clicked the dot button — toggle recording
             self._drag_is_click = True
             if self._on_toggle:
@@ -455,7 +462,7 @@ class OverlayWindow:
 
     def _on_mouse_move(self, event):
         """Show hand cursor when over the dot button area."""
-        if event.x <= self._DOT_HIT_X * self._scale and self._state in ("ready", "recording"):
+        if event.x <= self._DOT_HIT_X * self._scale and self._state in ("ready", "recording", "speaking"):
             self._canvas.configure(cursor="hand2")
         else:
             self._canvas.configure(cursor="")
@@ -552,6 +559,16 @@ class OverlayWindow:
         self._result_text = text
         self._animate(self.COMPACT_W, self.COMPACT_H)
         self._auto_hide_id = self._root.after(2500, self.show_ready)
+        if self._show_balloon and text.strip():
+            self._show_balloon_popup(text)
+
+    def show_speaking(self, text: str):
+        """Blue dot — voice chat speaks its reply (shown in the balloon). It
+        stays until the next state: the reply is not done until it is said."""
+        if self._state != "speaking":
+            self._cancel_timers()
+            self._state = "speaking"
+            self._animate(self.EXPANDED_W, self.COMPACT_H)
         if self._show_balloon and text.strip():
             self._show_balloon_popup(text)
 

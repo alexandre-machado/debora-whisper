@@ -224,6 +224,7 @@ class AppState(Enum):
     READY = "ready"            # Idle, waiting for hotkey
     RECORDING = "recording"    # Microphone active
     PROCESSING = "processing"  # Transcribing audio
+    SPEAKING = "speaking"      # Voice chat: the reply is being spoken
     ERROR = "error"            # Device lost or load failed
 
 
@@ -2953,7 +2954,7 @@ class DictationApp:
         self.recorder.set_muted(True)
         try:
             reply = self.voice_chat.respond(
-                text, on_reply=lambda r: self._set_state(AppState.READY, {"text": r}))
+                text, on_reply=lambda r: self._set_state(AppState.SPEAKING, {"text": r}))
         finally:
             self.recorder.set_muted(False)
         if not reply and self.config["beep_on_start"]:

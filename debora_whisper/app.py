@@ -187,6 +187,11 @@ class GUIApp:
             self._overlay.show_recording(draft)
             self._start_audio_polling()
 
+        elif state == AppState.SPEAKING:
+            self._stop_audio_polling()
+            self._tray.update_state(state_name, "Débora Whisper — Speaking...")
+            self._overlay.show_speaking(data.get("text", ""))
+
         elif state == AppState.PROCESSING:
             self._stop_audio_polling()
             self._tray.update_state(state_name, "Débora Whisper — Transcribing...")

@@ -138,7 +138,7 @@ class TrayManager:
             if state == "recording":
                 image = get_volume_icon(self._level)
                 interval = 0.1
-            elif state in ("loading", "processing"):
+            elif state in ("loading", "processing", "speaking"):
                 self._anim_frame += 1
                 image = get_icon(state, self._anim_frame)
                 interval = 0.15

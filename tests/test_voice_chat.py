@@ -314,6 +314,27 @@ def test_final_text_goes_to_the_llm_and_nothing_is_typed(typed):
     assert states[-1] == (de.AppState.READY, {"text": "Tudo ótimo!"})
 
 
+def test_the_reply_shows_as_speaking_never_as_ready(typed):
+    """While the reply is said the app is not idle: no green Ready until it
+    is done, and in continuous listening not even then."""
+    app = _app(voice_chat=True, continuous_listening=True)
+    app.is_recording = True
+    states = []
+    app.add_callback(lambda s, d: states.append((s, d)))
+
+    def respond(text, on_reply):
+        on_reply("Oi,")
+        on_reply("Oi, tudo bem!")
+        return "Oi, tudo bem!"
+    with patch.object(app.voice_chat, "respond", side_effect=respond):
+        _say(app, "oi")
+    kinds = [s for s, _ in states]
+    assert de.AppState.READY not in kinds
+    assert states[-3:] == [(de.AppState.SPEAKING, {"text": "Oi,"}),
+                           (de.AppState.SPEAKING, {"text": "Oi, tudo bem!"}),
+                           (de.AppState.RECORDING, {"draft_text": ""})]
+
+
 def test_microphone_is_muted_while_the_reply_plays(typed):
     app = _app(voice_chat=True)
     calls = []
