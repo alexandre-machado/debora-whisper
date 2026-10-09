@@ -35,23 +35,23 @@ def _drop(names):
 def _under_test():
     """Import app.py, falling back to stubs only for a real missing dependency."""
     try:
-        from npu_whisper.app import GUIApp
+        from debora_whisper.app import GUIApp
         return GUIApp
     except ImportError:
         pass
 
-    _drop([n for n in sys.modules if n == "npu_whisper.app" or n.startswith("npu_whisper.ui.")])
+    _drop([n for n in sys.modules if n == "debora_whisper.app" or n.startswith("debora_whisper.ui.")])
     injected = [n for n in _GUI_STACK if n not in sys.modules]
     for _n in injected:
         sys.modules[_n] = MagicMock()
     try:
-        from npu_whisper.app import GUIApp
+        from debora_whisper.app import GUIApp
         return GUIApp
     finally:
         # Drop the stubs AND the mock-tainted modules they were imported into,
         # so nothing downstream can resolve to a mock.
         _drop(injected)
-        _drop([n for n in sys.modules if n == "npu_whisper.app" or n.startswith("npu_whisper.ui.")])
+        _drop([n for n in sys.modules if n == "debora_whisper.app" or n.startswith("debora_whisper.ui.")])
 
 
 GUIApp = _under_test()
@@ -64,7 +64,7 @@ GUIApp = _under_test()
     ('max_record_seconds', 30),
 ])
 def test_audio_settings_restart_engine(key, value):
-    from npu_whisper.dictation_engine import DEFAULT_CONFIG
+    from debora_whisper.dictation_engine import DEFAULT_CONFIG
     app = GUIApp.__new__(GUIApp)
     app._config = dict(DEFAULT_CONFIG)
     if key == 'beep_on_start':
@@ -93,7 +93,7 @@ def test_overlay_and_tray_toggle_follow_replaced_engine():
     """Settings replaces the engine; the overlay dot and the tray menu item
     must drive the new engine, not the stopped one they were built with."""
     from types import SimpleNamespace
-    from npu_whisper.dictation_engine import DEFAULT_CONFIG
+    from debora_whisper.dictation_engine import DEFAULT_CONFIG
 
     g = GUIApp.__init__.__globals__
     RealTray, RealOverlay = g["TrayManager"], g["OverlayWindow"]
@@ -116,7 +116,7 @@ def test_overlay_and_tray_toggle_follow_replaced_engine():
     with patch.dict(g, {"ctk": MagicMock(), "DictationApp": factory,
                         "OverlayWindow": CapturingOverlay,
                         "save_config": MagicMock()}), \
-            patch("npu_whisper.ui.icons.render_app_icon"), patch("PIL.ImageTk.PhotoImage"):
+            patch("debora_whisper.ui.icons.render_app_icon"), patch("PIL.ImageTk.PhotoImage"):
         app = GUIApp(config)  # real __init__ wiring
         app._settings_win = None
         app._on_settings_apply({**config, "beep_on_start": not config["beep_on_start"]})
@@ -126,9 +126,10 @@ def test_overlay_and_tray_toggle_follow_replaced_engine():
     assert isinstance(app._tray, RealTray)
     app._tray._on_toggle_click()
     # Real overlay dot-click handler, given the callback __init__ passed in.
-    overlay = SimpleNamespace(_DOT_HIT_X=10, _scale=1.0, _state="ready", _drag_is_click=False,
+    overlay = SimpleNamespace(_CLICK_STATES=RealOverlay._CLICK_STATES, _state="ready",
                               _on_toggle=captured["on_toggle"])
     RealOverlay._on_drag_start(overlay, SimpleNamespace(x=0, y=0))
+    RealOverlay._on_drag_end(overlay, SimpleNamespace(x=0, y=0))
 
     assert second.toggle_recording.call_count == 2
     first.toggle_recording.assert_not_called()

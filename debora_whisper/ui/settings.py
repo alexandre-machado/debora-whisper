@@ -120,7 +120,7 @@ class SettingsWindow:
             return
 
         self._win = ctk.CTkToplevel(self._root)
-        self._win.title("NPU Dictation — Settings")
+        self._win.title("Débora Whisper — Settings")
         self._win.geometry("540x780")
         self._win.resizable(False, False)
         self._win.configure(fg_color=_CONTENT_BG)
@@ -128,12 +128,12 @@ class SettingsWindow:
         self._win.update_idletasks()
 
         # Title bar color via DWM
-        from npu_whisper.ui.glass import set_title_bar_color
+        from debora_whisper.ui.glass import set_title_bar_color
         set_title_bar_color(self._win, _HEADER_BG, "#FFFFFF")
 
         # Window icon — set _iconbitmap_method_called to prevent CTkToplevel
         # from overriding with its default icon at 200ms
-        from npu_whisper.ui.icons import render_app_icon
+        from debora_whisper.ui.icons import render_app_icon
         from PIL import ImageTk
         self._icon_photo = ImageTk.PhotoImage(render_app_icon(32))
         self._win._iconbitmap_method_called = True
@@ -152,7 +152,7 @@ class SettingsWindow:
         ctk.CTkLabel(header, image=self._logo_photo, text="",
                      fg_color="transparent").pack(side="left", padx=(16, 0))
         ctk.CTkLabel(
-            header, text="NPU Dictation", fg_color="transparent",
+            header, text="Débora Whisper", fg_color="transparent",
             font=ctk.CTkFont(size=14, weight="bold"), text_color="#FFFFFF",
         ).pack(side="left", padx=(8, 0))
         ctk.CTkLabel(
@@ -207,7 +207,7 @@ class SettingsWindow:
             font=ctk.CTkFont(size=13, weight="bold"), text_color=_SECTION_TEXT,
         ).pack(**pad, anchor="w")
 
-        from npu_whisper.dictation_engine import LANGUAGES
+        from debora_whisper.dictation_engine import LANGUAGES
         self._lang_codes = list(LANGUAGES.keys())
         lang_display = list(LANGUAGES.values())
         current_lang = self._config.get("language", "en")
@@ -330,7 +330,7 @@ class SettingsWindow:
 
     def _get_selected_lang_code(self) -> str:
         """Convert display name back to language code."""
-        from npu_whisper.dictation_engine import LANGUAGES
+        from debora_whisper.dictation_engine import LANGUAGES
         display = self._lang_var.get()
         for code, name in LANGUAGES.items():
             if name == display:
@@ -341,7 +341,7 @@ class SettingsWindow:
         """Rebuild model list when language changes."""
         current_model = self._model_radio_var.get()
         self._build_model_list()
-        from npu_whisper.dictation_engine import get_models_for_language
+        from debora_whisper.dictation_engine import get_models_for_language
         lang_code = self._get_selected_lang_code()
         available = get_models_for_language(lang_code)
         if current_model not in available:
@@ -350,7 +350,7 @@ class SettingsWindow:
 
     def _build_model_list(self):
         """Build/rebuild the model radio button list based on selected language."""
-        from npu_whisper.dictation_engine import (
+        from debora_whisper.dictation_engine import (
             get_models_for_language, is_model_downloaded, MODEL_REGISTRY,
         )
 
@@ -416,7 +416,7 @@ class SettingsWindow:
             new_config["balloon_font_size"] = int(self._font_size_var.get())
         except ValueError:
             new_config["balloon_font_size"] = 16
-        from npu_whisper.dictation_engine import detect_devices, select_device
+        from debora_whisper.dictation_engine import detect_devices, select_device
         new_config["device"] = select_device(new_config, detect_devices()) or "CPU"
         return new_config
 

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from npu_whisper.dictation_engine import (
+from debora_whisper.dictation_engine import (
     MODEL_REGISTRY, DictationApp, DEFAULT_CONFIG,
     create_model, ParakeetNPU, WhisperNPU,
     LANGUAGES, PARAKEET_UPSTREAM_LANGUAGES,
@@ -45,13 +45,13 @@ class TestParakeetRegistry:
 class TestCreateModel:
     """Verify factory function dispatches correctly."""
 
-    @patch("npu_whisper.dictation_engine.WhisperNPU")
+    @patch("debora_whisper.dictation_engine.WhisperNPU")
     def test_creates_whisper_for_whisper_backend(self, mock_cls):
         mock_cls.return_value = MagicMock()
         result = create_model(Path("/fake"), device="NPU", backend="whisper")
         mock_cls.assert_called_once_with(Path("/fake"), device="NPU")
 
-    @patch("npu_whisper.dictation_engine.ParakeetNPU")
+    @patch("debora_whisper.dictation_engine.ParakeetNPU")
     def test_creates_parakeet_for_parakeet_backend(self, mock_cls):
         mock_cls.return_value = MagicMock()
         result = create_model(Path("/fake"), device="NPU", backend="parakeet")
@@ -61,8 +61,8 @@ class TestCreateModel:
 class TestEnsureModelDispatch:
     """Verify ensure_model uses factory pattern."""
 
-    @patch("npu_whisper.dictation_engine.create_model")
-    @patch("npu_whisper.dictation_engine.setup_model")
+    @patch("debora_whisper.dictation_engine.create_model")
+    @patch("debora_whisper.dictation_engine.setup_model")
     def test_ensure_model_parakeet(self, mock_setup, mock_create):
         mock_setup.return_value = Path("/fake/parakeet")
         mock_create.return_value = MagicMock()
@@ -76,8 +76,8 @@ class TestEnsureModelDispatch:
             model_size="parakeet"
         )
 
-    @patch("npu_whisper.dictation_engine.create_model")
-    @patch("npu_whisper.dictation_engine.setup_model")
+    @patch("debora_whisper.dictation_engine.create_model")
+    @patch("debora_whisper.dictation_engine.setup_model")
     def test_ensure_model_whisper(self, mock_setup, mock_create):
         mock_setup.return_value = Path("/fake/whisper")
         mock_create.return_value = MagicMock()
@@ -96,13 +96,13 @@ class TestParakeetConfig:
     """Verify parakeet works with config validation."""
 
     def test_parakeet_config_validates(self):
-        from npu_whisper.dictation_engine import validate_config
+        from debora_whisper.dictation_engine import validate_config
         config = {**DEFAULT_CONFIG, "model_size": "parakeet", "device": "NPU"}
         # Should not raise
         validate_config(config)
 
     def test_invalid_model_still_rejected(self):
-        from npu_whisper.dictation_engine import validate_config
+        from debora_whisper.dictation_engine import validate_config
         config = {**DEFAULT_CONFIG, "model_size": "nonexistent"}
         with pytest.raises(ValueError, match="model_size"):
             validate_config(config)
@@ -286,16 +286,16 @@ class TestModelDownloadStatus:
     """Verify download status detection."""
 
     def test_nonexistent_model_not_downloaded(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("npu_whisper.dictation_engine.MODEL_DIR", tmp_path)
+        monkeypatch.setattr("debora_whisper.dictation_engine.MODEL_DIR", tmp_path)
         assert is_model_downloaded("base") is False
 
     def test_empty_dir_not_downloaded(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("npu_whisper.dictation_engine.MODEL_DIR", tmp_path)
+        monkeypatch.setattr("debora_whisper.dictation_engine.MODEL_DIR", tmp_path)
         (tmp_path / "whisper-base-openvino").mkdir()
         assert is_model_downloaded("base") is False
 
     def test_dir_with_xml_is_downloaded(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("npu_whisper.dictation_engine.MODEL_DIR", tmp_path)
+        monkeypatch.setattr("debora_whisper.dictation_engine.MODEL_DIR", tmp_path)
         model_dir = tmp_path / "whisper-base-openvino"
         model_dir.mkdir()
         (model_dir / "model.xml").write_text("")
@@ -305,7 +305,7 @@ class TestModelDownloadStatus:
     def test_interrupted_download_is_not_downloaded(self, tmp_path, monkeypatch):
         """The .xml files arrive first; missing or empty weights mean the
         download stopped and must resume, not load."""
-        monkeypatch.setattr("npu_whisper.dictation_engine.MODEL_DIR", tmp_path)
+        monkeypatch.setattr("debora_whisper.dictation_engine.MODEL_DIR", tmp_path)
         model_dir = tmp_path / "whisper-base-openvino"
         model_dir.mkdir()
         for name in ("encoder", "decoder"):
@@ -316,7 +316,7 @@ class TestModelDownloadStatus:
         assert is_model_downloaded("base") is False
 
     def test_dir_with_onnx_is_downloaded(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("npu_whisper.dictation_engine.MODEL_DIR", tmp_path)
+        monkeypatch.setattr("debora_whisper.dictation_engine.MODEL_DIR", tmp_path)
         model_dir = tmp_path / "parakeet-tdt-openvino"
         model_dir.mkdir()
         (model_dir / "encoder-model.onnx").write_text("")

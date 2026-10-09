@@ -1,5 +1,5 @@
 """Continuous mode must skip drafts that newer queued audio already covers."""
-from npu_whisper.dictation_engine import drop_superseded_drafts
+from debora_whisper.dictation_engine import drop_superseded_drafts
 
 
 def _d(tag):

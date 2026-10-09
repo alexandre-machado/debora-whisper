@@ -4,7 +4,7 @@ import time
 import numpy as np
 import pytest
 
-from npu_whisper.dictation_engine import AudioRecorder
+from debora_whisper.dictation_engine import AudioRecorder
 
 
 class TestAudioRecorderThreadSafety:

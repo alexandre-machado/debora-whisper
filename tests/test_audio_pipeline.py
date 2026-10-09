@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from npu_whisper import dictation_engine as engine
+from debora_whisper import dictation_engine as engine
 
 
 @pytest.fixture

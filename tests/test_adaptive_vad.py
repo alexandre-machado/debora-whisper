@@ -4,8 +4,8 @@ import queue
 import numpy as np
 import pytest
 
-from npu_whisper import dictation_engine as de
-from npu_whisper.vad_endpoint import AdaptiveEndpoint, VadSegment, incomplete_sentence
+from debora_whisper import dictation_engine as de
+from debora_whisper.vad_endpoint import AdaptiveEndpoint, VadSegment, incomplete_sentence
 
 
 @pytest.mark.parametrize("text, expected", [

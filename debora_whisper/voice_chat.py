@@ -1,6 +1,6 @@
 """Voice chat: each final transcription goes to a local LLM (OpenVINO GenAI,
-in npu_whisper/llm_server.py's process) and its reply is spoken aloud by the Chatterbox TTS server
-(npu_whisper/tts_server.py, in its own uv environment).
+in debora_whisper/llm_server.py's process) and its reply is spoken aloud by the Chatterbox TTS server
+(debora_whisper/tts_server.py, in its own uv environment).
 
 The reply is streamed and spoken sentence by sentence: the first sentence
 plays while the LLM still writes the rest and the TTS renders the next one.
@@ -23,8 +23,8 @@ import urllib.request
 import wave
 from pathlib import Path
 
-from npu_whisper import paths
-from npu_whisper.processes import NO_WINDOW, kill_tree, python_executable
+from debora_whisper import paths
+from debora_whisper.processes import NO_WINDOW, kill_tree, python_executable
 
 DEFAULT_VOICE_CHAT_PROMPT = (
     "You are a voice assistant. The user talks to you through a speech "
@@ -80,7 +80,7 @@ def split_sentences(buffer: str) -> tuple[list[str], str]:
 
 
 # ---------------------------------------------------------------------------
-# LLM (OpenVINO GenAI, in npu_whisper/llm_server.py's process)
+# LLM (OpenVINO GenAI, in debora_whisper/llm_server.py's process)
 # ---------------------------------------------------------------------------
 # A first compile on the Arc iGPU, without the cache, can take minutes.
 LLM_LOAD_TIMEOUT = 600
@@ -103,7 +103,7 @@ def download_llm(config: dict, log=print) -> str:
 
 
 def llm_command(model_dir: str, device: str) -> list[str]:
-    return [python_executable(), "-m", "npu_whisper.llm_server", model_dir, device,
+    return [python_executable(), "-m", "debora_whisper.llm_server", model_dir, device,
             str(paths.CACHE_DIR)]
 
 
@@ -471,7 +471,7 @@ class VoiceChat:
         if language and language != "auto":
             # A short "Sim." alone does not tell the model the language:
             # it answered in English.
-            from npu_whisper.dictation_engine import LANGUAGES
+            from debora_whisper.dictation_engine import LANGUAGES
             name = LANGUAGES.get(language, language)
             prompt += f" The user speaks {name}: reply in {name}."
         # Without it, asked the time at 00:25, it said 10 in the morning.

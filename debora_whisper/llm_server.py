@@ -4,7 +4,7 @@ Building an LLMPipeline holds the GIL for the whole compile: inside the app
 that froze the tray, the overlay and the hotkey (4 s with a warm cache, much
 longer without). Here only this process waits.
 
-    python -m npu_whisper.llm_server <model_dir> <device> <cache_dir>
+    python -m debora_whisper.llm_server <model_dir> <device> <cache_dir>
 
 One JSON object per line. On stdout:
     {"ready": "GPU", "seconds": 4.2}    loaded (on the CPU if the device failed)

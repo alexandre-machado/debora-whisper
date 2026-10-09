@@ -1,10 +1,14 @@
-# NPU Whisper
-
-Local voice-to-text dictation for Windows, powered by Intel NPU via OpenVINO. Press a hotkey, speak, and text appears at your cursor. Zero cloud, zero cost, zero data leaving your machine.
+# Débora Whisper
 
 ![Windows](https://img.shields.io/badge/platform-Windows%2011-0078D4?logo=windows)
 ![Python](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
+
+> **⚠️ Prototyping Phase:** Débora Whisper is currently in a prototyping phase. Features, branding, and our holographic cyber-fairy mascot are actively being developed.
+> 
+> <img src="docs/assets/branding/mascot_concept_matrix.jpg" width="600" alt="Mascot Concept Art">
+
+Local voice-to-text dictation for Windows, on Intel NPU or iGPU via OpenVINO, NVIDIA RTX via faster-whisper, or CPU. Press a hotkey, speak, and text appears at your cursor. Zero cloud, zero cost, zero data leaving your machine.
 
 ## Features
 
@@ -36,38 +40,38 @@ fetches a matching Python if you have none:
 winget install astral-sh.uv
 
 # NPU / Intel iGPU / CPU only
-uv tool install git+https://github.com/alexandre-machado/npu-whisper
+uv tool install git+https://github.com/alexandre-machado/debora-whisper
 
 # ...or with the NVIDIA RTX backend (adds ~2 GB of CUDA libraries)
-uv tool install "npu-whisper[cuda] @ git+https://github.com/alexandre-machado/npu-whisper"
+uv tool install "debora-whisper[cuda] @ git+https://github.com/alexandre-machado/debora-whisper"
 
-npu-whisper-cli --setup   # detect devices, download the model, warm the cache
-npu-whisper               # tray app + overlay
-npu-whisper-cli           # console-only mode
+debora-cli --setup          # detect devices, download the model, warm the cache
+debora                      # tray app + overlay
+debora-cli                  # console-only mode
 ```
 
 To launch it from the Start Menu (no console window), optionally also at sign-in:
 
 ```powershell
-npu-whisper --install-shortcut              # Start Menu entry "NPU Whisper"
-npu-whisper --install-shortcut --autostart  # ...and start with Windows
+debora --install-shortcut              # Start Menu entry "Débora Whisper"
+debora --install-shortcut --autostart  # ...and start with Windows
 ```
 
 Only one tray app runs at a time; launching a second one exits quietly. The
 shortcut points at the Python of the current install: after reinstalling
 (`uv tool install --reinstall`, a new Python), run `--install-shortcut` again.
 
-Update with `uv tool upgrade npu-whisper`. To remove, run
-`npu-whisper --remove-shortcut` first, then `uv tool uninstall npu-whisper`
-(models and config stay in `~/.npu-dictation/`). Once published to PyPI, the
-same works with `uv tool install npu-whisper` or a one-off `uvx npu-whisper`.
+Update with `uv tool upgrade debora-whisper`. To remove, run
+`debora --remove-shortcut` first, then `uv tool uninstall debora-whisper`
+(models and config stay in `~/.debora/`). Once published to PyPI, the
+same works with `uv tool install debora-whisper` or a one-off `uvx debora-whisper`.
 
 ### From a source checkout
 
 ```powershell
 # 1. Clone
-git clone https://github.com/Goodsmileduck/npu-whisper.git
-cd npu-whisper
+git clone https://github.com/alexandre-machado/debora-whisper.git
+cd debora-whisper
 
 # 2. First-time setup (creates venv, installs deps, downloads model, warms NPU cache)
 .\Start-Dictation.ps1 -Setup
@@ -145,7 +149,7 @@ Pastes text and presses Enter automatically — speak your prompt and it submits
 
 ## Configuration
 
-Stored at `~/.npu-dictation/config.json`:
+Stored at `~/.debora/config.json`:
 
 ```json
 {
@@ -225,12 +229,12 @@ loaded until the app exits, so switching back is instant.
 ```
 
 The LLM runs with OpenVINO GenAI, the same runtime as Whisper, in a process
-of its own (`npu_whisper/llm_server.py`, started by the app with its own
+of its own (`debora_whisper/llm_server.py`, started by the app with its own
 Python: nothing to install). Loading it holds Python's GIL for the whole
 compile, which froze the app when it ran inside it. While it compiles on the
 iGPU no transcription runs: both times the two overlapped, the NPU was lost.
 A load that takes over 10 minutes is killed. It logs to
-`~/.npu-dictation/logs/llm_server.log`. `llm_model` is a Hugging Face repo with an OpenVINO
+`~/.debora/logs/llm_server.log`. `llm_model` is a Hugging Face repo with an OpenVINO
 export (downloaded on first use into the Hugging Face cache) or a local
 directory. On a Core Ultra 9 185H, the default answers in under a second at
 ~15 tokens/s on the Arc iGPU (`"llm_device": "GPU"`); if the device fails it
@@ -238,12 +242,12 @@ loads on the CPU. Qwen3's thinking is turned off. `llm_prompt: null` uses the
 built-in voice-assistant prompt.
 
 The TTS is Chatterbox Multilingual on an NVIDIA GPU, served by
-`npu_whisper/tts_server.py`. It needs torch 2.6 with CUDA, so it never runs in
+`debora_whisper/tts_server.py`. It needs torch 2.6 with CUDA, so it never runs in
 the app's environment: the script declares its own dependencies and the app
 starts it with `uv run --script` (uv builds that environment on the first run,
 a few GB, and caches it). It is started only when nothing answers at
 `tts_url`, stopped when the app exits, and logs to
-`~/.npu-dictation/logs/tts_server.log`. `tts_server_command` replaces that
+`~/.debora/logs/tts_server.log`. `tts_server_command` replaces that
 command line (a list of arguments).
 
 `tts_voice` clones a voice from ~10 s of clean speech: a WAV path, or a name
@@ -264,17 +268,23 @@ Changing the model, device, hotkey, chime, sample rate or maximum recording leng
 
 | Path | Purpose |
 |------|---------|
-| `~/.npu-dictation/config.json` | User configuration |
-| `~/.npu-dictation/logs/` | `app.log`, `telemetry.log`, `tts_server.log`, `llm_server.log`; the first three with `[YYYY-MM-DD HH:MM:SS] message` lines; at startup a log over 5 MB moves to `<name>.1` |
-| `~/.npu-dictation/npu_lost.json` | An NPU lost to DEVICE_LOST: startup uses the next device and probes the NPU in the background (cleared when a probe passes or Windows restarts) |
-| `~/.npu-dictation/models/` | Downloaded model files |
-| `~/.npu-dictation/ov-cache/` | OpenVINO compilation cache (do not delete) |
-| `~/.npu-dictation/voices/` | Voices for `tts_voice` by name |
+| `~/.debora/config.json` | User configuration |
+| `~/.debora/logs/` | `app.log`, `telemetry.log`, `tts_server.log`, `llm_server.log`; the first three with `[YYYY-MM-DD HH:MM:SS] message` lines; at startup a log over 5 MB moves to `<name>.1` |
+| `~/.debora/npu_lost.json` | An NPU lost to DEVICE_LOST: startup uses the next device and probes the NPU in the background (cleared when a probe passes or Windows restarts) |
+| `~/.debora/models/` | Downloaded model files |
+| `~/.debora/ov-cache/` | OpenVINO compilation cache (do not delete) |
+| `~/.debora/voices/` | Voices for `tts_voice` by name |
 
 With the `MODELS_DIR` environment variable set (a shared models folder), the
-models and cache move to `$MODELS_DIR/npu-whisper/` and the voices to
+models and cache move to `$MODELS_DIR/debora-whisper/` and the voices to
 `$MODELS_DIR/voices/`. Models taken from the Hugging Face cache (the voice
 chat LLM, faster-whisper on CUDA, Chatterbox) follow `HF_HOME`.
+
+The project was called NPU Whisper before. On its first run Débora Whisper
+moves `~/.npu-dictation/` to `~/.debora/` (and `$MODELS_DIR/npu-whisper/` to
+`$MODELS_DIR/debora-whisper/`), and `--install-shortcut` replaces the old
+"NPU Whisper" shortcuts. If an older copy of the app is still running, the old
+folder stays in use until the next start.
 
 ## How It Works
 
@@ -306,7 +316,7 @@ The model runs **100% locally** on your Intel NPU. No internet required after in
 
 NPU only supports static (fixed) input shapes, so the Parakeet encoder can't
 just size itself to each utterance. Instead it's **shape-bucketed**: several
-fixed-size graphs (`ParakeetNPU.MEL_BUCKETS` in `npu_whisper/dictation_engine.py`) are
+fixed-size graphs (`ParakeetNPU.MEL_BUCKETS` in `debora_whisper/dictation_engine.py`) are
 compiled and cached up front, and each utterance runs on the smallest bucket
 it fits in, instead of always paying for the longest one. Audio longer than
 the largest bucket is truncated (never crashes), and this is logged, not
@@ -371,7 +381,7 @@ OpenVINO compiles the model graph for your specific NPU on first launch. This ta
 When the error is attributed to one device, the GUI falls back to the next healthy device in `device_priority`. After an NPU loss it probes the NPU in the background (after 30 s, 1 min, 5 min and 15 min) and moves back once it works; a reboot also resets it. Each probe runs in a separate process, killed after 5 minutes: right after a loss, loading a model on the NPU can hang in the driver or recompile for ~3 minutes, and either one inside the app froze it, Ctrl+C included. Later runs also start on the next device and probe the NPU the same way, until a probe passes.
 
 ### GPU failed: restart required
-OpenVINO GPU errors such as `CL_OUT_OF_RESOURCES`, or a device loss that cannot be pinned on the NPU (Parakeet runs its decoder on the GPU, and a loss during its GPU fallback compile is blamed on the GPU even if the NPU failed first), can leave the OpenCL context in a state where further calls hang. The app does not retry or reload after that, on the GPU or on any other device. Recording and transcription stay disabled, and Settings changes are saved but not applied (the tray menu marks them "after restart"), until you quit and restart the app. The original OpenVINO error is written to `~/.npu-dictation/logs/app.log`. If the failure repeats, select NPU or CPU in Settings, then restart. Disabling the retry only prevents a hang; it does not fix the driver or memory problem behind the error.
+OpenVINO GPU errors such as `CL_OUT_OF_RESOURCES`, or a device loss that cannot be pinned on the NPU (Parakeet runs its decoder on the GPU, and a loss during its GPU fallback compile is blamed on the GPU even if the NPU failed first), can leave the OpenCL context in a state where further calls hang. The app does not retry or reload after that, on the GPU or on any other device. Recording and transcription stay disabled, and Settings changes are saved but not applied (the tray menu marks them "after restart"), until you quit and restart the app. The original OpenVINO error is written to `~/.debora/logs/app.log`. If the failure repeats, select NPU or CPU in Settings, then restart. Disabling the retry only prevents a hang; it does not fix the driver or memory problem behind the error.
 
 ### Hotkey doesn't work
 - PowerShell must run as **Administrator** (the `keyboard` library requires elevated privileges)
@@ -398,17 +408,17 @@ python -m pytest tests/ -q
 
 # Auto-reload during development
 pip install watchfiles
-watchfiles "python -m npu_whisper" npu_whisper
+watchfiles "python -m debora_whisper" debora_whisper
 ```
 
-Code lives in the `npu_whisper` package: `app.py` (tray app, `npu-whisper`),
-`dictation_engine.py` (engine and console mode, `npu-whisper-cli`) and `ui/`.
+Code lives in the `debora_whisper` package: `app.py` (tray app, `debora`),
+`dictation_engine.py` (engine and console mode, `debora-cli`) and `ui/`.
 Dependencies are declared in `pyproject.toml`: runtime by default, plus the
 `cuda` (RTX), `export` (custom model export) and `test` extras.
 
 ### Releasing
 
-Bump `__version__` in `npu_whisper/__init__.py`, then push a `vX.Y.Z` tag that
+Bump `__version__` in `debora_whisper/__init__.py`, then push a `vX.Y.Z` tag that
 matches it. The [Release workflow](.github/workflows/release.yml) builds the
 wheel and sdist, installs the wheel with `uv tool install` as a smoke test and
 publishes to PyPI through trusted publishing (the `pypi` environment must be

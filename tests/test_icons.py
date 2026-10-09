@@ -3,9 +3,9 @@
 import pytest
 from PIL import Image
 
-from npu_whisper.ui.icons import (
+from debora_whisper.ui.icons import (
     icon_loading, icon_ready, icon_recording, icon_processing, icon_error,
-    STATE_ICONS, ICON_SIZE,
+    icon_speaking, STATE_ICONS, ICON_SIZE,
 )
 
 
@@ -14,6 +14,7 @@ class TestIconGeneration:
 
     @pytest.mark.parametrize("fn", [
         icon_loading, icon_ready, icon_recording, icon_processing, icon_error,
+        icon_speaking,
     ])
     def test_icon_size_and_mode(self, fn):
         img = fn()
@@ -22,7 +23,7 @@ class TestIconGeneration:
         assert img.mode == "RGBA"
 
     def test_state_icons_dict_has_all_states(self):
-        expected = {"loading", "ready", "recording", "processing", "error"}
+        expected = {"loading", "ready", "recording", "processing", "error", "speaking"}
         assert set(STATE_ICONS.keys()) == expected
 
     def test_state_icons_callable(self):

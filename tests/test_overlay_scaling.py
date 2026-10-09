@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 tk = pytest.importorskip("tkinter")
-from npu_whisper.ui.overlay import OverlayWindow
+from debora_whisper.ui.overlay import OverlayWindow
 
 
 @pytest.mark.parametrize("dpi", [96, 120, 144, 192, 240])
@@ -68,17 +68,97 @@ def test_monitor_change_rescales_even_without_animation():
     overlay._position.assert_called_once()
 
 
-@pytest.mark.parametrize("scale", [1.0, 1.25, 1.5, 2.0])
-def test_dot_hit_area_tracks_its_rendered_size(scale):
+def _clickable_overlay(scale, state="ready"):
     overlay = OverlayWindow.__new__(OverlayWindow)
     overlay._scale = scale
-    overlay._state = "ready"
+    overlay._state = state
     overlay._on_toggle = Mock()
-    overlay._on_drag_start(SimpleNamespace(x=38 * scale, y=10))
+    overlay._on_pos_changed = Mock()
+    overlay._cur_w = 150 * scale
+    overlay._win = Mock(winfo_x=Mock(return_value=100), winfo_y=Mock(return_value=10))
+    return overlay
+
+
+@pytest.mark.parametrize("scale", [1.0, 1.25, 1.5, 2.0])
+@pytest.mark.parametrize("x", [2, 75, 148])
+def test_a_click_anywhere_toggles(scale, x):
+    overlay = _clickable_overlay(scale)
+    press = SimpleNamespace(x=x * scale, y=10)
+    overlay._on_drag_start(press)
+    # A small jitter within the slop is still a click.
+    overlay._on_drag_move(SimpleNamespace(x=x * scale + 3 * scale, y=10))
+    overlay._on_drag_end(press)
     overlay._on_toggle.assert_called_once()
-    overlay._on_drag_start(SimpleNamespace(x=38 * scale + 1, y=10))
-    assert not overlay._drag_is_click
-    overlay._on_toggle.assert_called_once()
+    overlay._on_pos_changed.assert_not_called()
+
+
+@pytest.mark.parametrize("scale", [1.0, 2.0])
+def test_a_drag_moves_without_toggling(scale):
+    overlay = _clickable_overlay(scale)
+    overlay._on_drag_start(SimpleNamespace(x=20, y=10))
+    overlay._on_drag_move(SimpleNamespace(x=20 + 30 * scale, y=10))
+    overlay._on_drag_end(SimpleNamespace(x=20 + 30 * scale, y=10))
+    overlay._on_toggle.assert_not_called()
+    overlay._on_pos_changed.assert_called_once()
+
+
+@pytest.mark.parametrize("state", ["loading", "processing", "error"])
+def test_a_click_does_nothing_while_busy(state):
+    overlay = _clickable_overlay(1.0, state)
+    overlay._on_drag_start(SimpleNamespace(x=20, y=10))
+    overlay._on_drag_end(SimpleNamespace(x=20, y=10))
+    overlay._on_toggle.assert_not_called()
+
+
+@pytest.mark.parametrize("state, draft, label", [
+    ("ready", "", "Ready"),
+    ("recording", "", ""),  # the mascot alone says it is listening
+    ("recording", "ola tudo bem", "ola tudo bem"),
+    ("processing", "", "Transcribing..."),
+    ("speaking", "", "Speaking..."),
+    ("error", "", "Error"),
+])
+def test_states_are_told_in_words_only(state, draft, label):
+    overlay = _clickable_overlay(1.0, state)
+    overlay._hover = False
+    overlay._draft_text = draft
+    assert overlay._label()[0] == label
+
+
+def test_text_is_a_soft_white_in_a_legible_font(monkeypatch):
+    import tkinter.font as tkfont
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    overlay._root = None
+    assert OverlayWindow.TEXT.upper() != "#FFFFFF"
+    monkeypatch.setattr(tkfont, "families", lambda root=None: ["Segoe UI", "Segoe UI Semibold",
+                                                                "Segoe UI Variable Text",
+                                                                "Segoe UI Variable Text Semibold"])
+    assert overlay._font(14) == ("Segoe UI Variable Text", 14)
+    assert overlay._font(14, semibold=True) == ("Segoe UI Variable Text Semibold", 14)
+
+
+def test_font_falls_back_to_segoe_ui(monkeypatch):
+    import tkinter.font as tkfont
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    overlay._root = None
+    monkeypatch.setattr(tkfont, "families", lambda root=None: ["Segoe UI", "Arial"])
+    assert overlay._font(14, semibold=True) == ("Segoe UI Semibold", 14)
+
+
+def test_panel_is_flat():
+    from debora_whisper.ui.glass import render_pill
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    img = render_pill(150, 38, radius=OverlayWindow.RADIUS, **overlay._flat())
+    # One color edge to edge: no border, gradient or highlight.
+    inner = img.crop((8, 2, 142, 36)).convert("RGB")
+    assert len(set(inner.getdata())) == 1
+    assert img.getpixel((75, 0))[:3] == img.getpixel((75, 19))[:3]
+
+
+def test_panel_is_translucent_and_slightly_rounded():
+    assert 0.5 < OverlayWindow.OPACITY < 1.0
+    assert OverlayWindow.RADIUS < OverlayWindow.COMPACT_H // 4
+    assert OverlayWindow.BALLOON_RADIUS == OverlayWindow.RADIUS
 
 
 @pytest.fixture
@@ -130,3 +210,30 @@ def test_real_tk_text_and_balloon_ignore_other_monitors_font_scale(
         measurements.append((pill_bbox, bbox, width, height))
     assert measurements[0] == measurements[1]
     overlay._dismiss_balloon()
+
+
+def test_speaking_stays_until_the_next_state_and_shows_the_reply():
+    overlay = OverlayWindow.__new__(OverlayWindow)
+    overlay._state = "processing"
+    overlay._show_balloon = True
+    overlay._cancel_timers = Mock()
+    overlay._animate = Mock()
+    overlay._show_balloon_popup = Mock()
+    overlay._root = Mock()
+
+    overlay.show_speaking("Oi,")
+    overlay.show_speaking("Oi, tudo bem!")
+
+    assert overlay._state == "speaking"
+    overlay._cancel_timers.assert_called_once()
+    overlay._animate.assert_called_once()
+    overlay._root.after.assert_not_called()  # no auto-return to Ready
+    assert overlay._show_balloon_popup.call_args.args == ("Oi, tudo bem!",)
+
+
+def test_mascot_ships_inside_the_package():
+    from PIL import Image
+    from debora_whisper.ui.overlay import MASCOT_PATH
+    assert "debora_whisper" in MASCOT_PATH.parts
+    with Image.open(MASCOT_PATH) as img:
+        assert img.size[0] == img.size[1] >= 64

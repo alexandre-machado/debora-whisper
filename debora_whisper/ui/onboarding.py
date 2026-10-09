@@ -24,25 +24,25 @@ class OnboardingWindow:
 
     def show(self):
         self._win = ctk.CTkToplevel(self._root)
-        self._win.title("NPU Dictation — First Run Setup")
+        self._win.title("Débora Whisper — First Run Setup")
         self._win.geometry("500x220")
         self._win.resizable(False, False)
         self._win.attributes("-topmost", True)
         self._win.protocol("WM_DELETE_WINDOW", lambda: None)  # Prevent closing
 
         self._win.update_idletasks()
-        from npu_whisper.ui.glass import apply_acrylic
+        from debora_whisper.ui.glass import apply_acrylic
         apply_acrylic(self._win)
 
         # Set title bar icon — prevent CTkToplevel from overriding at 200ms
-        from npu_whisper.ui.icons import render_app_icon
+        from debora_whisper.ui.icons import render_app_icon
         from PIL import ImageTk
         self._icon_photo = ImageTk.PhotoImage(render_app_icon(32))
         self._win._iconbitmap_method_called = True
         self._win.iconphoto(False, self._icon_photo)
 
         ctk.CTkLabel(
-            self._win, text="Setting up NPU Dictation",
+            self._win, text="Setting up Débora Whisper",
             font=ctk.CTkFont(size=18, weight="bold"),
         ).pack(pady=(24, 8))
 
@@ -84,7 +84,7 @@ class OnboardingWindow:
 
     def _run_setup(self):
         """Run model download + cache warmup in background thread."""
-        from npu_whisper.dictation_engine import setup_model, create_model, MODEL_REGISTRY, log
+        from debora_whisper.dictation_engine import setup_model, create_model, MODEL_REGISTRY, log
         import numpy as np
 
         # Phase 1: Download

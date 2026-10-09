@@ -1,4 +1,4 @@
-"""The voice chat's LLM runs in npu_whisper/llm_server.py's process: its
+"""The voice chat's LLM runs in debora_whisper/llm_server.py's process: its
 compile holds the GIL, which froze the app when it ran inside it."""
 import io
 import json
@@ -11,9 +11,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from npu_whisper import llm_server
-from npu_whisper import voice_chat as vc
-from npu_whisper.dictation_engine import DEFAULT_CONFIG
+from debora_whisper import llm_server
+from debora_whisper import voice_chat as vc
+from debora_whisper.dictation_engine import DEFAULT_CONFIG
 
 ROOT = Path(__file__).parent.parent
 
@@ -245,7 +245,7 @@ def test_crashed_process_is_started_again(llm):
     config, logs = llm
     _reply(config, logs)
     first = vc._llm
-    from npu_whisper.processes import kill_tree
+    from debora_whisper.processes import kill_tree
     kill_tree(first.process)
     first.process.wait(10)
     assert "".join(_reply(config, logs)) == "Olá! Tudo bem."

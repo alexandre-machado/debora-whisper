@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from npu_whisper.dictation_engine import (AppState, AudioRecorder, DEFAULT_CONFIG,
+from debora_whisper.dictation_engine import (AppState, AudioRecorder, DEFAULT_CONFIG,
                                           DictationApp, validate_config)
 
 
@@ -37,7 +37,7 @@ def _press(app, hold_for=0.0, until=None):
     outcome to wait for while the patches are still active."""
     released_at = time.time() + hold_for
     with patch("keyboard.is_pressed", side_effect=lambda _k: time.time() < released_at), \
-            patch("npu_whisper.dictation_engine.type_text"):
+            patch("debora_whisper.dictation_engine.type_text"):
         app.toggle_recording()
         assert _wait(lambda: not app._hotkey_held)
         if until is not None:
@@ -144,8 +144,8 @@ def test_stop_while_the_final_transcribes_ends_ready_not_recording():
         release.wait(2)
         return "hello world"
     app.whisper.transcribe.side_effect = slow_transcribe
-    with patch("npu_whisper.dictation_engine.type_text"), \
-            patch("npu_whisper.dictation_engine.get_input_target", return_value=None):
+    with patch("debora_whisper.dictation_engine.type_text"), \
+            patch("debora_whisper.dictation_engine.get_input_target", return_value=None):
         worker = threading.Thread(target=app._finish_recording,
                                   kwargs={"audio": np.zeros(16000, dtype=np.float32)})
         worker.start()

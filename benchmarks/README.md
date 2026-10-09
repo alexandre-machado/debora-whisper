@@ -5,7 +5,7 @@
 Measures the Parakeet TDT (`ParakeetNPU`) pipeline: model load/compile time, and
 per-utterance latency broken down by stage (mel preprocessing / encoder / TDT
 decoder), plus which shape bucket was selected. This is the harness required by
-[issue #3](https://github.com/alexandre-machado/npu-whisper/issues/3).
+[issue #3](https://github.com/alexandre-machado/debora-whisper/issues/3).
 
 **No numbers in this repo, this README, or the PR that introduced this script are
 measured.** This environment (the one the change was authored in) has no Intel

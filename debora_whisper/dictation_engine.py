@@ -1,8 +1,8 @@
 """
-NPU Dictation Engine - Local voice-to-text using OpenVINO on Intel NPU
+Débora Whisper - Local voice-to-text on Intel NPU, GPU, NVIDIA CUDA or CPU
 Supports Whisper (via openvino_genai) and Parakeet TDT (via OpenVINO + onnxruntime).
 
-Usage: npu-whisper-cli [--setup] [--device NPU|GPU|CPU] [--model base|small|medium|parakeet]
+Usage: debora-cli [--setup] [--device NPU|GPU|CPU] [--model base|small|medium|parakeet]
 """
 
 import sys
@@ -17,9 +17,10 @@ from enum import Enum
 from pathlib import Path
 from datetime import datetime
 
-from npu_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
-from npu_whisper.vad_endpoint import AdaptiveEndpoint, VadSegment
-from npu_whisper.voice_chat import (VoiceChat, download_llm, ensure_tts_server, is_http_url,
+from debora_whisper import paths
+from debora_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
+from debora_whisper.vad_endpoint import AdaptiveEndpoint, VadSegment
+from debora_whisper.voice_chat import (VoiceChat, download_llm, ensure_tts_server, is_http_url,
                                     llm_loaded, load_llm)
 
 # Disable HuggingFace symlinks on Windows to avoid WinError 1314
@@ -69,7 +70,7 @@ DEFAULT_CONFIG = {
     "continuous_idle_stop_seconds": 120,
     # Voice chat: instead of typing, each final transcription goes to a local
     # LLM (OpenVINO GenAI, in its own process) and its reply is spoken by the
-    # Chatterbox TTS server (npu_whisper/tts_server.py, its own uv env).
+    # Chatterbox TTS server (debora_whisper/tts_server.py, its own uv env).
     "voice_chat": False,
     # Silence that ends a sentence in voice chat (dictation: 1.5 s, room to
     # think). The reply cannot start before it has passed.
@@ -86,7 +87,7 @@ DEFAULT_CONFIG = {
     "tts_url": "http://127.0.0.1:8765",
     "tts_timeout_seconds": 60,
     # Command that starts the TTS server when nothing answers at tts_url.
-    # null: uv runs npu_whisper/tts_server.py with tts_voice.
+    # null: uv runs debora_whisper/tts_server.py with tts_voice.
     "tts_server_command": None,
 }
 
@@ -223,6 +224,7 @@ class AppState(Enum):
     READY = "ready"            # Idle, waiting for hotkey
     RECORDING = "recording"    # Microphone active
     PROCESSING = "processing"  # Transcribing audio
+    SPEAKING = "speaking"      # Voice chat: the reply is being spoken
     ERROR = "error"            # Device lost or load failed
 
 
@@ -248,6 +250,12 @@ def rotate_logs():
                 os.replace(path, path.with_name(path.name + ".1"))
         except OSError:
             pass  # missing, or open in another process
+
+
+def log_folder_moves():
+    """Report the legacy (npu-whisper) folders this run moved or could not move."""
+    for line in paths.MIGRATIONS:
+        log(line)
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +580,7 @@ def classify_device_failure(exc: BaseException, active_devices=()) -> str | None
 def restart_required_message(device: str, detail: str) -> str:
     name = "The accelerator" if device == "UNKNOWN" else f"The {device}"
     return (
-        f"{name} failed ({detail}). Dictation is disabled until NPU Dictation "
+        f"{name} failed ({detail}). Dictation is disabled until Débora Whisper "
         f"is restarted, because further calls could hang the driver. Quit and "
         f"restart the app. If it happens again, pick another device in "
         f"Settings before restarting."
@@ -1013,7 +1021,7 @@ class ParakeetNPU:
                 f"Parakeet vocab.txt at {vocab_path} produced zero valid entries "
                 f"(expected '<token> <index>' pairs per line, e.g. '▁the 42'). "
                 f"The file is empty, truncated, or in an unexpected format. "
-                f"Re-run setup: npu-whisper-cli --model parakeet --setup"
+                f"Re-run setup: debora-cli --model parakeet --setup"
             )
 
         # Derive BLANK_IDX / VOCAB_SIZE from the loaded vocab instead of
@@ -1056,7 +1064,7 @@ class ParakeetNPU:
             raise RuntimeError(
                 f"Could not determine decoder_joint-model.onnx's output width to "
                 f"validate the vocab.txt-derived VOCAB_SIZE ({self.VOCAB_SIZE}): {e}. "
-                f"Re-run setup: npu-whisper-cli --model parakeet --setup"
+                f"Re-run setup: debora-cli --model parakeet --setup"
             ) from e
 
         # At least one duration logit must remain after the vocab+blank
@@ -1070,7 +1078,7 @@ class ParakeetNPU:
                 f"means vocab.txt is truncated, stale, or paired with a decoder "
                 f"model from a different export. Refusing to start transcription "
                 f"with mismatched constants. Re-run setup: "
-                f"npu-whisper-cli --model parakeet --setup"
+                f"debora-cli --model parakeet --setup"
             )
         log(
             f"  Vocab constants validated against decoder output width "
@@ -1091,7 +1099,7 @@ class ParakeetNPU:
         if not preproc_path.exists():
             raise FileNotFoundError(
                 f"nemo128.onnx not found at {preproc_path}. "
-                f"Re-run setup: npu-whisper-cli --model parakeet --setup"
+                f"Re-run setup: debora-cli --model parakeet --setup"
             )
         try:
             import onnxruntime as ort
@@ -2946,7 +2954,7 @@ class DictationApp:
         self.recorder.set_muted(True)
         try:
             reply = self.voice_chat.respond(
-                text, on_reply=lambda r: self._set_state(AppState.READY, {"text": r}))
+                text, on_reply=lambda r: self._set_state(AppState.SPEAKING, {"text": r}))
         finally:
             self.recorder.set_muted(False)
         if not reply and self.config["beep_on_start"]:
@@ -3352,7 +3360,7 @@ class DictationApp:
         hotkey = self.config["hotkey"]
 
         log("=" * 60)
-        log("NPU Dictation Engine")
+        log("Débora Whisper")
         log(f"  Device:  {self.config['device']}")
         log(f"  Model:   {self.config['model_size']}")
         log(f"  Hotkey:  {hotkey}")
@@ -3388,7 +3396,7 @@ def run_setup():
     never from here: an installed or frozen app has no requirements.txt.
     """
     log("=" * 60)
-    log("NPU Dictation Engine - Setup")
+    log("Débora Whisper - Setup")
     log("=" * 60)
 
     # 1. Check Python version
@@ -3431,7 +3439,7 @@ def run_setup():
         log(f"Model ready at: {model_path}")
     except Exception as e:
         log(f"Model download failed: {e}")
-        log("You can retry later with: npu-whisper-cli --setup")
+        log("You can retry later with: debora-cli --setup")
 
     # 5. Warm the OpenVINO cache by running a dummy inference
     #    This triggers NPU compilation during setup so the first real use is fast.
@@ -3453,7 +3461,7 @@ def run_setup():
     log("\n" + "=" * 60)
     log("Setup complete!")
     log(f"Config file: {CONFIG_FILE}")
-    log("Start dictating: npu-whisper (tray app) or npu-whisper-cli")
+    log("Start dictating: debora (tray app) or debora-cli")
     log("From a source checkout: .\\Start-Dictation.ps1")
     log("=" * 60)
 
@@ -3462,7 +3470,7 @@ def run_setup():
 # CLI
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(prog="npu-whisper-cli", description="NPU Dictation Engine")
+    parser = argparse.ArgumentParser(prog="debora-cli", description="Débora Whisper")
     parser.add_argument("--setup", action="store_true", help="Run first-time setup")
     parser.add_argument("--device", choices=["NPU", "GPU", "CPU", "CUDA"], help="Override device")
     parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), help="Model size")
@@ -3474,6 +3482,7 @@ def main():
                         help="Talk to a local LLM and hear its reply (voice chat) "
                              "instead of typing")
     args = parser.parse_args()
+    log_folder_moves()
 
     if args.setup:
         run_setup()

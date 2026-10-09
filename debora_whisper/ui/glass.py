@@ -97,6 +97,7 @@ def render_pill(w, h, radius, border_color_rgba=GLASS_BORDER,
 
     Uses a single rounded_rectangle for the outer shape so the border
     outline and fill share the exact same edge curve — no misalignment.
+    border_width 0 gives a flat shape: no border and no top highlight.
 
     Returns an RGBA PIL Image at (w, h).
     """
@@ -119,6 +120,9 @@ def render_pill(w, h, radius, border_color_rgba=GLASS_BORDER,
         row = Image.new("L", (sw, 1), row_val)
         mask.paste(row, (0, y))
     img = Image.composite(bottom_img, img, mask)
+
+    if border_width <= 0:
+        return img.resize((w, h), Image.LANCZOS)
 
     # 3. Border outline — drawn on top, uses the same rect/radius
     #    so it's perfectly aligned with the fill edge

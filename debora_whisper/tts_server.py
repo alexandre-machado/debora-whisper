@@ -16,16 +16,16 @@
 # torch = { index = "pytorch-cu124" }
 # torchaudio = { index = "pytorch-cu124" }
 # ///
-"""Local TTS server for npu-whisper's voice chat, backed by Chatterbox
+"""Local TTS server for debora-whisper's voice chat, backed by Chatterbox
 Multilingual on an NVIDIA GPU.
 
 It never runs in the app's environment: chatterbox-tts pins torch 2.6 (CUDA)
 and numpy 1.26. The block above lets uv build its own environment on the first
 run (a few GB, cached afterwards):
 
-    uv run --script npu_whisper/tts_server.py --voice ref.wav
+    uv run --script debora_whisper/tts_server.py --voice ref.wav
 
-npu-whisper starts it this way by itself in voice chat mode, with the voice
+The app starts it this way by itself in voice chat mode, with the voice
 from "tts_voice" in config.json, and stops it on exit.
 
 Endpoints (127.0.0.1 only):
