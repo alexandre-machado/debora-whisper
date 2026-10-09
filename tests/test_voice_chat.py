@@ -558,8 +558,8 @@ def test_bundled_voice_is_used_unless_the_voices_folder_has_one(voices):
 
 def test_the_default_voice_ships_with_the_app():
     from debora_whisper import paths
-    assert DEFAULT_CONFIG["tts_voice"] == "debora"
-    for name in ("carol", "debora", "isabel", "mari"):
+    assert DEFAULT_CONFIG["tts_voice"] == "debora_v2"
+    for name in ("carol", "debora", "debora_v2", "isabel", "mari"):
         path = paths.BUNDLED_VOICES_DIR / f"{name}.wav"
         assert "debora_whisper" in path.parts
         with wave.open(str(path)) as w:
