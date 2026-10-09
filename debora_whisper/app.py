@@ -342,13 +342,12 @@ class GUIApp:
     # -- Audio level polling -----------------------------------------------
 
     def _start_audio_polling(self):
-        """Start polling audio levels for waveform display."""
+        """Start polling audio levels for the tray icon's bars."""
         self._poll_audio()
 
     def _poll_audio(self):
         if self._engine.is_recording:
             level = self._engine.recorder.audio_level
-            self._overlay.update_audio_level(level)
             self._tray.update_audio_level(level)
             self._audio_poll_id = self._root.after(100, self._poll_audio)
 

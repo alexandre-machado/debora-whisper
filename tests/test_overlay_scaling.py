@@ -68,17 +68,67 @@ def test_monitor_change_rescales_even_without_animation():
     overlay._position.assert_called_once()
 
 
-@pytest.mark.parametrize("scale", [1.0, 1.25, 1.5, 2.0])
-def test_dot_hit_area_tracks_its_rendered_size(scale):
+def _clickable_overlay(scale, state="ready"):
     overlay = OverlayWindow.__new__(OverlayWindow)
     overlay._scale = scale
-    overlay._state = "ready"
+    overlay._state = state
     overlay._on_toggle = Mock()
-    overlay._on_drag_start(SimpleNamespace(x=38 * scale, y=10))
+    overlay._on_pos_changed = Mock()
+    overlay._cur_w = 150 * scale
+    overlay._win = Mock(winfo_x=Mock(return_value=100), winfo_y=Mock(return_value=10))
+    return overlay
+
+
+@pytest.mark.parametrize("scale", [1.0, 1.25, 1.5, 2.0])
+@pytest.mark.parametrize("x", [2, 75, 148])
+def test_a_click_anywhere_toggles(scale, x):
+    overlay = _clickable_overlay(scale)
+    press = SimpleNamespace(x=x * scale, y=10)
+    overlay._on_drag_start(press)
+    # A small jitter within the slop is still a click.
+    overlay._on_drag_move(SimpleNamespace(x=x * scale + 3 * scale, y=10))
+    overlay._on_drag_end(press)
     overlay._on_toggle.assert_called_once()
-    overlay._on_drag_start(SimpleNamespace(x=38 * scale + 1, y=10))
-    assert not overlay._drag_is_click
-    overlay._on_toggle.assert_called_once()
+    overlay._on_pos_changed.assert_not_called()
+
+
+@pytest.mark.parametrize("scale", [1.0, 2.0])
+def test_a_drag_moves_without_toggling(scale):
+    overlay = _clickable_overlay(scale)
+    overlay._on_drag_start(SimpleNamespace(x=20, y=10))
+    overlay._on_drag_move(SimpleNamespace(x=20 + 30 * scale, y=10))
+    overlay._on_drag_end(SimpleNamespace(x=20 + 30 * scale, y=10))
+    overlay._on_toggle.assert_not_called()
+    overlay._on_pos_changed.assert_called_once()
+
+
+@pytest.mark.parametrize("state", ["loading", "processing", "error"])
+def test_a_click_does_nothing_while_busy(state):
+    overlay = _clickable_overlay(1.0, state)
+    overlay._on_drag_start(SimpleNamespace(x=20, y=10))
+    overlay._on_drag_end(SimpleNamespace(x=20, y=10))
+    overlay._on_toggle.assert_not_called()
+
+
+@pytest.mark.parametrize("state, draft, label", [
+    ("ready", "", "Ready"),
+    ("recording", "", "Listening..."),
+    ("recording", "ola tudo bem", "ola tudo bem"),
+    ("processing", "", "Transcribing..."),
+    ("speaking", "", "Speaking..."),
+    ("error", "", "Error"),
+])
+def test_states_are_told_in_words_only(state, draft, label):
+    overlay = _clickable_overlay(1.0, state)
+    overlay._hover = False
+    overlay._draft_text = draft
+    assert overlay._label()[0] == label
+
+
+def test_panel_is_translucent_and_slightly_rounded():
+    assert 0.5 < OverlayWindow.OPACITY < 1.0
+    assert OverlayWindow.RADIUS < OverlayWindow.COMPACT_H // 4
+    assert OverlayWindow.BALLOON_RADIUS == OverlayWindow.RADIUS
 
 
 @pytest.fixture

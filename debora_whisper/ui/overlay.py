@@ -1,16 +1,14 @@
-"""iPhone Dynamic Island-style floating overlay for dictation state.
+"""Floating overlay for dictation state: a translucent, slightly rounded
+panel that says what the app is doing, in words only.
 
-Uses PIL 2x supersampled rendering via ui.glass for anti-aliased shapes.
+Uses PIL supersampled rendering via ui.glass for anti-aliased shapes.
 """
 
-import time
 import tkinter as tk
-from collections import deque
 
 from debora_whisper.ui.glass import (
     TRANSPARENT_COLOR, PillCache, composite_on_transparent, pil_to_photo,
-    render_button, render_dot, render_icon_mic, render_icon_stop,
-    render_waveform, render_pill, _hex_to_rgba,
+    render_pill, _hex_to_rgba,
 )
 
 # Color used for window transparency (never appears in UI)
@@ -18,10 +16,10 @@ _TRANSPARENT = TRANSPARENT_COLOR
 
 
 class OverlayWindow:
-    """Always-visible floating pill that shows dictation state.
+    """Always-visible floating panel that shows dictation state as text.
 
-    Compact capsule when idle, expands on hover and during recording.
-    Shows live audio waveform bars while recording.
+    Compact when idle, wider on hover and while recording. A click anywhere
+    toggles recording; a drag moves it.
     """
 
     # --- Dimensions ---
@@ -30,10 +28,10 @@ class OverlayWindow:
     HOVER_H = 38
     EXPANDED_W = 450
     EXPANDED_H = 38
-    RADIUS = 19  # half compact height -> perfect capsule ends
-    MARGIN = 19  # right padding for waveform to avoid curve intersection
-    BTN_CX = 19  # perfectly centered in the left semicircle (margin matches top/bottom)
+    RADIUS = 6   # a slightly rounded rectangle, not a capsule
     BORDER = 2   # border thickness
+    # Whole-window opacity: Tk has no per-pixel alpha, so text fades too.
+    OPACITY = 0.85
 
     # --- iOS-inspired dark palette ---
     BG = "#0A0A0A"
@@ -47,16 +45,17 @@ class OverlayWindow:
     AMBER = "#FF9F0A"
     BLUE = "#0A84FF"
     GRAY = "#48484A"
-    WAVE_COLOR = "#A78BFA"
 
-    # The dot button hit area (left side of the pill)
-    _DOT_HIT_X = 38
+    # States in which a click toggles recording (speaking: cuts the reply).
+    _CLICK_STATES = ("ready", "recording", "speaking")
+    # A press that moves less than this (logical px) is a click, not a drag.
+    _CLICK_SLOP = 4
 
     # --- Balloon dimensions ---
     BALLOON_MAX_W = 360
     BALLOON_PAD = 12
     BALLOON_GAP = 20      # gap between pill and balloon
-    BALLOON_RADIUS = 12
+    BALLOON_RADIUS = 6
     BALLOON_FONT_SIZE = 16
     BALLOON_DURATION = 6000  # ms before auto-dismiss
 
@@ -95,13 +94,10 @@ class OverlayWindow:
         # State
         self._state = "loading"
         self._hover = False
-        self._rec_start = 0.0
         self._result_text = ""
-        self._wave: deque[float] = deque(maxlen=26)
 
         # Timer IDs
         self._anim_id = None
-        self._rec_id = None
         self._auto_hide_id = None
 
         # Balloon
@@ -113,8 +109,6 @@ class OverlayWindow:
         # PIL rendering state
         self._pill_cache = PillCache()
         self._photo_refs: list = []  # prevent GC of PhotoImages
-        self._mic_button_photo = None
-        self._stop_button_photo = None
         
 
         self._build()
@@ -167,25 +161,6 @@ class OverlayWindow:
         if self._balloon_win is not None:
             self._show_balloon_popup(self._balloon_text)
 
-    def _get_mic_btn(self):
-        s = self._scale
-        if s not in getattr(self, "_btn_cache", {}):
-            if not hasattr(self, "_btn_cache"): self._btn_cache = {}
-            from debora_whisper.ui.glass import render_icon_mic, render_button
-            icon = render_icon_mic(max(1, int(12 * s)), self.GREEN)
-            self._btn_cache[s] = render_button(max(1, int(24 * s)), self.GREEN, "#1B3A20", icon)
-        return self._btn_cache[s]
-
-    def _get_stop_btn(self):
-        s = self._scale
-        k = f"stop_{s}"
-        if k not in getattr(self, "_btn_cache", {}):
-            if not hasattr(self, "_btn_cache"): self._btn_cache = {}
-            from debora_whisper.ui.glass import render_icon_stop, render_button
-            icon = render_icon_stop(max(1, int(10 * s)), self.VIOLET)
-            self._btn_cache[k] = render_button(max(1, int(24 * s)), self.VIOLET, "#2E1A47", icon)
-        return self._btn_cache[k]
-
     # --- Window setup -----------------------------------------------------
 
     def _build(self):
@@ -198,6 +173,10 @@ class OverlayWindow:
             self._win.attributes("-transparentcolor", _TRANSPARENT)
         except Exception:
             pass  # Non-Windows fallback: square corners
+        try:
+            self._win.attributes("-alpha", self.OPACITY)
+        except Exception:
+            pass
 
         # Re-assert topmost periodically so the Windows 11 taskbar doesn't cover it
         def _force_topmost():
@@ -317,6 +296,30 @@ class OverlayWindow:
         y = cy - oh // 2
         base.alpha_composite(overlay, (x, y))
 
+    def _label(self) -> tuple[str, str, bool]:
+        """(text, color, bold) for the current state."""
+        state = self._state
+        if state == "loading":
+            return "Loading...", self.TEXT_DIM, False
+        if state == "ready":
+            if self._hover and self._cur_w > (self.COMPACT_W + 20) * self._scale:
+                return "Start recording", self.TEXT_DIM, False
+            return "Ready", self.TEXT, True
+        if state == "recording":
+            draft = getattr(self, "_draft_text", "")
+            if draft:
+                return draft[-40:], self.TEXT, False
+            return "Listening...", self.TEXT_DIM, False
+        if state == "processing":
+            return "Transcribing...", self.TEXT, True
+        if state == "speaking":
+            return "Speaking...", self.TEXT, True
+        if state == "result":
+            return "Done", self.TEXT, True
+        if state == "error":
+            return "Error", self.RED, True
+        return "", self.TEXT, False
+
     def _redraw(self):
         from PIL import Image
         c = self._canvas
@@ -336,77 +339,11 @@ class OverlayWindow:
         # Work on a copy so the cache stays clean
         frame = pill.copy()
 
-        bx = int(self.BTN_CX * s)
-        margin = int(self.MARGIN * s)
+        label, fill, bold = self._label()
         text_items = []  # (x, y, text, fill, font, anchor) — drawn after image
-
-        if self._state == "loading":
-            dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.GRAY))
-            self._paste_centered(frame, dot, bx, mid)
-            text_items.append((w // 2 + int(6 * s), mid, "Loading...",
-                               self.TEXT_DIM, ("Segoe UI", font_size), "center"))
-
-        elif self._state == "ready":
-            if self._hover and w > int(self.COMPACT_W * s) + int(20 * s):
-                self._paste_centered(frame, self._get_mic_btn(), bx, mid)
-                text_items.append((w // 2 + int(10 * s), mid, "Start recording",
-                                   self.TEXT_DIM, ("Segoe UI", font_size), "center"))
-            else:
-                dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.GREEN))
-                self._paste_centered(frame, dot, bx, mid)
-                text_items.append((w // 2 + int(6 * s), mid, "Ready",
-                                   self.TEXT, ("Segoe UI", font_size, "bold"), "center"))
-
-        elif self._state == "recording":
-            self._paste_centered(frame, self._get_stop_btn(), bx, mid)
-            
-            wave_start = int(60 * s)
-            wave_w = int(100 * s)
-            wave_end = wave_start + wave_w
-            
-            draft = getattr(self, "_draft_text", "")
-            if draft:
-                text_items.append((int(wave_end + 15 * s), mid, draft[-40:],
-                                   self.TEXT, ("Segoe UI", font_size), "w"))
-            else:
-                text_items.append((int(wave_end + 15 * s), mid, "Listening...",
-                                   self.TEXT_DIM, ("Segoe UI", font_size), "w"))
-
-            # Waveform
-            levels = list(self._wave)
-            if levels:
-                wave_h = int((h - int(8 * s)) * 0.6)
-                if wave_w > 0 and wave_h > 0:
-                    wave_img = render_waveform(wave_w, wave_h, levels,
-                                               bar_width=max(1, int(3 * s)), gap=max(1, int(3 * s)),
-                                               color=self.WAVE_COLOR)
-                    frame.alpha_composite(wave_img,
-                                          (wave_start, mid - wave_h // 2))
-            # Timer text removed as it doesn't make sense for continuous mode
-
-        elif self._state == "processing":
-            dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.AMBER))
-            self._paste_centered(frame, dot, bx, mid)
-            text_items.append((w // 2 + int(6 * s), mid, "Transcribing...",
-                               self.TEXT, ("Segoe UI", font_size, "bold"), "center"))
-
-        elif self._state == "speaking":
-            dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.BLUE))
-            self._paste_centered(frame, dot, bx, mid)
-            text_items.append((w // 2 + int(6 * s), mid, "Speaking...",
-                               self.TEXT, ("Segoe UI", font_size, "bold"), "center"))
-
-        elif self._state == "result":
-            dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.GREEN))
-            self._paste_centered(frame, dot, bx, mid)
-            text_items.append((w // 2 + int(6 * s), mid, "Done",
-                               self.TEXT, ("Segoe UI", font_size, "bold"), "center"))
-
-        elif self._state == "error":
-            dot = render_dot(max(1, int(10 * s)), _hex_to_rgba(self.RED))
-            self._paste_centered(frame, dot, bx, mid)
-            text_items.append((w // 2 + int(6 * s), mid, "Error",
-                               self.RED, ("Segoe UI", font_size, "bold"), "center"))
+        if label:
+            font = ("Segoe UI", font_size, "bold") if bold else ("Segoe UI", font_size)
+            text_items.append((w // 2, mid, label, fill, font, "center"))
 
         # Flatten to RGB on transparent background and place as one image
         composited = composite_on_transparent(frame)
@@ -424,21 +361,20 @@ class OverlayWindow:
     # --- Drag to reposition -----------------------------------------------
 
     def _on_drag_start(self, event):
-        """Click on dot -> toggle recording. Click elsewhere -> start drag."""
-        if event.x <= self._DOT_HIT_X * self._scale and self._state in ("ready", "recording", "speaking"):
-            # Clicked the dot button — toggle recording
-            self._drag_is_click = True
-            if self._on_toggle:
-                self._on_toggle()
-            return
-        self._drag_is_click = False
+        """Remember the press; it becomes a click or a drag."""
+        self._press_x, self._press_y = event.x, event.y
+        self._dragging = False
         self._drag_offset_x = event.x
         self._drag_offset_y = event.y
 
     def _on_drag_move(self, event):
-        """Move window to follow the mouse."""
-        if getattr(self, "_drag_is_click", False):
-            return  # Was a button click, not a drag
+        """Move window to follow the mouse, once it left the click slop."""
+        if not self._dragging:
+            slop = self._CLICK_SLOP * self._scale
+            if (abs(event.x - self._press_x) <= slop
+                    and abs(event.y - self._press_y) <= slop):
+                return
+            self._dragging = True
         x = self._win.winfo_x() + event.x - self._drag_offset_x
         y = self._win.winfo_y() + event.y - self._drag_offset_y
         w = int(self._cur_w)
@@ -448,11 +384,13 @@ class OverlayWindow:
         self._win.geometry(f"+{x}+{y}")
 
     def _on_drag_end(self, event):
-        """Called when mouse drag finishes."""
-        if getattr(self, "_drag_is_click", False):
-            return
-        if self._on_pos_changed:
-            self._on_pos_changed(self._pos_x, self._pos_y)
+        """A drag saves the position; a click toggles recording."""
+        if getattr(self, "_dragging", False):
+            self._dragging = False
+            if self._on_pos_changed:
+                self._on_pos_changed(self._pos_x, self._pos_y)
+        elif self._state in self._CLICK_STATES and self._on_toggle:
+            self._on_toggle()
 
     # --- Hover & cursor ---------------------------------------------------
 
@@ -461,8 +399,8 @@ class OverlayWindow:
         self._set_hover(False)
 
     def _on_mouse_move(self, event):
-        """Show hand cursor when over the dot button area."""
-        if event.x <= self._DOT_HIT_X * self._scale and self._state in ("ready", "recording", "speaking"):
+        """Hand cursor wherever a click toggles recording."""
+        if self._state in self._CLICK_STATES:
             self._canvas.configure(cursor="hand2")
         else:
             self._canvas.configure(cursor="")
@@ -507,7 +445,7 @@ class OverlayWindow:
     # --- Public state API -------------------------------------------------
 
     def _cancel_timers(self):
-        for attr in ("_anim_id", "_rec_id", "_auto_hide_id"):
+        for attr in ("_anim_id", "_auto_hide_id"):
             tid = getattr(self, attr, None)
             if tid:
                 self._root.after_cancel(tid)
@@ -529,22 +467,13 @@ class OverlayWindow:
         self._animate(self.COMPACT_W, self.COMPACT_H)
 
     def show_recording(self, draft_text=""):
-        """Expand with pulsing red dot, timer, and waveform."""
+        """Wider panel: "Listening..." or the draft so far."""
         if self._state != "recording":
             self._cancel_timers()
             self._state = "recording"
-            self._rec_start = time.time()
-            self._wave.clear()
             self._animate(self.EXPANDED_W, self.EXPANDED_H)
-            self._tick_recording()
         self._draft_text = draft_text
         self._redraw()
-
-    def _tick_recording(self):
-        if self._state != "recording":
-            return
-        self._redraw()
-        self._rec_id = self._root.after(80, self._tick_recording)
 
     def show_processing(self):
         """Amber dot — transcribing."""
@@ -583,14 +512,6 @@ class OverlayWindow:
         self._state = "error"
         self._animate(self.COMPACT_W, self.COMPACT_H)
 
-    def update_audio_level(self, level: float):
-        """Feed audio level (0.0-1.0) for waveform visualization."""
-        # Light smoothing — responsive to speech but not jittery
-        if self._wave:
-            prev = self._wave[-1]
-            level = prev * 0.2 + level * 0.8
-        self._wave.append(level)
-
     def set_show_balloon(self, enabled: bool):
         """Enable or disable the text balloon under the notch."""
         self._show_balloon = enabled
@@ -612,6 +533,10 @@ class OverlayWindow:
         bw.configure(bg=_TRANSPARENT)
         try:
             bw.attributes("-transparentcolor", _TRANSPARENT)
+        except Exception:
+            pass
+        try:
+            bw.attributes("-alpha", self.OPACITY)
         except Exception:
             pass
 
