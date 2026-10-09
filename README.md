@@ -289,10 +289,25 @@ Voice chat is on by default (`"voice_chat": true`; turn it off in Settings or
 the tray to dictate instead). While it is on, nothing is typed: each final transcription goes to a local LLM, and its reply
 is spoken by a local TTS server and shown in the overlay. The reply streams and
 plays sentence by sentence. The conversation keeps the last 8 turns and starts
-over after 10 minutes of silence. In continuous listening the microphone is
-muted while the reply plays; a hotkey press cuts the reply short. A sentence
-ends after 0.8 s of silence (`voice_chat_end_silence_seconds`; dictation
-waits 1.5–3 s), and the reply's sentences play back to back on one audio stream.
+over after 10 minutes of silence (Claude keeps its own persistent history).
+In continuous listening the microphone stays open during thinking and playback.
+New user speech interrupts the reply and becomes the next turn by default
+(`voice_chat_barge_in: true`); with `false`, transcriptions wait in order until
+the reply finishes. The hotkey also interrupts. This works with Claude and Qwen.
+A sentence normally ends after 0.8 s of silence (`voice_chat_end_silence_seconds`).
+An incomplete draft, including trailing `...`, `…`, or a dangling connective,
+allows 2 s (`voice_chat_incomplete_silence_seconds`; dictation waits 1.5–3 s).
+
+Headphones are recommended for simultaneous listening and playback. With speakers,
+`voice_chat_echo_filter: true` compares normalized words against audio actually
+played during the captured segment, allowing a 2 s echo tail. At least 60% token
+overlap is treated as echo and is not sent to the LLM. This is a text heuristic:
+it can mistake a user repeating Débora for echo, or miss distorted speaker audio.
+Headphone users can disable the filter. Every nonempty final transcription is
+logged in `app.log` and added immediately to the usual transcription history,
+including queued, interrupted, cancelled, failed and echo-filtered entries with
+status labels. History retains its usual last 20 entries; logs retain older text
+subject to log rotation. Raw recordings are not archived.
 
 Switch it on or off while the app runs, from **Voice chat** in the tray menu
 or in Settings: no restart. Switching on starts the TTS server and loads the
@@ -303,6 +318,9 @@ loaded until the app exits, so switching back is instant.
 ```json
 {
   "voice_chat": true,
+  "voice_chat_incomplete_silence_seconds": 2.0,
+  "voice_chat_echo_filter": true,
+  "voice_chat_barge_in": true,
   "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
   "llm_device": "GPU",
   "llm_prompt": null,

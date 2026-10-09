@@ -91,7 +91,7 @@ def test_voice_chat_delivers_both_sides_to_the_single_overlay():
     from debora_whisper.ui.overlay import OverlayWindow
 
     gui = GUIApp.__new__(GUIApp)
-    gui._config = {**DEFAULT_CONFIG, "beep_on_start": False}
+    gui._config = {**DEFAULT_CONFIG, "beep_on_start": False, "voice_chat": True}
     gui._root = MagicMock()
     gui._tray = MagicMock()
     gui._stop_audio_polling = MagicMock()
@@ -106,7 +106,7 @@ def test_voice_chat_delivers_both_sides_to_the_single_overlay():
     engine.add_callback(gui._update_ui)
     during_speech = []
 
-    def respond(text, on_reply):
+    def respond(text, on_reply, stop):
         assert gui._overlay._conversation_lines()[0][1] == "Você: abre o log"
         on_reply("O log mostra.")
         on_reply("O log mostra. O TTS demorou.")
@@ -116,6 +116,10 @@ def test_voice_chat_delivers_both_sides_to_the_single_overlay():
 
     with patch.object(engine.voice_chat, "respond", side_effect=respond):
         engine._voice_chat_turn("abre o log", np.zeros(160), True)
+        worker = engine._voice_worker
+        if worker is not None:
+            worker.join(3)
+            assert not worker.is_alive()
     assert [line[1] for line in during_speech] == [
         "Você: abre o log", "Débora: O log mostra. O TTS demorou."]
     assert gui._overlay._conversation_lines() == during_speech

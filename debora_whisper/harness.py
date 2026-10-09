@@ -325,8 +325,8 @@ class HarnessSession:
     def send(self, text: str, on_text, stop: threading.Event, on_event=None):
         """Stream text and drain an interrupted turn before accepting another."""
         with self._turn_lock:
-            if stop.is_set():
-                return
+            # A reserved voice turn still records its user message when
+            # interrupted before the writer starts; then drain its result.
             if not self.running:
                 raise RuntimeError(self.error or "Claude is not running")
             self._send({"type": "user", "message": {"role": "user", "content": text}})

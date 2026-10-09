@@ -134,7 +134,7 @@ def test_duration_limit_still_cuts_incomplete_segment(monkeypatch):
 
 
 def test_voice_chat_keeps_its_own_timeout(monkeypatch):
-    finals = run_vad(monkeypatch, [(True, 38), (False, 110)], voice_chat=True)
+    finals = run_vad(monkeypatch, [(True, 38), (False, 110)], "Pronto.", voice_chat=True)
     assert finals[0][0] == 38 + 26
 
 
@@ -151,3 +151,14 @@ def test_short_timeout_does_not_wait_for_missing_fresh_draft(monkeypatch):
     finals = run_vad(monkeypatch, [(True, 38), (False, 110)],
                      vad_end_silence_seconds=0.7, vad_incomplete_silence_seconds=2)
     assert finals[0][0] == 38 + 22
+
+
+@pytest.mark.parametrize("draft", ["sobre o projeto...", "sobre o projeto…", "Eu queria, mas."])
+def test_incomplete_voice_chat_draft_extends_silence(monkeypatch, draft):
+    finals = run_vad(monkeypatch, [(True, 38), (False, 110)], draft, voice_chat=True)
+    assert finals[0][0] == 38 + 63  # 2 s, shorter than dictation's 3 s
+
+
+def test_voice_chat_requires_actual_minimum_speech(monkeypatch):
+    finals = run_vad(monkeypatch, [(True, 3), (False, 110)], voice_chat=True)
+    assert finals == []  # lookback and silence must not count as voiced frames

@@ -679,7 +679,7 @@ class VoiceChat:
     """A conversation with the LLM, spoken through the TTS server.
 
     respond() blocks until the reply has been spoken (or interrupt() is
-    called); it is meant to run on the engine's transcription thread.
+    called); the engine runs it on a separate, serial reply worker.
     llm(messages, on_text, stop) replaces the OpenVINO model (tests)."""
 
     def __init__(self, config: dict, log=print, play=None, tts_log_path=None, llm=None,
@@ -694,6 +694,8 @@ class VoiceChat:
         self._history: list[dict] = []
         self._last_turn = 0.0
         self._interrupt = threading.Event()
+        self._spoken_lock = threading.Lock()
+        self._spoken = []
         self._tts_cache_lock = threading.RLock()
         self._tts_cache_key = None
         self._waiting_clip = None
@@ -749,8 +751,9 @@ class VoiceChat:
         worker.start()
         return worker
 
-    def reset(self):
-        self.interrupt()
+    def reset(self, interrupt=True):
+        if interrupt:
+            self.interrupt()
         self._history = []
         if self.config.get("voice_chat_backend", "local") == "claude":
             from debora_whisper.harness import reset_harness
@@ -768,6 +771,35 @@ class VoiceChat:
     def interrupt(self):
         """Stop the reply in progress: no more text, synthesis or audio."""
         self._interrupt.set()
+
+    def _remember_spoken(self, text, duration):
+        now = time.monotonic()
+        with self._spoken_lock:
+            self._spoken.append((now, now + duration, text))
+            self._spoken = self._spoken[-256:]
+
+    def is_echo(self, text, started, ended):
+        """Compare only audio played during capture (plus a 2 s room tail).
+
+        Capture timestamps keep delayed ASR from matching a later reply.
+        Count repeated tokens too, so a single shared word is not enough.
+        """
+        from collections import Counter
+
+        def tokens(value):
+            value = spoken_numbers(value, self.config.get("language"))
+            value = unicodedata.normalize("NFKD", value.casefold())
+            value = "".join(c for c in value if not unicodedata.combining(c))
+            return Counter(re.findall(r"\w+", value))
+
+        heard = tokens(text)
+        if not heard:
+            return False
+        with self._spoken_lock:
+            recent = " ".join(words for begin, end, words in self._spoken
+                              if begin <= ended and end + 2 >= started)
+        overlap = sum((heard & tokens(recent)).values())
+        return overlap / sum(heard.values()) >= 0.6
 
     def _messages(self, text: str) -> list[dict]:
         if self.config.get("voice_chat_backend", "local") == "claude":
@@ -800,7 +832,7 @@ class VoiceChat:
         return [{"role": "system", "content": prompt}, *recent,
                 {"role": "user", "content": text}]
 
-    def respond(self, text: str, on_reply=None) -> str:
+    def respond(self, text: str, on_reply=None, stop=None) -> str:
         """Ask the LLM, speak its reply and return the text spoken so far
         ("" if the LLM failed). on_reply(text) gets the reply as it grows."""
         started = time.perf_counter()
@@ -828,6 +860,7 @@ class VoiceChat:
         def playback_started(timing):
             nonlocal first_audio
             timing["play"] = time.perf_counter() - started
+            self._remember_spoken(timing["spoken"], timing["audio"])
             if first_audio is None:
                 first_audio = timing["play"]
             log_timing(timing)
@@ -837,11 +870,16 @@ class VoiceChat:
             self.reset()
         # A fresh event per turn: an interrupted turn's threads keep seeing
         # theirs set, even after the next turn starts.
-        stop = self._interrupt = threading.Event()
+        stop = self._interrupt = stop if stop is not None else threading.Event()
         # Voice chat may have been switched on in Settings since startup.
         ensure_tts_server(self.config, self.log, self.tts_log_path)
         messages = self._messages(text)
         claude = self.config.get("voice_chat_backend", "local") == "claude"
+        conversation = self._history
+        if not claude:
+            # Keep the user even if interruption precedes the first token.
+            conversation.append({"role": "user", "content": text})
+            self._last_turn = time.time()
         sentences: queue.Queue = queue.Queue()
         # Unbounded: after an interrupt nobody takes clips, and the renderer
         # must still be able to finish.
@@ -874,6 +912,8 @@ class VoiceChat:
             return False
 
         def on_text(chunk):
+            if stop.is_set():
+                return
             with feedback_lock:
                 if not state["tokens"]:
                     state["tokens"] = True
@@ -921,6 +961,8 @@ class VoiceChat:
                     if item is None:
                         return
                     sentence, timing = item
+                    if stop.is_set():
+                        return
                     is_feedback = sentence is waiting
                     if is_feedback:
                         sentence = "Um instante."
@@ -961,6 +1003,7 @@ class VoiceChat:
                             self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
                     if audio is not None:
                         timing["audio"] = len(audio[0]) / audio[1]
+                        timing["spoken"] = spoken
                         clips.put((trim_silence(*audio), audio[1], timing))
                     else:
                         log_timing(timing)
@@ -977,8 +1020,11 @@ class VoiceChat:
         self.speaking = True
         play = self._play or StreamPlayer()
         try:
-            while True:
-                clip = clips.get()
+            while not stop.is_set():
+                try:
+                    clip = clips.get(timeout=0.1)
+                except queue.Empty:
+                    continue
                 if clip is None or stop.is_set():
                     break
                 if len(clip[0]):
@@ -995,6 +1041,13 @@ class VoiceChat:
             finally:
                 self.speaking = False
                 stop.set()  # stops the writer and renderer threads
+                # Drain Claude's result / local cancellation before the next
+                # turn. In particular, never clear its stop event early.
+                writer.join()
+                with self._spoken_lock:
+                    now = time.monotonic()
+                    self._spoken = [(begin, min(end, now), words)
+                                    for begin, end, words in self._spoken]
                 for timing in list(timings):
                     log_timing(timing)
                 elapsed = f"{first_audio:.3f}s" if first_audio is not None else "-"
@@ -1014,9 +1067,8 @@ class VoiceChat:
             self.log("Voice chat: the LLM repeated an earlier reply; "
                      "not keeping it in the conversation.")
             self._last_turn = time.time()
-        elif reply:
-            self._history += [{"role": "user", "content": text},
-                              {"role": "assistant", "content": reply}]
+        elif reply and self._history is conversation:
+            conversation.append({"role": "assistant", "content": reply})
             self._last_turn = time.time()
             self.log(f"Voice chat: replied in {time.time() - start:.1f}s")
         return reply

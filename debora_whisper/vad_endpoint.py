@@ -1,5 +1,6 @@
 """Punctuation feedback for continuous dictation's silence timeout."""
 import threading
+import re
 from typing import Any, NamedTuple
 
 
@@ -8,6 +9,7 @@ class VadSegment(NamedTuple):
     is_final: bool
     segment_id: int
     audio_end: int  # Frames from the beginning of this segment, including silence.
+    captured_at: float | None = None  # End of capture, before ASR/queue delays.
 
 
 def incomplete_sentence(text: str) -> bool | None:
@@ -16,6 +18,10 @@ def incomplete_sentence(text: str) -> bool | None:
     if not text or not any(char.isalnum() for char in text):
         return None
     if text.endswith(("...", "…")):
+        return True
+    words = re.findall(r"\w+", text.casefold())
+    if words and words[-1] in {"e", "mas", "porque", "que", "se", "ou", "então",
+                              "and", "but", "because", "or", "if", "so"}:
         return True
     return not text.endswith((".", "?", "!"))
 

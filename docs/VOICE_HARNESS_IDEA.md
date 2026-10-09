@@ -29,6 +29,23 @@
    Chatterbox nesta sessão; ganho real e qualidade das pausas ainda precisam de
    confirmação no app. CUDA graphs/static KV cache ficam para experimento separado.
 
+6. Fala perdida na pausa de 0,8 s e durante a resposta — implementado: rascunho
+   incompleto (inclusive `...`, `…` e conectivos pendurados) permite 2 s por
+   `voice_chat_incomplete_silence_seconds`. Captura/VAD/ASR continuam durante
+   Claude/Qwen e TTS, sem mute nem salto do cursor. Respostas usam uma fila serial;
+   `voice_chat_barge_in: true` interrompe o turno ativo, drena a resposta do
+   backend e envia o próximo texto em ordem; `false` aguarda o fim da resposta.
+   `voice_chat_echo_filter: true` compara tokens normalizados com frases cujo
+   áudio realmente começou durante a captura (mais 2 s de cauda); sobreposição
+   de 60% marca eco, inclusive “Um instante.”. Fones permitem desativar o filtro.
+   Cada final não vazio fica imediatamente no histórico e em `app.log`, com
+   marcação de fila/interrupção/eco/cancelamento/falha; “Obrigado.” deixa de ser
+   descartado como alucinação neste modo. Histórico mantém o limite de 20 itens;
+   áudio bruto não é arquivado. A regressão de desligar com duas interrupções
+   veio de `6a06200`: `reset()` passou a interromper também; desligar agora usa
+   `reset(interrupt=False)`, pois já interrompeu o turno. Validação ao vivo com
+   Bluetooth, alto-falantes, Claude e Qwen ainda pendente; app não foi reiniciado.
+
 As mudanças visuais ainda precisam de confirmação no app, inclusive em monitores
 com DPI diferente. A validação desta mudança de TTS se limita a `py_compile` e
 `tests/test_voice_chat.py`; sem suíte completa nem revisão de segurança.

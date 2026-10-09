@@ -85,6 +85,9 @@ DEFAULT_CONFIG = {
     # Silence that ends a sentence in voice chat (dictation: 1.5 s, room to
     # think). The reply cannot start before it has passed.
     "voice_chat_end_silence_seconds": 0.8,
+    "voice_chat_incomplete_silence_seconds": 2.0,
+    "voice_chat_echo_filter": True,
+    "voice_chat_barge_in": True,
     # Hugging Face repo (OpenVINO IR) or local directory. The int4-cw export
     # answers in ~0.4 s at ~15 tokens/s on a Core Ultra's Arc iGPU.
     "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
@@ -1592,9 +1595,6 @@ class AudioRecorder:
         self._expected_adc_time = None
         self._stable_callbacks = 0
         self.paused = False
-        # Voice chat speaking: the VAD ignores the microphone so the reply
-        # coming out of the speakers is never taken for the user's speech.
-        self.muted = False
         # time.time() of the last block the VAD classified as speech.
         self.last_speech_time = 0.0
 
@@ -1605,7 +1605,8 @@ class AudioRecorder:
         self._read_pos = 0
         self._lookback_count = 0
         self._data_cv = threading.Condition(self._lock)
-        self.segment_queue = queue.Queue(maxsize=10)
+        # Finals must not block capture when inference falls behind.
+        self.segment_queue = queue.Queue()
         # Set by the consumer while it transcribes. An empty queue is not an
         # idle model: the consumer has already taken the item it is working
         # on, so gating drafts on the queue alone snapshots audio that is
@@ -1635,6 +1636,8 @@ class AudioRecorder:
         so switching modes applies to the next sentence."""
         if self.config.get("voice_chat"):
             seconds = self.config.get("voice_chat_end_silence_seconds", 0.8)
+            if self.endpoint.incomplete:
+                seconds = max(seconds, self.config.get("voice_chat_incomplete_silence_seconds", 2.0))
         else:
             seconds = self.config.get("vad_end_silence_seconds", 1.5)
             if self.endpoint.incomplete:
@@ -1759,17 +1762,6 @@ class AudioRecorder:
             self.continuous = False
             self.endpoint.finish()
 
-    def set_muted(self, muted: bool):
-        """Mute or unmute the VAD. Unmuting skips everything heard while
-        muted, so the reply's tail is not cut as a segment."""
-        with self._lock:
-            self.muted = muted
-            self.endpoint.finish()
-            if not muted:
-                self._read_pos = self._write_pos
-                if self.neural_vad:
-                    self.neural_vad.reset_state()
-
     def wait_ready(self, timeout=3.0):
         if not self._audio_ready.wait(timeout):
             raise RuntimeError("Microphone did not deliver stable audio callbacks during warmup")
@@ -1836,6 +1828,7 @@ class AudioRecorder:
                     
                     start_read_pos = self._read_pos
                     self._read_pos = self._write_pos
+                    captured_at = time.monotonic()
                     
                 # Silero VAD prefers 512 frames for 16kHz
                 block_size = 512
@@ -1853,16 +1846,9 @@ class AudioRecorder:
                     is_paused = getattr(self, "paused", False)
                     cut_segment = False
 
-                    if self.muted:
-                        # Speech in progress is dropped, not cut: it may be
-                        # the reply's own audio.
-                        is_speaking = False
-                        self.endpoint.finish()
-                        continue
-                    
                     if is_paused:
                         if is_speaking:
-                            if speech_frames >= self.min_speech_frames:
+                            if voiced_frames >= self.min_speech_frames:
                                 cut_segment = True
                                 log("VAD: Cutting segment due to pause.")
                             else:
@@ -1884,12 +1870,16 @@ class AudioRecorder:
                                 speech_start_pos = (start_read_pos + i - self.lookback_frames) % self.capacity
                                 silence_frames = 0
                                 speech_frames = self.lookback_frames + block_len
+                                voiced_frames = 0
+                                drafted_pause = False
                                 last_draft_time = time.time()
                             else:
                                 silence_frames = 0
                                 speech_frames += block_len
+                            voiced_frames += block_len
                             self.endpoint.speech(speech_frames)
                             extension_logged = False
+                            drafted_pause = False
                         else:
                             if is_speaking:
                                 silence_frames += block_len
@@ -1898,10 +1888,15 @@ class AudioRecorder:
                         # Draft logic
                         if is_speaking and not cut_segment:
                             current_time = time.time()
-                            if current_time - last_draft_time > 1.0:
+                            # Voice chat ends a turn after 0.8 s: waiting up to
+                            # 1 s for the next draft, the "incomplete" check
+                            # came too late and a mid-thought pause cut the turn.
+                            pause_draft = (self.config.get("voice_chat") and not drafted_pause
+                                           and silence_frames >= int(self.sample_rate * 0.2))
+                            if current_time - last_draft_time > 1.0 or pause_draft:
                                 if (self.segment_queue.empty()
                                         and not self.consumer_busy.is_set()
-                                        and speech_frames > self.min_speech_frames):
+                                        and voiced_frames >= self.min_speech_frames):
                                     # Model is idle: snapshot the audio now so
                                     # the draft is as fresh as possible.
                                     with self._lock:
@@ -1916,18 +1911,21 @@ class AudioRecorder:
                                     self.segment_queue.put(VadSegment(
                                         draft_audio.flatten(), False, segment_id, speech_frames))
                                     last_draft_time = current_time
+                                    drafted_pause = silence_frames > 0
 
                         # End of speech conditions
                         silence_limit = self.end_silence_frames
-                        base_limit = int(self.sample_rate * self.config.get("vad_end_silence_seconds", 1.5))
+                        base_seconds = (self.config.get("voice_chat_end_silence_seconds", 0.8)
+                                        if self.config.get("voice_chat") else
+                                        self.config.get("vad_end_silence_seconds", 1.5))
+                        base_limit = int(self.sample_rate * base_seconds)
                         if (is_speaking and not extension_logged
-                                and not self.config.get("voice_chat")
                                 and silence_limit > base_limit and silence_frames > base_limit):
                             log(f"VAD: Incomplete draft; allowing {silence_limit / self.sample_rate:g}s "
                                 "of total silence.")
                             extension_logged = True
                         if is_speaking and silence_frames > silence_limit:
-                            if speech_frames >= self.min_speech_frames:
+                            if voiced_frames >= self.min_speech_frames:
                                 cut_segment = True
                                 log("VAD: Cutting segment due to natural silence.")
                             else:
@@ -1964,7 +1962,9 @@ class AudioRecorder:
                                 ))
                             
                         self.segment_queue.put(VadSegment(
-                            audio.flatten(), True, segment_id, speech_frames))
+                            audio.flatten(), True, segment_id, speech_frames,
+                            captured_at - (len(new_data) - i - block_len
+                                           + max(0, speech_frames - extract_frames)) / self.sample_rate))
         except Exception as e:
             import traceback
             log(f"CRITICAL ERROR in VAD loop: {e}\n{traceback.format_exc()}")
@@ -2464,6 +2464,11 @@ class DictationApp:
         self.voice_chat = VoiceChat(config, log=log, tts_log_path=TTS_SERVER_LOG,
                                     llm_log_path=LLM_SERVER_LOG)
         self._voice_chat_loading = threading.Lock()
+        self._voice_lock = threading.RLock()
+        self._voice_pending = []
+        self._voice_active = None
+        self._voice_stop = None
+        self._voice_worker = None
 
         self._resource_thread = threading.Thread(target=self._monitor_resources, daemon=True)
         self._resource_thread.start()
@@ -2839,7 +2844,7 @@ class DictationApp:
         self._draft_target = None
 
     def _finish_recording(self, generation=None, audio=None, is_final=True,
-                          segment_id=None, audio_end=None):
+                          segment_id=None, audio_end=None, captured_at=None):
         """Consume one recording, whether stopped by the user or its timer,
         or (audio given) one VAD segment of continuous listening."""
         vad_segment = audio is not None
@@ -2854,6 +2859,8 @@ class DictationApp:
         try:
             if audio is None:
                 audio = self.recorder.stop()
+            if captured_at is None:
+                captured_at = time.monotonic()
             if self._stopping.is_set():
                 return
             if self.config["beep_on_start"] and is_final:
@@ -2911,17 +2918,16 @@ class DictationApp:
                 t_lower = text.strip().lower()
                 hallucinations = {"obrigado.", "obrigada.", "obrigado", "obrigada", "obrigado!", "obrigada!", "obrigado por assistir.", "obrigada por assistir.", 
 "thank you.", "thank you", "thanks for watching.", "obrigado por assistir"}
-                if t_lower in hallucinations:
+                if t_lower in hallucinations and not self.config.get("voice_chat"):
                     log(f"Ignoring hallucination: '{text}'")
                     text = ""
 
-                if (vad_segment and not is_final and segment_id is not None
-                        and not self.config.get("voice_chat")):
+                if vad_segment and not is_final and segment_id is not None:
                     self.recorder.endpoint.update(segment_id, audio_end, text)
 
                 if text.strip() and self.config.get("voice_chat"):
                     # Voice chat types nothing: the text goes to the LLM.
-                    self._voice_chat_turn(text.strip(), audio, is_final)
+                    self._voice_chat_turn(text.strip(), audio, is_final, captured_at)
                     return
 
                 if text:
@@ -3031,46 +3037,95 @@ class DictationApp:
             with self._audio_lifecycle_lock:
                 self._transcribing = False
 
-    def _voice_chat_turn(self, text, audio, is_final):
-        """Voice chat: show drafts, send the final to the LLM and speak its
-        reply. Runs on the transcription thread, so the next segment waits
-        until the reply has been spoken."""
-        listening = self._continuous and self.is_recording
+    def _voice_chat_turn(self, text, audio, is_final, captured_at=None):
+        """Save each final immediately; replies run separately from ASR."""
         if not is_final:
-            if listening:
+            if self._continuous and self.is_recording:
                 self._set_state(AppState.RECORDING, {"draft_text": text})
             return
-        if self._stopping.is_set():
-            return
-        log(f"Voice chat: {text!r}")
-        # Voice chat was switched on mid-sentence: what was typed of it as
-        # dictation goes, the sentence goes to the LLM instead.
+        duration = len(audio) / self.config["sample_rate"]
+        captured_at = time.monotonic() if captured_at is None else captured_at
+        echo = (self.config.get("voice_chat_echo_filter", True)
+                and self.voice_chat.is_echo(text, captured_at - duration, captured_at))
+        entry = {"timestamp": datetime.now().isoformat(), "text": text,
+                 "duration": duration, "voice_chat_status": "echo" if echo else "queued"}
         with self._output_lock:
             self._forget_draft_locked(erase=True)
-        self._set_state(AppState.PROCESSING, {"user_text": text})
-        # The microphone must not hear the reply.
-        self.recorder.set_muted(True)
-        try:
-            reply = self.voice_chat.respond(
-                text, on_reply=lambda r: self._set_state(AppState.SPEAKING, {"text": r}))
-        finally:
-            self.recorder.set_muted(False)
-        if not reply and self.config["beep_on_start"]:
-            self.chimes.play('warning')
-        with self._output_lock:
-            if self._stopping.is_set():
-                return
-            self._history.append({
-                "timestamp": datetime.now().isoformat(),
-                "text": f"{text}\n→ {reply}" if reply else text,
-                "duration": len(audio) / self.config["sample_rate"],
-            })
+            self._history.append(entry)
             if len(self._history) > self.MAX_HISTORY:
                 self._history = self._history[-self.MAX_HISTORY:]
-        if self._continuous and self.is_recording:
-            self._set_state(AppState.RECORDING, {"draft_text": ""})
-        else:
-            self._set_state(AppState.READY, {"text": reply} if reply else None)
+        log(f"Final transcription (voice chat, {entry['voice_chat_status']}): {text!r}")
+        if echo:
+            log(f"Voice chat: ignored echo {text!r}")
+            return
+        with self._voice_lock:
+            if self._stopping.is_set() or not self.config.get("voice_chat"):
+                entry["voice_chat_status"] = "cancelled"
+                log(f"Voice chat: kept cancelled transcription {text!r}")
+                return
+            if self._voice_active is None and not self._voice_pending:
+                entry["voice_chat_status"] = "sent"
+            self._voice_pending.append((text, entry))
+            if self._voice_active is not None and self.config.get("voice_chat_barge_in", True):
+                entry["voice_chat_status"] = "barge-in"
+                self._interrupt_voice_reply()
+            if self._voice_worker is None:
+                self._voice_worker = threading.Thread(target=self._voice_replies, daemon=True)
+                self._voice_worker.start()
+
+    def _interrupt_voice_reply(self):
+        """Also cancel a reserved turn that has not entered respond() yet."""
+        with self._voice_lock:
+            if self._voice_stop is not None:
+                self._voice_stop.set()
+            if self._voice_active is not None:
+                self._voice_active["voice_chat_status"] = "interrupted"
+                log(f"Voice chat: interrupted reply to {self._voice_active['text']!r}")
+            self.voice_chat.interrupt()
+
+    def _voice_replies(self):
+        while True:
+            with self._voice_lock:
+                if self._stopping.is_set() or not self.config.get("voice_chat"):
+                    for text, entry in self._voice_pending:
+                        entry["voice_chat_status"] = "cancelled"
+                        log(f"Voice chat: kept cancelled transcription {text!r}")
+                    self._voice_pending.clear()
+                if not self._voice_pending:
+                    self._voice_worker = None
+                    return
+                text, entry = self._voice_pending.pop(0)
+                self._voice_active = entry
+                stop = self._voice_stop = threading.Event()
+            reply = ""
+            try:
+                self._set_state(AppState.PROCESSING, {"user_text": text})
+
+                def on_reply(reply):
+                    if not stop.is_set() and not self._stopping.is_set():
+                        self._set_state(AppState.SPEAKING, {"text": reply})
+
+                reply = self.voice_chat.respond(text, on_reply=on_reply, stop=stop)
+                if (not reply and entry["voice_chat_status"] != "interrupted"
+                        and self.config["beep_on_start"]):
+                    self.chimes.play('warning')
+            except Exception as e:
+                entry["voice_chat_status"] = "failed"
+                log(f"Voice chat: reply failed for {text!r}: {e}")
+            finally:
+                with self._output_lock:
+                    if reply:
+                        entry["text"] = f"{text}\n→ {reply}"
+                with self._voice_lock:
+                    self._voice_active = None
+                    self._voice_stop = None
+                    pending = bool(self._voice_pending)
+                log(f"Voice chat: kept transcription ({entry['voice_chat_status']}): {text!r}")
+            if not pending and not self._stopping.is_set() and self.config.get("voice_chat"):
+                if self._continuous and self.is_recording:
+                    self._set_state(AppState.RECORDING, {"draft_text": ""})
+                else:
+                    self._set_state(AppState.READY, {"text": reply} if reply else None)
 
     # A press longer than this is push-to-talk: recording stops on release.
     HOLD_SECONDS = 0.4
@@ -3090,10 +3145,10 @@ class DictationApp:
             return
 
         press_time = time.time()
-        if self.voice_chat.speaking:
+        if self.voice_chat.speaking or self._voice_active is not None:
             # A press while the reply is on its way only cuts it short.
             self._hotkey_held = True
-            self.voice_chat.interrupt()
+            self._interrupt_voice_reply()
             threading.Thread(target=self._watch_key, args=(press_time,), daemon=True).start()
             return
         if self._continuous:
@@ -3289,9 +3344,9 @@ class DictationApp:
             self._warm_up_voice_chat()
         else:
             log("Voice chat off: dictation types again.")
-            self.voice_chat.interrupt()
+            self._interrupt_voice_reply()
             if self.config.get("voice_chat_backend", "local") == "local":
-                self.voice_chat.reset()
+                self.voice_chat.reset(interrupt=False)
 
     def _warm_up_voice_chat(self):
         """Start the TTS server and load the LLM ahead of the first reply,
@@ -3386,7 +3441,8 @@ class DictationApp:
                             while getattr(self, "_transcribing", False) and not self._stopping.is_set():
                                 time.sleep(0.1)
                             metadata = ({"segment_id": segment.segment_id,
-                                         "audio_end": segment.audio_end}
+                                         "audio_end": segment.audio_end,
+                                         "captured_at": segment.captured_at}
                                         if isinstance(segment, VadSegment) else {})
                             self._finish_recording(audio=audio_segment, is_final=is_final, **metadata)
                         finally:
@@ -3438,7 +3494,7 @@ class DictationApp:
         # after this line no transcription can be typed or added to history.
         with self._output_lock:
             self._stopping.set()
-        self.voice_chat.interrupt()
+        self._interrupt_voice_reply()
         try:
             import keyboard
             keyboard.unhook_all()
