@@ -55,6 +55,8 @@ class HistoryWindow:
             ts = entry.get("timestamp", "")[:19].replace("T", " ")
             dur = entry.get("duration", 0)
             header = f"{ts}  ({dur:.1f}s)"
+            if entry.get("voice_chat_status"):
+                header += f"  · {entry['voice_chat_status']}"
             ctk.CTkLabel(
                 frame, text=header,
                 font=ctk.CTkFont(size=11), text_color="gray60",

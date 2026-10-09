@@ -2,6 +2,7 @@
 spoken by a local TTS server instead of being typed."""
 import io
 import json
+import re
 import sys
 import threading
 import time
@@ -183,7 +184,7 @@ def test_a_repeated_reply_is_not_kept_in_the_history(server):
     llm.chunks = ["Não sei, não tenho acesso à previsão."]
     chat.respond("vai chover amanhã?")
     assert [m["content"] for m in llm.calls[2][1:]] == [
-        "ah, mas você", "Parece que quer brincar.", "vai chover amanhã?"]
+        "ah, mas você", "Parece que quer brincar.", "e...", "vai chover amanhã?"]
 
 
 def test_history_resets_after_a_long_pause(server):
@@ -313,9 +314,18 @@ def _app(**config):
     return app
 
 
-def _say(app, text, is_final=True):
+def _wait_reply(app):
+    worker = app._voice_worker
+    if worker is not None:
+        worker.join(5)
+        assert not worker.is_alive()
+
+
+def _say(app, text, is_final=True, wait=True):
     app.whisper.transcribe.return_value = text
     app._finish_recording(audio=AUDIO, is_final=is_final)
+    if wait:
+        _wait_reply(app)
 
 
 @pytest.fixture
@@ -348,7 +358,7 @@ def test_the_reply_shows_as_speaking_never_as_ready(typed):
     states = []
     app.add_callback(lambda s, d: states.append((s, d)))
 
-    def respond(text, on_reply):
+    def respond(text, on_reply, stop):
         on_reply("Oi,")
         on_reply("Oi, tudo bem!")
         return "Oi, tudo bem!"
@@ -361,18 +371,15 @@ def test_the_reply_shows_as_speaking_never_as_ready(typed):
                            (de.AppState.RECORDING, {"draft_text": ""})]
 
 
-def test_microphone_is_muted_while_the_reply_plays(typed):
+def test_microphone_keeps_listening_while_the_reply_plays(typed):
     app = _app(voice_chat=True)
-    calls = []
-    app.recorder.set_muted.side_effect = lambda m: calls.append(("muted", m))
-    with patch.object(app.voice_chat, "respond",
-                      side_effect=lambda t, on_reply: calls.append("respond") or "Oi."):
+    with patch.object(app.voice_chat, "respond", return_value="Oi."):
         _say(app, "oi")
-    assert calls == [("muted", True), "respond", ("muted", False)]
+    app.recorder.set_muted.assert_not_called()
 
 
 def test_voice_chat_off_types_the_text(typed):
-    app = _app()
+    app = _app(voice_chat=False)
     with patch.object(app.voice_chat, "respond") as respond:
         _say(app, "ola tudo bem")
     respond.assert_not_called()
@@ -395,12 +402,13 @@ def test_drafts_are_shown_not_typed_or_sent(typed):
     assert states[-1] == (de.AppState.RECORDING, {"draft_text": ""})
 
 
-def test_hallucinations_and_silence_never_reach_the_llm(typed):
+def test_short_thanks_is_preserved_in_voice_chat_but_silence_is_not_sent(typed):
     app = _app(voice_chat=True)
-    with patch.object(app.voice_chat, "respond") as respond:
+    with patch.object(app.voice_chat, "respond", return_value="De nada.") as respond:
         _say(app, "Obrigado.")
         _say(app, "")
-    respond.assert_not_called()
+    respond.assert_called_once()
+    assert app.history[0]["text"].startswith("Obrigado.")
     assert typed == []
 
 
@@ -430,15 +438,111 @@ def test_stop_interrupts_the_reply():
     interrupt.assert_called_once()
 
 
-def test_muted_recorder_drops_speech_and_skips_what_it_heard():
-    recorder = de.AudioRecorder(config={})
-    recorder._write_pos = 1000
-    recorder.set_muted(True)
-    assert recorder.muted
-    recorder._write_pos = 5000  # the reply played into the microphone
-    recorder.set_muted(False)
-    assert not recorder.muted
-    assert recorder._read_pos == 5000
+@pytest.mark.parametrize("barge_in", [True, False])
+@pytest.mark.parametrize("backend", ["local", "claude"])
+def test_speech_during_reply_is_transcribed_and_sent_in_order(typed, barge_in, backend):
+    app = _app(voice_chat=True, voice_chat_barge_in=barge_in, voice_chat_backend=backend)
+    started, release = threading.Event(), threading.Event()
+    turns, stops = [], []
+
+    def respond(text, on_reply, stop):
+        turns.append(text)
+        stops.append(stop)
+        if len(turns) == 1:
+            started.set()  # still thinking; no audio has been played
+            assert release.wait(3)
+        return "Resposta."
+
+    with patch.object(app.voice_chat, "respond", side_effect=respond), \
+            patch.object(app.voice_chat, "interrupt") as interrupt:
+        try:
+            _say(app, "sobre aquele projeto...", wait=False)
+            assert started.wait(2)
+            _say(app, "quero mudar a interface", wait=False)
+            assert len(app.history) == 2  # saved before either reply finishes
+            assert app.whisper.transcribe.call_count == 2
+            assert turns == ["sobre aquele projeto..."]
+            assert stops[0].is_set() is barge_in
+            assert interrupt.call_count == int(barge_in)
+            assert app.history[1]["voice_chat_status"] == ("barge-in" if barge_in else "queued")
+        finally:
+            release.set()
+            _wait_reply(app)
+    assert turns == ["sobre aquele projeto...", "quero mudar a interface"]
+    assert stops[0] is not stops[1]
+    if barge_in:
+        assert app.history[0]["voice_chat_status"] == "interrupted"
+    app.recorder.set_muted.assert_not_called()
+    assert typed == []
+
+
+def test_echo_is_logged_and_kept_in_history_without_interrupting(typed, monkeypatch):
+    app = _app(voice_chat=True)
+    logs = []
+    monkeypatch.setattr(de, "log", logs.append)
+    app.voice_chat._remember_spoken("A próxima etapa é conferir o projeto.", 3)
+    with patch.object(app.voice_chat, "respond") as respond, \
+            patch.object(app.voice_chat, "interrupt") as interrupt:
+        _say(app, "A proxima etapa e conferir o projeto!")
+    respond.assert_not_called()
+    interrupt.assert_not_called()
+    assert app.history[0]["voice_chat_status"] == "echo"
+    assert app.history[0]["text"] == "A proxima etapa e conferir o projeto!"
+    assert any("Voice chat: ignored echo" in line for line in logs)
+    assert any("Final transcription" in line for line in logs)
+
+
+def test_echo_filter_can_be_disabled(typed):
+    app = _app(voice_chat=True, voice_chat_echo_filter=False)
+    app.voice_chat._remember_spoken("Um instante.", 1)
+    with patch.object(app.voice_chat, "respond", return_value="Oi.") as respond:
+        _say(app, "Um instante.")
+    respond.assert_called_once()
+
+
+def test_echo_uses_capture_time_instead_of_transcription_time():
+    chat = vc.VoiceChat({})
+    chat._spoken = [(100, 104, "O projeto tem quatro arquivos.")]
+    assert chat.is_echo("O projeto tem quatro arquivos", 101, 103)
+    assert not chat.is_echo("O projeto tem quatro arquivos", 90, 99)
+    assert not chat.is_echo("O projeto tem quatro arquivos", 110, 113)
+    assert not chat.is_echo("Quero mudar a interface", 101, 103)
+
+
+def test_interrupted_thinking_keeps_the_local_user_message(server):
+    started = threading.Event()
+    messages = []
+
+    def llm(turns, on_text, stop):
+        messages.append(turns)
+        if len(messages) == 1:
+            started.set()
+            assert stop.wait(3)
+        else:
+            on_text("Certo.")
+
+    chat, played = _chat(server, llm)
+    worker = threading.Thread(target=chat.respond, args=("sobre o projeto...",))
+    worker.start()
+    try:
+        assert started.wait(2)
+        chat.interrupt()
+        worker.join(2)
+        assert not worker.is_alive()
+        assert played == []
+        chat.respond("quero mudar a interface")
+    finally:
+        chat.interrupt()
+        worker.join(3)
+    assert [m["content"] for m in messages[1][1:]] == [
+        "sobre o projeto...", "quero mudar a interface"]
+
+
+def test_played_waiting_phrase_is_an_echo_reference(server):
+    chat, _ = _chat(server, FakeLLM(["Um instante."]))
+    chat.respond("oi")
+    now = time.monotonic()
+    assert chat.is_echo("Um instante", now - 1, now)
 
 
 @pytest.mark.parametrize("module", ["debora_whisper.app", "debora_whisper.dictation_engine"])
@@ -766,6 +870,107 @@ def test_each_spoken_sentence_is_logged(server):
         "Voice chat: reply 'Fica no sul do país.'"]
 
 
+def test_tts_timings_follow_each_chunk_through_playback(server):
+    logs = []
+    chat, played = _chat(server, FakeLLM(["A capital é Canberra. Fica no sul do país."]))
+    chat.log = logs.append
+    chat.respond("capital")
+    chunks = [line for line in logs if " chunk=" in line]
+    assert len(chunks) == len(played) == 2
+    for line in chunks:
+        times = {key: float(value) for key, value in re.findall(r"(\w+)=(\d+\.\d+)s", line)}
+        assert times["enqueued"] <= times["synth_start"] <= times["synth_end"] <= times["play"]
+        assert times["audio"] == pytest.approx(0.1)
+    assert len([line for line in logs if " first_audio=" in line]) == 1
+    assert not any("first_audio=-" in line for line in logs)
+
+
+@pytest.mark.parametrize("boundary", [",", ";", ":", " —"])
+def test_only_the_first_reply_chunk_splits_at_a_clause(server, boundary):
+    head = "Eu posso explicar isso" + boundary
+    tail = " porque temos bastante tempo para conversar. "
+    later = "Agora temos outra frase, que deve continuar inteira."
+    chat, _ = _chat(server, FakeLLM([head + " ", tail, later]))
+    chat.respond("explique")
+    assert _tts_texts(server) == [vc.speakable(head), tail.strip(), later]
+
+
+def test_first_chunk_uses_twelve_complete_words_without_punctuation():
+    head = "uma duas três quatro cinco seis sete oito nove dez onze doze"
+    assert vc.split_sentences(head + " tre", first=True) == ([head], "tre")
+    assert vc.split_sentences(head[:-1], first=True) == ([], head[:-1])
+    # A clause later in the same delta must not move the cut past word 12.
+    assert vc.split_sentences(head + " treze quatorze, depois", first=True) == (
+        [head], "treze quatorze, depois")
+    assert vc.split_sentences("Eu vi, mas ainda não terminei", first=True)[0] == []
+    assert vc.split_sentences("Eu posso explicar — depois", first=True)[0] == []
+    assert vc.split_sentences("a b c d, resto", first=True)[0] == []
+
+
+def test_warmup_discards_audio_and_caches_waiting_phrase(server):
+    chat, played = _chat(server, FakeLLM())
+    for _ in range(2):
+        worker = chat.warm_tts()
+        worker.join(5)
+        assert not worker.is_alive()
+    assert _tts_texts(server) == ["Olá, estou pronta.", "Um instante."]
+    assert not played
+    assert chat._waiting_audio(chat.config) is chat._waiting_audio(chat.config)
+    assert len(server.requests) == 2
+
+
+@pytest.mark.parametrize("key,value", [("tts_voice", "another"), ("language", "en"),
+                                      ("tts_url", "http://127.0.0.1:9999")])
+def test_waiting_cache_is_invalidated_by_settings(key, value, monkeypatch):
+    synth = MagicMock(side_effect=[(AUDIO, 16000), (AUDIO.copy(), 16000)])
+    monkeypatch.setattr(vc, "synthesize", synth)
+    chat = vc.VoiceChat({**DEFAULT_CONFIG, "language": "pt"})
+    old = chat._waiting_audio(chat.config)
+    assert chat._waiting_audio(chat.config) is old
+    chat.config[key] = value
+    assert chat._waiting_audio(chat.config) is not old
+    assert synth.call_count == 2
+
+
+def test_warmup_returns_while_server_loads_and_failure_does_not_poison_cache(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    def wait(config):
+        entered.set()
+        assert release.wait(5)
+        return True
+
+    monkeypatch.setattr(vc, "wait_tts_server", wait)
+    synth = MagicMock(side_effect=[vc.TTSRejected("cold"), (AUDIO, 16000)])
+    monkeypatch.setattr(vc, "synthesize", synth)
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), log=lambda m: None)
+    worker = chat.warm_tts()
+    try:
+        assert entered.wait(5) and worker.is_alive()
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert chat._waiting_audio(chat.config)[1] == 16000
+    assert synth.call_count == 2
+
+
+def test_waiting_phrase_is_reused_across_turns(server, monkeypatch):
+    # Trigger feedback deterministically, before the writer's first delta.
+    def timer(delay, callback):
+        return MagicMock(start=callback)
+
+    monkeypatch.setattr(vc.threading, "Timer", timer)
+    chat, played = _chat(server, FakeLLM(["A capital é Canberra."]), voice_chat_backend="claude")
+    logs = []
+    chat.log = logs.append
+    chat.respond("capital")
+    chat.respond("capital")
+    assert _tts_texts(server) == ["Um instante.", "A capital é Canberra.", "A capital é Canberra."]
+    assert len(played) == 4
+    assert len([line for line in logs if " cached" in line]) == 1
+
+
 # --- Switching voice chat while running ---------------------------------------
 
 @pytest.fixture
@@ -773,6 +978,8 @@ def loader(monkeypatch):
     """The engine's LLM loading, recorded instead of run."""
     calls = []
     monkeypatch.setattr(de, "ensure_tts_server", lambda *a: calls.append("tts"))
+    # Never warm the user's real server from the engine loading tests.
+    monkeypatch.setattr(vc.VoiceChat, "warm_tts", MagicMock())
     monkeypatch.setattr(de, "download_llm", lambda *a: calls.append("download"))
     monkeypatch.setattr(de, "llm_loaded", lambda config: False)
 
@@ -805,6 +1012,7 @@ def test_switching_on_loads_the_llm_in_the_background(loader):
     assert app.config["voice_chat"] is True
     # Downloaded first, then compiled with every transcription held back.
     assert loader == ["tts", "download", ("llm", True)]
+    vc.VoiceChat.warm_tts.assert_called_once()
     assert notices == ["Voice chat: loading the LLM...", "Voice chat ready"]
 
 
@@ -863,7 +1071,7 @@ def test_switching_off_stops_the_reply_and_forgets_the_conversation():
 
 
 def test_sentence_typed_as_dictation_goes_to_the_llm_after_the_switch(typed):
-    app = _app(continuous_listening=True, inline_drafts=True)
+    app = _app(voice_chat=False, continuous_listening=True, inline_drafts=True)
     app.is_recording = True
     _say(app, "ola tudo", is_final=False)  # typed as a dictation draft
     app.config["voice_chat"] = True
@@ -919,12 +1127,30 @@ def test_rebuilt_engine_starts_voice_chat_itself():
     old.set_voice_chat.assert_not_called()
 
 
-def test_notice_shows_in_the_balloon_without_changing_state():
+def test_notice_shows_only_in_the_tray_without_changing_state():
     gui = _gui()
     gui._update_ui(de.AppState.RECORDING, {"notice": "Voice chat ready"})
-    gui._overlay.show_notice.assert_called_once_with("Voice chat ready")
+    gui._overlay.show_notice.assert_not_called()
     gui._overlay.show_recording.assert_not_called()
+    gui._tray.update_state.assert_called_once_with("recording", "Débora Whisper — Voice chat ready")
+
+
+def test_talking_only_animates_the_mascot():
+    gui = _gui()
+    gui._update_ui(de.AppState.SPEAKING, {"talking": "debora", "active": True})
+    gui._overlay.set_talking.assert_called_once_with("debora", True)
+    gui._overlay.show_speaking.assert_not_called()
     gui._tray.update_state.assert_not_called()
+
+
+def test_engine_wires_both_voices_to_the_ui():
+    events = []
+    app = de.DictationApp.__new__(de.DictationApp)
+    app._stopping = threading.Event()
+    app._state = de.AppState.RECORDING
+    app._callbacks = [lambda state, data: events.append(data)]
+    app._talking("user", True)
+    assert events == [{"talking": "user", "active": True}]
 
 
 # --- Latency and playback -------------------------------------------------------
@@ -1097,3 +1323,136 @@ def test_debora_prompt_fixes_what_the_last_chat_got_wrong():
                  "qual é meu nome",
                  "oferecendo ajuda", "por cento"):
         assert rule in pt
+
+
+@pytest.mark.parametrize("text", ["sobre o projeto...", "sobre o projeto…", "Eu queria, mas."])
+def test_voice_chat_draft_updates_endpoint_through_asr(typed, text):
+    app = _app(voice_chat=True)
+    app.recorder = de.AudioRecorder(config=app.config)
+    segment = app.recorder.endpoint.start()
+    app.whisper.transcribe.return_value = text
+    app._finish_recording(audio=AUDIO, is_final=False, segment_id=segment, audio_end=len(AUDIO))
+    assert app.recorder.end_silence_frames == 2 * app.config["sample_rate"]
+
+
+def test_claude_keeps_an_interrupted_reserved_message_and_drains_before_next(tmp_path):
+    import queue
+    from debora_whisper.harness import HarnessSession
+
+    session = HarnessSession.__new__(HarnessSession)
+    session.process = MagicMock()
+    session.process.poll.return_value = None
+    session.error = None
+    session._turn_lock = threading.Lock()
+    session._send = MagicMock()
+    session._events = queue.Queue()
+    session.log = MagicMock()
+    session.session_file = tmp_path / "session.json"
+    session.session_id = "test-session"
+    session.key = (str(tmp_path),)
+    first = threading.Event()
+    first.set()  # interrupted before send starts, still preserve the user
+    session._events.put({"type": "result"})
+    session.send("sobre o projeto...", MagicMock(), first)
+    assert session._events.empty()
+    session._events.put({"type": "result"})
+    session.send("quero mudar a interface", MagicMock(), threading.Event())
+    sent = [call.args[0] for call in session._send.call_args_list]
+    assert [m["type"] for m in sent] == ["user", "control_request", "user"]
+    assert [m["message"]["content"] for m in sent if m["type"] == "user"] == [
+        "sobre o projeto...", "quero mudar a interface"]
+
+
+def test_on_audio_marks_when_her_voice_is_heard(server):
+    """The mascot zooms from her first clip to the end of the reply."""
+    events = []
+    chat, played = _chat(server, FakeLLM(["A capital é Canberra. ", "Fica no sul, perto do mar."]))
+    chat.on_audio = lambda active: events.append((active, len(played)))
+    chat.respond("qual é a capital da austrália")
+    assert events[0] == (True, 0)  # before the first clip plays
+    assert events[-1] == (False, 2)  # after the last one
+    assert all(a != b for (a, _), (b, _) in zip(events, events[1:]))  # once per change
+
+
+def _harness_session(tmp_path, saved, events, closed=None):
+    """closed: set it to close Claude's output after events (None: at once)."""
+    import io
+    import json as _json
+    from debora_whisper.harness import HarnessSession, harness_key
+    config = {**DEFAULT_CONFIG, "harness_cwd": str(tmp_path)}
+    key = harness_key(config)[0]
+    session_file = tmp_path / "harness_session.json"
+    session_file.write_text(_json.dumps({key: saved}), encoding="utf-8")
+
+    def output():
+        for event in events:
+            yield _json.dumps(event) + "\n"
+        if closed is not None:
+            closed.wait(5)
+
+    process = MagicMock(pid=1, stdin=io.StringIO(), stdout=output(), stderr=iter([]))
+    process.poll.return_value = None
+    commands = []
+    session = HarnessSession(
+        config, log=lambda m: None,
+        command_factory=lambda config, sid, resume: commands.append((sid, resume)) or ["claude"],
+        process_factory=lambda *a, **kw: process, session_file=session_file)
+    return session, commands, lambda: _json.loads(
+        session_file.read_text(encoding="utf-8")).get(key)
+
+
+def test_claude_session_that_does_not_resume_is_forgotten(tmp_path):
+    saved = "6f1c2d4e-0000-4000-8000-000000000001"
+    session, commands, stored = _harness_session(tmp_path, saved, [])  # exits at once
+    assert commands == [(saved, True)]
+    with pytest.raises(RuntimeError):
+        session.send("oi", MagicMock(), threading.Event())
+    assert stored() is None
+
+
+def test_claude_session_that_resumed_is_kept_after_a_later_failure(tmp_path):
+    saved = "6f1c2d4e-0000-4000-8000-000000000002"
+    closed = threading.Event()
+    session, _, stored = _harness_session(
+        tmp_path, saved, [{"type": "result", "session_id": saved}], closed)
+    session.send("oi", MagicMock(), threading.Event())
+    closed.set()
+    with pytest.raises(RuntimeError):
+        session.send("de novo", MagicMock(), threading.Event())
+    assert stored() == saved
+
+
+def test_invalid_saved_claude_session_is_never_passed_as_a_flag(tmp_path):
+    _, commands, _ = _harness_session(tmp_path, "--dangerously-skip-permissions", [])
+    sid, resume = commands[0]
+    assert resume is False and not sid.startswith("-")
+
+
+@pytest.mark.parametrize("text, started, echo", [
+    ("sim", 10.5, True),     # heard while she was saying it
+    ("sim", 12.5, False),    # her sentence ended: the user answered
+    ("quê", 13.0, False),
+    ("ela disse sim mesmo", 12.5, True),  # longer text keeps the 2 s room tail
+])
+def test_short_answers_after_her_sentence_are_not_echo(text, started, echo, monkeypatch):
+    chat = vc.VoiceChat({"language": "pt"})
+    chat._spoken = [(10.0, 12.0, "Sim, ela disse que quê mesmo")]
+    assert chat.is_echo(text, started, started + 0.4) is echo
+
+
+def test_her_text_enters_the_balloon_with_her_voice(server):
+    shown = []
+    chat, played = _chat(server, FakeLLM(["A capital é Canberra. ", "Fica no sul, perto do mar."]))
+    chat.respond("qual é a capital da austrália",
+                 on_reply=lambda text: shown.append((text, len(played))))
+    # Each sentence appears as its clip starts, never while it is synthesized.
+    assert shown == [("A capital é Canberra.", 0),
+                     ("A capital é Canberra. Fica no sul, perto do mar.", 1)]
+
+
+def test_her_text_still_shows_without_a_voice(server, monkeypatch):
+    monkeypatch.setattr(vc, "wait_tts_server", lambda config, *a, **kw: False)
+    shown = []
+    chat, played = _chat(server, FakeLLM(["A capital é Canberra."]))
+    chat.respond("capital", on_reply=shown.append)
+    assert shown == ["A capital é Canberra."] and played == []

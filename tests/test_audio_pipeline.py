@@ -281,3 +281,58 @@ def test_previous_timer_cannot_stop_new_recording(audio_backend, monkeypatch):
     assert recorder.recording
     np.testing.assert_array_equal(recorder.stop(), [1, 2, 3])
     recorder.close()
+
+
+def test_audio_captured_during_reply_reaches_asr_without_skipping(audio_backend, monkeypatch):
+    import threading
+
+    app = engine.DictationApp({**engine.DEFAULT_CONFIG, "voice_chat": True,
+                               "beep_on_start": False, "continuous_listening": True,
+                               "vad_lookback_seconds": 0, "vad_trailing_seconds": 0})
+    recorder = app.recorder
+    # Use deterministic RMS classification, with no model/device loading.
+    monkeypatch.setattr(engine, "NeuralVAD", MagicMock(side_effect=RuntimeError("test RMS")))
+    monkeypatch.setattr(app, "ensure_model", lambda: None)
+    monkeypatch.setattr(engine, "ensure_devices_usable", lambda: None)
+    app.whisper = MagicMock()
+    app.whisper.transcribe.return_value = "quero continuar minha ideia."
+    app._model_ready.set()
+    started, received, release = threading.Event(), threading.Event(), threading.Event()
+    turns = []
+
+    def respond(text, on_reply, stop):
+        turns.append(text)
+        if len(turns) == 1:
+            started.set()
+            assert release.wait(4)
+        else:
+            received.set()
+        return "Certo."
+
+    monkeypatch.setattr(app.voice_chat, "respond", respond)
+    recorder.warmup()
+    app.is_recording = True
+    app._start_segment_consumer()
+    try:
+        app._voice_chat_turn("sobre o projeto...", np.zeros(16000), True)
+        assert started.wait(2)
+        # Exact 512-frame blocks, all captured while the first reply waits.
+        speech = np.full(512 * 20, 0.1, dtype=np.float32)
+        silence = np.zeros(512 * 32, dtype=np.float32)
+        audio_backend.streams[0].feed(np.concatenate([speech, silence]))
+        # ASR must finish before we allow the first reply to return.
+        assert app._voice_stop.wait(2)
+        # A draft at the pause, then the final: the last call is the whole segment.
+        assert app.whisper.transcribe.call_count >= 1
+        captured = app.whisper.transcribe.call_args.args[0]
+        assert np.count_nonzero(captured) == len(speech)
+        assert len(app.history) == 2
+        release.set()
+        assert received.wait(2)
+        assert turns == ["sobre o projeto...", "quero continuar minha ideia."]
+    finally:
+        release.set()
+        worker = app._voice_worker
+        if worker is not None:
+            worker.join(3)
+        app.stop()

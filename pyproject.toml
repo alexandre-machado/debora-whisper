@@ -94,5 +94,8 @@ include = ["debora_whisper", "tests", "README.md", "pyproject.toml"]
 [tool.hatch.build.targets.wheel]
 packages = ["debora_whisper"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"debora_whisper/harness_prompt.md" = "debora_whisper/harness_prompt.md"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

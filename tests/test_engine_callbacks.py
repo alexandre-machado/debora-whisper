@@ -231,3 +231,16 @@ class TestListInputDevices:
         with patch("debora_whisper.dictation_engine.DictationApp.list_input_devices", return_value=[]):
             devices = DictationApp.list_input_devices()
         assert devices == []
+
+
+def test_user_voice_is_reported_once_per_change():
+    from debora_whisper.dictation_engine import AudioRecorder
+    recorder = AudioRecorder.__new__(AudioRecorder)
+    recorder._voice_shown = False
+    events = []
+    recorder.on_voice = events.append
+    for active in (True, True, False, False, True):
+        recorder._show_voice(active)
+    assert events == [True, False, True]
+    recorder.on_voice = lambda active: 1 / 0  # a broken UI never breaks the VAD
+    recorder._show_voice(False)

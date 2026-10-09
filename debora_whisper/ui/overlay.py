@@ -1,22 +1,22 @@
-"""Floating overlay for dictation state: a translucent, slightly rounded
-panel that says what the app is doing, in words only.
+"""One translucent window for the mascot and the current conversation.
 
 Uses PIL supersampled rendering via ui.glass for anti-aliased shapes.
 """
 
 import tkinter as tk
 from pathlib import Path
+from time import monotonic
 
 from debora_whisper.ui.glass import (
     TRANSPARENT_COLOR, PillCache, composite_on_transparent, pil_to_photo,
-    render_pill, _hex_to_rgba,
+    _hex_to_rgba, render_pill,
 )
 
 # Débora's face, shown at the panel's left edge.
 MASCOT_PATH = Path(__file__).parent / "assets" / "mascot.png"
 # Her animated bust, 12 fps, 228x128, cut from a generated video: a calm
 # loop (played forward then back, so it has no seam) and a zoom into her face
-# and back, played once when she starts to speak.
+# and back, repeated while someone talks (the user or her voice).
 MASCOT_LOOP_PATH = Path(__file__).parent / "assets" / "mascot_loop.webp"
 MASCOT_ZOOM_PATH = Path(__file__).parent / "assets" / "mascot_zoom.webp"
 
@@ -25,28 +25,19 @@ _TRANSPARENT = TRANSPARENT_COLOR
 
 
 class OverlayWindow:
-    """Always-visible floating panel that shows dictation state as text.
-
-    Compact when idle, wider on hover and while recording. A click anywhere
-    toggles recording; a drag moves it.
-    """
+    """A fixed mascot anchor with an optional, clipped conversation to its right."""
 
     # --- Dimensions ---
-    COMPACT_W = 150
+    COMPACT_W = 64
     COMPACT_H = 38
-    HOVER_H = 38
-    EXPANDED_W = 450
-    EXPANDED_H = 38
     RADIUS = 6   # a slightly rounded rectangle, not a capsule
     # Whole-window opacity: Tk has no per-pixel alpha, so text fades too.
     OPACITY = 0.85
 
     # --- iOS-inspired dark palette ---
     BG = "#0A0A0A"
-    BG_HOVER = "#0A0A0A"
     TEXT = "#D8D8DC"      # a slightly gray white, softer than pure white
     TEXT_DIM = "#9A9AA0"
-    FONT_SIZE = 11
     # Windows 11's text-optimized Segoe; Segoe UI where it is missing.
     FONTS = (("Segoe UI Variable Text", "Segoe UI Variable Text Semibold"),
              ("Segoe UI", "Segoe UI Semibold"))
@@ -57,8 +48,9 @@ class OverlayWindow:
     BLUE = "#0A84FF"
     GRAY = "#48484A"
 
-    # The mascot moves only while she listens or speaks.
-    _MASCOT_ANIMATED_STATES = ("recording", "speaking")
+    # The mascot flaps its wings in silence and zooms while someone talks;
+    # it stands still only while loading or after an error.
+    _MASCOT_STILL_STATES = ("loading", "error")
     MASCOT_FPS = 12
     MASCOT_FEATHER = 2  # logical px of haze where the mascot meets the panel
     MASCOT_ASPECT = 16 / 9  # the whole video frame, uncropped
@@ -69,25 +61,45 @@ class OverlayWindow:
     _CLICK_SLOP = 4
 
     # --- Balloon dimensions ---
-    BALLOON_MAX_W = 360
-    BALLOON_PAD = 12
-    BALLOON_GAP = 20      # gap between pill and balloon
-    BALLOON_RADIUS = 6
+    BALLOON_DEFAULT_W = 360
+    BALLOON_MIN_W = 200
+    BALLOON_PAD = 6
+    BALLOON_GAP = 8
     BALLOON_FONT_SIZE = 16
-    BALLOON_DURATION = 6000  # ms before auto-dismiss
+    BALLOON_DURATION = 2500  # the former result -> ready auto-dismiss delay
+    SLIDE_SECONDS = 0.2
+    # While she works on the input, the text breathes between these
+    # opacities over the panel, once per period.
+    PULSE_SECONDS = 1.4
+    PULSE_MIN = 0.45
 
-    def __init__(self, root, on_toggle=None, pos_x=None, pos_y=10, on_pos_changed=None):
+    # --- Resize grip: a small glass capsule at the right edge ---
+    GRIP_W = 4
+    GRIP_H = 24
+    GRIP_INSET = 4      # from the window's right edge
+    GRIP_HIT_W = 16     # invisible hit area, centered on the capsule
+    GRIP_IDLE = 0.2     # white opacity over the panel
+    GRIP_ACTIVE = 0.5   # hover and drag
+    GRIP_FADE_MS = 150
+    GRIP_STEPS = 5
+
+    def __init__(self, root, on_toggle=None, pos_x=None, pos_y=10, on_pos_changed=None,
+                 balloon_width=None, on_width_changed=None):
         """
         Args:
             root: Parent Tk/CTk window.
-            on_toggle: Callback() to toggle recording on dot click.
-            pos_x: Initial logical center X position.
+            on_toggle: Callback() to toggle recording on mascot click.
+            pos_x: Initial mascot center X in desktop pixels.
             pos_y: Initial top Y position.
             on_pos_changed: Callback(x, y) when dragged to a new position.
+            balloon_width: Preferred text area width in logical pixels, or None.
+            on_width_changed: Callback(width) after resizing the text area.
         """
         self._root = root
         self._on_toggle = on_toggle
         self._on_pos_changed = on_pos_changed
+        self._on_width_changed = on_width_changed
+        self._balloon_width = balloon_width
         self._win: tk.Toplevel | None = None
         self._canvas: tk.Canvas | None = None
 
@@ -95,14 +107,10 @@ class OverlayWindow:
         self._pos_x: int | None = pos_x
         self._pos_y: int = pos_y
 
-        # Animated size
-        self._tgt_base_w = float(self.COMPACT_W)
-        self._tgt_base_h = float(self.COMPACT_H)
         s = self._scale = self._get_scale()
-        self._cur_w = self._tgt_base_w * s
-        self._cur_h = self._tgt_base_h * s
-        self._tgt_w = self._tgt_base_w * s
-        self._tgt_h = self._tgt_base_h * s
+        self._cur_w = self.COMPACT_W * s
+        self._cur_h = self.COMPACT_H * s
+        self._window_x = None
 
         # Drag state
         self._drag_offset_x = 0
@@ -110,29 +118,27 @@ class OverlayWindow:
 
         # State
         self._state = "loading"
-        self._hover = False
         self._mascot_clip = "loop"
         self._mascot_index = 0
         self._mascot_anim_id = None
-        self._result_text = ""
-
-        # Timer IDs
-        self._anim_id = None
-        self._auto_hide_id = None
-
-        # Balloon
-        self._balloon_win: tk.Toplevel | None = None
+        self._talking = set()  # "user" and/or "debora" while their voice is heard
+        self._user_text = ""
+        self._reply_text = ""
+        self._voice_turn = False
+        self._turn_finished = False
+        self._text_dismissed = False
         self._balloon_id = None
-        self._balloon_text = ""
         self._show_balloon = True
+        self._slide_id = None
+        self._slides = {}
+        self._grip_level = 0  # 0 idle .. GRIP_STEPS active
+        self._grip_hover = False
+        self._grip_fade_id = None
 
         # PIL rendering state
         self._pill_cache = PillCache()
         self._photo_refs: list = []  # prevent GC of PhotoImages
-        
-
         self._build()
-
 
     def _get_scale(self) -> float:
         """Read the effective DPI of this window, including Windows display scaling."""
@@ -170,16 +176,10 @@ class OverlayWindow:
         scale = self._get_scale()
         if scale == self._scale:
             return
-        ratio = scale / self._scale
         self._scale = scale
-        self._cur_w *= ratio
-        self._cur_h *= ratio
-        self._tgt_w = self._tgt_base_w * scale
-        self._tgt_h = self._tgt_base_h * scale
+        self._reset_slides()
         self._position()
         self._redraw()
-        if self._balloon_win is not None:
-            self._show_balloon_popup(self._balloon_text)
 
     # --- Window setup -----------------------------------------------------
 
@@ -211,8 +211,13 @@ class OverlayWindow:
             width=self.COMPACT_W, height=self.COMPACT_H,
         )
         self._canvas.pack(fill="both", expand=True)
+        # A child canvas is a real clipping viewport, not a second Toplevel.
+        # It has the same flat glass color and inherits the window's opacity.
+        self._text_canvas = tk.Canvas(
+            self._canvas, bg=self.BG, highlightthickness=0, borderwidth=0)
+        self._text_canvas.bind("<ButtonPress-1>", lambda e: self._dismiss_balloon())
+        self._text_canvas.configure(cursor="hand2")
 
-        self._canvas.bind("<Enter>", lambda e: self._set_hover(True))
         self._canvas.bind("<Leave>", self._on_leave)
         self._canvas.bind("<Motion>", self._on_mouse_move)
         self._canvas.bind("<ButtonPress-1>", self._on_drag_start)
@@ -220,8 +225,7 @@ class OverlayWindow:
         self._canvas.bind("<ButtonRelease-1>", self._on_drag_end)
 
         self._win.update_idletasks()
-        self._position()
-        self._win.update_idletasks()
+        self._restore_position()
         self._win.bind("<Configure>", self._refresh_scale)
         _force_topmost()
         self._apply_window_flags()
@@ -251,19 +255,9 @@ class OverlayWindow:
         except Exception:
             return self._win.winfo_screenwidth()
 
-    def _position(self):
-        """Position the window, keeping it centered on its anchor point."""
-        w = int(self._cur_w)
-        h = int(self._cur_h)
-        if self._pos_x is None:
-            # Default: center horizontally at top of screen
-            x = (self._get_screen_width() - w) // 2
-        else:
-            # Keep centered on the user's chosen position
-            x = self._pos_x - w // 2
-        y = self._pos_y
-
-        # Clamp to the working area of the monitor where the window currently belongs
+    def _monitor_work_area(self, x, y, full=False):
+        """Find the monitor containing the mascot's anchor.
+        full: the whole monitor, taskbar included, not just the work area."""
         try:
             import ctypes
             from ctypes import wintypes
@@ -281,40 +275,140 @@ class OverlayWindow:
             user32.MonitorFromPoint.restype = wintypes.HANDLE
             user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
             user32.GetMonitorInfoW.restype = wintypes.BOOL
-            pt = POINT(x + w // 2, y + h // 2)
+            pt = POINT(x, y)
             hMonitor = user32.MonitorFromPoint(pt, 2) # MONITOR_DEFAULTTONEAREST
             
             mi = MONITORINFO()
             mi.cbSize = ctypes.sizeof(MONITORINFO)
             if user32.GetMonitorInfoW(hMonitor, ctypes.byref(mi)):
-                wl, wt, wr, wb = mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom
-                if x < wl: x = wl
-                if x + w > wr: x = wr - w
-                if y < wt: y = wt
-                if y + h > wb: y = wb - h
-                
-                # Update logical position so it doesn't try to escape on next resize
-                self._pos_x = x + w // 2
-                self._pos_y = y
+                rect = mi.rcMonitor if full else mi.rcWork
+                return rect.left, rect.top, rect.right, rect.bottom
         except Exception:
             pass
+        return 0, 0, self._win.winfo_screenwidth(), self._win.winfo_screenheight()
 
+    def _mascot_geometry(self):
+        """Use exactly the same rounded pixel dimensions as the drawn clip."""
+        pad = round(2 * self._scale)
+        height = round(self.COMPACT_H * self._scale) - 2 * pad
+        right = pad + round(height * self.MASCOT_ASPECT)
+        return pad, height, right, right + pad
+
+    def _text_geometry(self, width):
+        mascot_right = self._mascot_geometry()[2]
+        gap = round(self.BALLOON_GAP * self._scale)
+        bar_width = max(1, round(self.GRIP_W * self._scale))
+        bar_left = width - round(self.GRIP_INSET * self._scale) - bar_width
+        text_left = mascot_right + gap
+        text_right = max(text_left, bar_left - gap)
+        return text_left, text_right, bar_left, bar_width
+
+    def _grip_image(self, level, height):
+        """The resize capsule at fade level 0 (idle) .. GRIP_STEPS (hover,
+        drag), pre-blended over the flat panel: Tk images have no alpha."""
+        from PIL import Image
+        s = self._scale
+        width = max(1, round(self.GRIP_W * s))
+        height = max(1, min(round(self.GRIP_H * s), height))
+        cache = self.__dict__.setdefault("_grip_cache", {})
+        key = (width, height, level)
+        if key not in cache:
+            opacity = self.GRIP_IDLE + (self.GRIP_ACTIVE - self.GRIP_IDLE) * level / self.GRIP_STEPS
+            capsule = render_pill(width, height, radius=max(1, round(2 * s)),
+                                  bg_top=(255, 255, 255), bg_bottom=(216, 216, 222),
+                                  border_width=0)
+            capsule.putalpha(capsule.getchannel("A").point(lambda a: round(a * opacity)))
+            image = Image.new("RGBA", (width, height), _hex_to_rgba(self.BG))
+            image.alpha_composite(capsule)
+            cache[key] = image
+        return cache[key]
+
+    def _set_grip_active(self, active):
+        """Fade the capsule toward its hover/drag look, or back to idle."""
+        active = active or getattr(self, "_dragging", False) and self._press_region == "resize"
+        if active == self._grip_hover:
+            return
+        self._grip_hover = active
+        if self._grip_fade_id is None:
+            self._grip_fade_id = self._root.after(
+                self.GRIP_FADE_MS // self.GRIP_STEPS, self._grip_fade_tick)
+
+    def _grip_fade_tick(self):
+        self._grip_fade_id = None
+        target = self.GRIP_STEPS if self._grip_hover else 0
+        if self._grip_level == target:
+            return
+        self._grip_level += 1 if target > self._grip_level else -1
+        self._draw_grip()
+        self._grip_fade_id = self._root.after(
+            self.GRIP_FADE_MS // self.GRIP_STEPS, self._grip_fade_tick)
+
+    def _draw_grip(self):
+        c = self._canvas
+        c.delete("grip")
+        w, h = int(self._cur_w), int(self._cur_h)
+        left, right, bar, _ = self._text_geometry(w)
+        if not self._conversation_lines() or right <= left:
+            return
+        image = self._grip_image(self._grip_level, h - 2 * round(self.BALLOON_PAD * self._scale))
+        photo = pil_to_photo(image)
+        self.__dict__["_grip_photo"] = photo
+        c.create_image(bar, (h - image.height) // 2, image=photo, anchor="nw", tags="grip")
+
+    def _conversation_lines(self):
+        if not self._show_balloon or self._text_dismissed:
+            return []
+        if self._voice_turn:
+            lines = [("user", f"Você: {self._user_text}", self.TEXT_DIM)]
+            if self._reply_text:
+                lines.append(("reply", f"Débora: {self._reply_text}", self.TEXT))
+            return lines if self._user_text or self._reply_text else []
+        return [("user", self._user_text, self.TEXT)] if self._user_text else []
+
+    def _text_font(self):
+        import tkinter.font as tkfont
+        return tkfont.Font(root=self._root, font=self._font(
+            self._font_pixels(self.BALLOON_FONT_SIZE, self._scale)))
+
+    def _restore_position(self):
+        # The root may be on another monitor. First move this window, then
+        # restore the saved mascot center using the destination monitor's DPI.
+        center, top = self._pos_x, self._pos_y
+        self._position()
+        self._win.update_idletasks()
+        scale = self._get_scale()
+        if scale != self._scale:
+            self._scale = scale
+            self._window_x = None
+            self._pos_x, self._pos_y = center, top
+            self._position()
+
+    def _position(self):
+        """Only the mascot is the position anchor; text never recenters it."""
+        mascot_w = self._mascot_geometry()[3]
+        mascot_h = round(self.COMPACT_H * self._scale)
+        if self._window_x is None:
+            center = self._get_screen_width() // 2 if self._pos_x is None else self._pos_x
+            self._window_x = center - mascot_w // 2
+        x, y = self._window_x, self._pos_y
+        wl, wt, wr, wb = self._monitor_work_area(
+            x + mascot_w // 2, y + mascot_h // 2, full=True)
+        x = max(wl, min(x, wr - mascot_w))
+        y = max(wt, min(y, wb - mascot_h))
+        self._window_x, self._pos_x, self._pos_y = x, x + mascot_w // 2, y
+        w, h = mascot_w, mascot_h
+        lines = self._conversation_lines()
+        if lines:
+            requested = self._balloon_width or self.BALLOON_DEFAULT_W
+            w += min(round(requested * self._scale), max(0, wr - x - mascot_w))
+            # Both sides share one row; her reply pushes the user's text left.
+            # The row is centered on the mascot; only a font taller than her
+            # makes the window grow.
+            h = max(h, self._text_font().metrics("linespace"))
+        self._cur_w, self._cur_h = w, h
+        # +negative coordinates are absolute desktop positions in Tk geometry.
         self._win.geometry(f"{w}x{h}+{x}+{y}")
         self._canvas.configure(width=w, height=h)
-
-    # --- PIL-based drawing ------------------------------------------------
-    # All elements are composited onto the pill RGBA image first, then
-    # the final result is flattened onto TRANSPARENT_COLOR and placed as
-    # one single canvas image.  This avoids the transparent-color
-    # punch-through that happens when layering separate images.
-
-    @staticmethod
-    def _paste_centered(base, overlay, cx, cy):
-        """Alpha-composite overlay onto base, centered at (cx, cy)."""
-        ow, oh = overlay.size
-        x = cx - ow // 2
-        y = cy - oh // 2
-        base.alpha_composite(overlay, (x, y))
 
     def _flat(self) -> dict:
         """render_pill arguments for a flat panel: one color, no border."""
@@ -335,162 +429,176 @@ class OverlayWindow:
             self._font_families = families
         return (families[1] if semibold else families[0], size)
 
-    def _label(self) -> tuple[str, str, bool]:
-        """(text, color, bold) for the current state."""
-        state = self._state
-        if state == "loading":
-            return "Loading...", self.TEXT_DIM, False
-        if state == "ready":
-            if self._hover and self._cur_w > (self.COMPACT_W + 20) * self._scale:
-                return "Start recording", self.TEXT_DIM, False
-            return "Ready", self.TEXT, True
-        if state == "recording":
-            draft = getattr(self, "_draft_text", "")
-            if draft:
-                return draft[-40:], self.TEXT, False
-            return "", self.TEXT_DIM, False
-        if state == "processing":
-            return "Transcribing...", self.TEXT, True
-        if state == "speaking":
-            return "Speaking...", self.TEXT, True
-        if state == "result":
-            return "Done", self.TEXT, True
-        if state == "error":
-            return "Error", self.RED, True
-        return "", self.TEXT, False
-
     def _redraw(self):
-        from PIL import Image
         c = self._canvas
         c.delete("all")
         self._photo_refs.clear()
         s = self._scale
-        font_size = self._font_pixels(self.FONT_SIZE, s)
         w, h = int(self._cur_w), int(self._cur_h)
-        r = min(int(self.RADIUS * s), h // 2)
-        mid = h // 2
-
-        # Start with glass pill as the base image
-        pill = self._pill_cache.get(w, h, radius=r, **self._flat())
-        # Work on a copy so the cache stays clean
-        frame = pill.copy()
-
-        # The mascot on the left; it moves while she listens or speaks.
+        frame = self._pill_cache.get(w, h, radius=round(self.RADIUS * s),
+                                     **self._flat()).copy()
         self._sync_mascot_animation()
-        pad = int(2 * s)
-        frames = self._mascot_frames(h - 2 * pad, max(1, round(self.MASCOT_FEATHER * s)),
-                                     max(1, round(self.RADIUS * s)),
-                                     clip=self._mascot_clip)
-        icon_right = pad
+        pad, mascot_h, _, _ = self._mascot_geometry()
+        frames = self._mascot_frames(mascot_h, max(1, round(self.MASCOT_FEATHER * s)),
+                                     max(1, round(self.RADIUS * s)), clip=self._mascot_clip)
         if frames:
-            thumb = frames[self._mascot_index % len(frames)]
-            frame.alpha_composite(thumb, (pad, pad))
-            icon_right = pad + thumb.width
-
-        label, fill, bold = self._label()
-        text_items = []  # (x, y, text, fill, font, anchor) — drawn after image
-        if label:
-            font = self._font(font_size, semibold=bold)
-            # Centered in the space right of the mascot
-            text_cx = icon_right + (w - icon_right) // 2
-            text_items.append((text_cx, mid, label, fill, font, "center"))
-
-        # Flatten to RGB on transparent background and place as one image
-        composited = composite_on_transparent(frame)
-        photo = pil_to_photo(composited)
+            frame.alpha_composite(frames[self._mascot_index % len(frames)], (pad, pad))
+        photo = pil_to_photo(composite_on_transparent(frame))
         self._photo_refs.append(photo)
         c.create_image(0, 0, image=photo, anchor="nw")
+        left, right, bar, bar_w = self._text_geometry(w)
+        if self._conversation_lines() and right > left:
+            self._draw_grip()
+            line_h = min(h, self._text_font().metrics("linespace"))
+            self._text_canvas.place(x=left, y=(h - line_h) // 2,
+                                    width=right - left, height=line_h)
+            self._draw_text(right - left)
+        else:
+            self._text_canvas.place_forget()
 
-        # Draw text on top (ClearType AA handled by tkinter)
-        # Apply a 1-pixel optical correction upwards when scaled to keep it centered
-        optical_offset = 1 if s > 1.0 else 0
-        for tx, ty, text, fill, font, anchor in text_items:
-            c.create_text(tx, ty - optical_offset, text=text, fill=fill, font=font,
-                          anchor=anchor)
+    @staticmethod
+    def _line_target(line_width, visible_width):
+        return min(0, visible_width - line_width)
 
-    # --- Drag to reposition -----------------------------------------------
+    def _slide_offset(self, key, target, now):
+        slide = self._slides.get(key)
+        if slide is None:
+            slide = (0.0, 0.0, now)
+        start, end, began = slide
+        progress = min(1.0, max(0.0, (now - began) / self.SLIDE_SECONDS))
+        current = start + (end - start) * (1 - (1 - progress) ** 3)
+        if target != end:
+            # Retarget from the current position, even if another sentence
+            # arrived before the last animation finished.
+            slide = (current, target, now)
+        self._slides[key] = slide
+        return current
+
+    def _draw_text(self, visible_width):
+        canvas = self._text_canvas
+        canvas.delete("all")
+        font = self._text_font()
+        now = monotonic()
+        # From the input until her voice is ready: her text may arrive
+        # (speaking) well before the audio does.
+        pulsing = (self._state == "processing" or self._state == "speaking"
+                   and not self.__dict__.get("_voice_heard"))
+        # One row: "Você: …" then "Débora: …", slid left together, so her
+        # reply pushes the user's words under the mascot like new words do.
+        items, x = [], 0
+        space = font.measure("   ")
+        for key, text, fill in self._conversation_lines():
+            # Newlines in a transcript/reply never create additional rows.
+            text = " ".join(text.split())
+            if pulsing:
+                fill = self._pulse(fill, now)
+            item = canvas.create_text(0, 0, text=text, fill=fill, font=font, anchor="nw")
+            bbox = canvas.bbox(item)
+            # Tk text bboxes include font bearings: normalize their left edge,
+            # so fitting text starts at text_left.
+            canvas.move(item, x - bbox[0], 0)
+            items.append(item)
+            x += bbox[2] - bbox[0] + space
+        width = max(0, x - space)
+        target = self._line_target(width, visible_width)
+        offset = self._slide_offset("row", target, now)
+        for item in items:
+            canvas.move(item, offset, 0)
+        moving = abs(offset - target) > 0.01
+        if (moving or pulsing) and self._slide_id is None:
+            self._slide_id = self._root.after(16 if moving else 50, self._slide_tick)
+
+    def _pulse(self, fill, now):
+        """fill faded toward the panel by the breathing pulse at time now."""
+        import math
+        wave = 0.5 + 0.5 * math.cos(2 * math.pi * now / self.PULSE_SECONDS)
+        opacity = self.PULSE_MIN + (1 - self.PULSE_MIN) * wave
+        bg, fg = _hex_to_rgba(self.BG), _hex_to_rgba(fill)
+        return "#" + "".join(f"{round(b + (f - b) * opacity):02X}" for f, b in zip(fg[:3], bg[:3]))
+
+    def _slide_tick(self):
+        self._slide_id = None
+        left, right, _, _ = self._text_geometry(int(self._cur_w))
+        if self._conversation_lines() and right > left:
+            self._draw_text(right - left)
+
+    def _reset_slides(self):
+        if self._slide_id is not None:
+            self._root.after_cancel(self._slide_id)
+            self._slide_id = None
+        self._slides.clear()
+
+    def _update_layout(self):
+        self._position()
+        self._redraw()
+
+    # --- Drag, resize and click -------------------------------------------
+
+    def _hit_region(self, x):
+        _, _, bar, bar_w = self._text_geometry(int(self._cur_w))
+        if self._conversation_lines() and self._cur_w > self._mascot_geometry()[3]:
+            reach = (self.GRIP_HIT_W * self._scale - bar_w) / 2
+            if bar - reach <= x <= bar + bar_w + reach:
+                return "resize"
+            if x >= self._mascot_geometry()[2]:
+                return "text"
+        return "mascot"
 
     def _on_drag_start(self, event):
-        """Remember the press; it becomes a click or a drag."""
+        self._press_region = self._hit_region(event.x)
         self._press_x, self._press_y = event.x, event.y
         self._dragging = False
-        self._drag_offset_x = event.x
-        self._drag_offset_y = event.y
+        self._drag_offset_x, self._drag_offset_y = event.x, event.y
+        self._resize_start = (self._cur_w - self._mascot_geometry()[3]) / self._scale
+        if self._press_region == "resize":
+            self._set_grip_active(True)
 
     def _on_drag_move(self, event):
-        """Move window to follow the mouse, once it left the click slop."""
+        if self._press_region == "text":
+            return
         if not self._dragging:
             slop = self._CLICK_SLOP * self._scale
             if (abs(event.x - self._press_x) <= slop
                     and abs(event.y - self._press_y) <= slop):
                 return
             self._dragging = True
-        x = self._win.winfo_x() + event.x - self._drag_offset_x
-        y = self._win.winfo_y() + event.y - self._drag_offset_y
-        w = int(self._cur_w)
-        # Store the center x so resizing stays anchored to the drag position
-        self._pos_x = x + w // 2
-        self._pos_y = y
-        self._win.geometry(f"+{x}+{y}")
+        if self._press_region == "resize":
+            requested = self._resize_start + (event.x - self._press_x) / self._scale
+            mascot_w = self._mascot_geometry()[3]
+            _, _, right, _ = self._monitor_work_area(self._pos_x, self._pos_y, full=True)
+            maximum = max(self.BALLOON_MIN_W,
+                          (right - self._window_x - mascot_w) / self._scale)
+            self._balloon_width = round(max(self.BALLOON_MIN_W, min(requested, maximum)))
+        else:
+            self._window_x = self._win.winfo_x() + event.x - self._drag_offset_x
+            self._pos_y = self._win.winfo_y() + event.y - self._drag_offset_y
+        self._update_layout()
 
     def _on_drag_end(self, event):
-        """A drag saves the position; a click toggles recording."""
-        if getattr(self, "_dragging", False):
+        if self._dragging:
             self._dragging = False
-            if self._on_pos_changed:
+            if self._press_region == "resize":
+                self._set_grip_active(self._hit_region(event.x) == "resize")
+                if self._on_width_changed:
+                    self._on_width_changed(self._balloon_width)
+            elif self._on_pos_changed:
                 self._on_pos_changed(self._pos_x, self._pos_y)
-        elif self._state in self._CLICK_STATES and self._on_toggle:
+        elif self._press_region == "text":
+            self._dismiss_balloon()
+        elif (self._press_region == "mascot" and self._state in self._CLICK_STATES
+              and self._on_toggle):
             self._on_toggle()
-
-    # --- Hover & cursor ---------------------------------------------------
 
     def _on_leave(self, event):
         self._canvas.configure(cursor="")
-        self._set_hover(False)
+        self._set_grip_active(False)
 
     def _on_mouse_move(self, event):
-        """Hand cursor wherever a click toggles recording."""
-        if self._state in self._CLICK_STATES:
-            self._canvas.configure(cursor="hand2")
-        else:
-            self._canvas.configure(cursor="")
-
-    def _set_hover(self, hovered):
-        if self._state != "ready":
-            return
-        self._hover = hovered
-        if hovered:
-            self._animate(self.EXPANDED_W, self.HOVER_H)
-        else:
-            self._animate(self.COMPACT_W, self.COMPACT_H)
-
-    # --- Animation --------------------------------------------------------
-
-    def _animate(self, tw, th):
-        self._tgt_base_w = float(tw)
-        self._tgt_base_h = float(th)
-        if self._anim_id:
-            self._root.after_cancel(self._anim_id)
-        self._anim_tick()
-
-    def _anim_tick(self):
-        s = self._scale
-        self._tgt_w = self._tgt_base_w * s
-        self._tgt_h = self._tgt_base_h * s
-        dw = self._tgt_w - self._cur_w
-        dh = self._tgt_h - self._cur_h
-        if abs(dw) < 1.5 and abs(dh) < 1.5:
-            self._cur_w = self._tgt_w
-            self._cur_h = self._tgt_h
-            self._position()
-            self._redraw()
-            self._anim_id = None
-            return
-        self._cur_w += dw * 0.25
-        self._cur_h += dh * 0.25
-        self._position()
-        self._redraw()
-        self._anim_id = self._root.after(16, self._anim_tick)
+        region = self._hit_region(event.x)
+        cursor = "sb_h_double_arrow" if region == "resize" else (
+            "hand2" if region == "text" or self._state in self._CLICK_STATES else "")
+        self._canvas.configure(cursor=cursor)
+        self._set_grip_active(region == "resize")
 
     # --- Mascot -----------------------------------------------------------
 
@@ -538,9 +646,9 @@ class OverlayWindow:
         return frames
 
     def _sync_mascot_animation(self):
-        """Run the mascot's frame timer only in the animated states; the
-        other states show the loop's first frame and cost nothing."""
-        animate = self._state in self._MASCOT_ANIMATED_STATES
+        """Run the mascot's frame timer except while loading or after an
+        error, where it shows the loop's first frame and costs nothing."""
+        animate = self._state not in self._MASCOT_STILL_STATES
         running = self.__dict__.get("_mascot_anim_id")
         if animate and not running:
             self._mascot_anim_id = self._root.after(
@@ -554,198 +662,140 @@ class OverlayWindow:
 
     def _mascot_tick(self):
         self._mascot_anim_id = None
-        self._mascot_index += 1
-        if self._mascot_clip != "loop":
-            # A one-shot clip (the zoom) hands over to the loop when done.
-            if self._mascot_index >= len(self._mascot_frames(1, clip=self._mascot_clip)):
-                self._mascot_clip = "loop"
-                self._mascot_index = 0
+        count = len(self._mascot_frames(1, clip=self._mascot_clip))
+        talking = bool(self.__dict__.get("_talking"))
+        step = 1
+        if self._mascot_clip == "zoom" and not talking and self._mascot_index < count // 2:
+            # Silence early in the zoom: play it back out, never jump mid-zoom.
+            step = -1
+        self._mascot_index += step
+        if self._mascot_index < 0 or self._mascot_index >= count:
+            # A clip boundary: the zoom repeats while someone talks.
+            self._mascot_clip = "zoom" if talking else "loop"
+            self._mascot_index = 0
         self._redraw()  # reschedules through _sync_mascot_animation
+
+    def set_talking(self, who: str, active: bool):
+        """who ("user" or "debora") started or stopped talking. The zoom
+        starts at once and ends at a clip boundary (see _mascot_tick)."""
+        talking = self.__dict__.setdefault("_talking", set())
+        was = bool(talking)
+        (talking.add if active else talking.discard)(who)
+        if who == "debora" and active:
+            self._voice_heard = True
+        if talking and not was and self._mascot_clip == "loop":
+            self._mascot_clip, self._mascot_index = "zoom", 0
+            if self._state not in self._MASCOT_STILL_STATES:
+                self._redraw()
 
     # --- Public state API -------------------------------------------------
 
-    def _cancel_timers(self):
-        for attr in ("_anim_id", "_auto_hide_id"):
-            tid = getattr(self, attr, None)
-            if tid:
-                self._root.after_cancel(tid)
-                setattr(self, attr, None)
-        self._dismiss_balloon()
-
-    def show_loading(self):
-        """Gray dot — model loading."""
-        self._cancel_timers()
-        self._state = "loading"
-        self._hover = False
-        self._animate(self.COMPACT_W, self.COMPACT_H)
-
-    def show_ready(self):
-        """Green dot — idle, waiting for hotkey."""
-        self._cancel_timers()
-        self._state = "ready"
-        self._hover = False
-        self._animate(self.COMPACT_W, self.COMPACT_H)
-
-    def show_recording(self, draft_text=""):
-        """Wider panel: "Listening..." or the draft so far."""
-        if self._state != "recording":
-            self._cancel_timers()
-            self._state = "recording"
-            self._animate(self.EXPANDED_W, self.EXPANDED_H)
-        self._draft_text = draft_text
-        self._redraw()
-
-    def show_processing(self, text: str = ""):
-        """Amber dot — transcribing."""
-        self._cancel_timers()
-        self._state = "processing"
-        self._animate(self.EXPANDED_W, self.COMPACT_H)
-        if self._show_balloon and text.strip():
-            self._show_balloon_popup(text)
-
-    def show_result(self, text: str):
-        """Green dot — transcription done. Text shown in balloon only."""
-        self._cancel_timers()
-        self._state = "result"
-        self._result_text = text
-        self._animate(self.COMPACT_W, self.COMPACT_H)
-        self._auto_hide_id = self._root.after(2500, self.show_ready)
-        if self._show_balloon and text.strip():
-            self._show_balloon_popup(text)
-
-    def show_speaking(self, text: str):
-        """Blue dot — voice chat speaks its reply (shown in the balloon). It
-        stays until the next state: the reply is not done until it is said."""
-        if self._state != "speaking":
-            self._cancel_timers()
-            self._state = "speaking"
-            self._mascot_clip = "zoom"
-            self._mascot_index = 0
-            self._animate(self.EXPANDED_W, self.COMPACT_H)
-        if self._show_balloon and text.strip():
-            self._show_balloon_popup(text)
-
-    def show_notice(self, text: str):
-        """A passing message in the balloon; the pill keeps its state."""
-        if self._show_balloon and text.strip():
-            self._show_balloon_popup(text)
-
-    def show_error(self):
-        """Red dot — error state."""
-        self._cancel_timers()
-        self._state = "error"
-        self._animate(self.COMPACT_W, self.COMPACT_H)
-
-    def set_show_balloon(self, enabled: bool):
-        """Enable or disable the text balloon under the notch."""
-        self._show_balloon = enabled
-
-    def set_balloon_font_size(self, size: int):
-        """Set the font size for balloon text."""
-        self.BALLOON_FONT_SIZE = max(10, min(size, 32))
-
-    # --- Balloon popup ----------------------------------------------------
-
-    def _show_balloon_popup(self, text: str):
-        """Show a dark tooltip-style balloon below the pill with full text."""
-        self._dismiss_balloon()
-        self._balloon_text = text
-
-        bw = self._balloon_win = tk.Toplevel(self._root)
-        bw.overrideredirect(True)
-        bw.attributes("-topmost", True)
-        bw.configure(bg=_TRANSPARENT)
-        try:
-            bw.attributes("-transparentcolor", _TRANSPARENT)
-        except Exception:
-            pass
-        try:
-            bw.attributes("-alpha", self.OPACITY)
-        except Exception:
-            pass
-
-        s = self._scale
-        pad = int(self.BALLOON_PAD * s)
-        r = int(self.BALLOON_RADIUS * s)
-        max_w = int(self.BALLOON_MAX_W * s)
-        fsize = self._font_pixels(self.BALLOON_FONT_SIZE, s)
-
-        canvas = tk.Canvas(bw, bg=_TRANSPARENT, highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
-
-        # Measure text to determine balloon size
-        tmp_id = canvas.create_text(
-            0, 0, text=text, font=self._font(fsize),
-            width=max_w - 2 * pad, anchor="nw",
-        )
-        bbox = canvas.bbox(tmp_id)
-        canvas.delete(tmp_id)
-
-        text_w = bbox[2] - bbox[0]
-        text_h = bbox[3] - bbox[1]
-        bw_w = text_w + 2 * pad
-        bw_h = text_h + 2 * pad
-        # Clamp minimum width
-        bw_w = max(bw_w, int(120 * s))
-
-        canvas.configure(width=bw_w, height=bw_h)
-
-        # Glass pill background for balloon (PIL-rendered)
-        balloon_pill = render_pill(bw_w, bw_h, radius=r, **self._flat())
-        composited = composite_on_transparent(balloon_pill)
-        photo = pil_to_photo(composited)
-        # Store reference to prevent GC
-        canvas._photo_ref = photo
-        canvas.create_image(0, 0, image=photo, anchor="nw")
-
-        # Draw text
-        canvas.create_text(
-            pad, pad, text=text, font=self._font(fsize),
-            fill=self.TEXT, width=max_w - 2 * pad, anchor="nw",
-        )
-
-        # Click anywhere on balloon to dismiss
-        canvas.bind("<ButtonPress-1>", lambda e: self._dismiss_balloon())
-
-        # Position below the pill
-        pill_x = self._win.winfo_x()
-        pill_y = self._win.winfo_y()
-        pill_w = int(self._cur_w)
-        pill_h = int(self._cur_h)
-        bx = pill_x + (pill_w - bw_w) // 2
-        by = pill_y + pill_h + int(self.BALLOON_GAP * s)
-        bw.geometry(f"{bw_w}x{bw_h}+{bx}+{by}")
-
-        # Apply no-focus flags
-        try:
-            import ctypes
-            GWL_EXSTYLE = -20
-            WS_EX_NOACTIVATE = 0x08000000
-            WS_EX_TOOLWINDOW = 0x00000080
-            WS_EX_APPWINDOW = 0x00040000
-            hwnd = ctypes.windll.user32.GetParent(bw.winfo_id())
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            style = (style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-        except Exception:
-            pass
-
-        # Auto-dismiss
-        self._balloon_id = self._root.after(self.BALLOON_DURATION, self._dismiss_balloon)
-
-    def _dismiss_balloon(self):
-        """Destroy the balloon popup if it exists."""
-        self._balloon_text = ""
-        if self._balloon_id:
+    def _cancel_dismiss(self):
+        if self._balloon_id is not None:
             self._root.after_cancel(self._balloon_id)
             self._balloon_id = None
-        if self._balloon_win:
-            try:
-                self._balloon_win.destroy()
-            except Exception:
-                pass
-            self._balloon_win = None
+
+    def _finish_turn(self):
+        self._turn_finished = True
+        if self._balloon_id is None and not self._text_dismissed:
+            self._balloon_id = self._root.after(self.BALLOON_DURATION, self._dismiss_balloon)
+
+    def _new_turn(self, voice_chat=False):
+        self._cancel_dismiss()
+        self._reset_slides()
+        self._user_text = self._reply_text = ""
+        self._voice_turn = voice_chat
+        self._turn_finished = False
+        self._text_dismissed = False
+
+    def _set_state(self, state):
+        if state in self._MASCOT_STILL_STATES:
+            # A replaced or failed engine never reports that the voices
+            # stopped; nobody is talking until a new one says so.
+            self.__dict__.setdefault("_talking", set()).clear()
+        if state == "processing":
+            self._voice_heard = False  # a new input: pulse until she speaks
+        self._state = state
+
+    def show_loading(self):
+        self._set_state("loading")
+        self._update_layout()
+
+    def show_ready(self):
+        if self._user_text or self._reply_text:
+            self._finish_turn()
+        self._set_state("ready")
+        self._update_layout()
+
+    def show_recording(self, draft_text="", voice_chat=False):
+        # Continuous listening resumes with an empty draft after TTS. Keep
+        # that turn through its normal delay, until actual new speech arrives.
+        finishing = self._voice_turn and self._state in ("speaking", "processing")
+        if finishing and not draft_text:
+            self._finish_turn()
+        elif draft_text and (self._turn_finished or self._state != "recording"):
+            self._new_turn(voice_chat)
+        elif self._state != "recording" and (not self._turn_finished or not self._voice_turn):
+            self._new_turn(voice_chat)
+        self._set_state("recording")
+        if draft_text:
+            self._user_text = draft_text
+        self._update_layout()
+
+    def show_processing(self, text="", voice_chat=False):
+        self._set_state("processing")
+        if text.strip():
+            if self._turn_finished:
+                self._new_turn(voice_chat)
+            self._voice_turn = voice_chat
+            self._user_text = text
+            self._cancel_dismiss()
+        self._update_layout()
+
+    def show_result(self, text):
+        if self._voice_turn and not self._turn_finished:
+            self._reply_text = text
+        else:
+            if self._turn_finished:
+                self._new_turn()
+            self._user_text = text
+        self._set_state("ready")
+        self._finish_turn()
+        self._update_layout()
+
+    def show_speaking(self, text):
+        self._cancel_dismiss()
+        self._voice_turn = True
+        self._reply_text = text
+        self._set_state("speaking")
+        self._update_layout()
+
+    def show_notice(self, text):
+        """Notices belong to the tray; never overwrite conversation content."""
+
+    def show_error(self):
+        if self._state in ("speaking", "processing") and (self._user_text or self._reply_text):
+            self._finish_turn()
+        self._set_state("error")
+        self._update_layout()
+
+    def set_show_balloon(self, enabled):
+        """The Settings checkbox controls the in-window text area."""
+        self._show_balloon = enabled
+        self._update_layout()
+
+    def set_balloon_font_size(self, size):
+        self.BALLOON_FONT_SIZE = max(10, min(size, 32))
+        self._reset_slides()
+        self._update_layout()
+
+    def _dismiss_balloon(self):
+        # Retain the turn internally so another streamed sentence cannot
+        # reopen text that the user just dismissed.
+        self._cancel_dismiss()
+        self._text_dismissed = True
+        self._reset_slides()
+        self._update_layout()
 
     def hide(self):
-        """Dynamic Island is always visible — hide means go to ready."""
         self.show_ready()

@@ -196,16 +196,118 @@ only works where the editor leaves the typed text and caret alone; editors
 with autocomplete, auto-closing brackets, autocorrect or slow input handling
 (browsers, Word, IDEs) can garble the result.
 
-### Voice chat (OpenVINO LLM + Chatterbox)
+### Voice chat with Claude Code
+
+Choose **Claude Code** and a **Harness folder** in Settings, or run
+`debora-cli --voice-chat --voice-chat-backend claude --harness-cwd D:\my-project`.
+Claude Code must already be installed, authenticated and on PATH. Qwen remains
+the default (`"voice_chat_backend": "local"`); speech recognition and TTS stay local.
+
+```json
+{
+  "voice_chat": true,
+  "voice_chat_backend": "claude",
+  "harness_cwd": null,
+  "harness_model": null,
+  "harness_permission_mode": "acceptEdits",
+  "harness_permission_response": "deny",
+  "harness_allowed_tools": null,
+  "harness_prompt_file": null,
+  "harness_memory_file": null,
+  "harness_hotwords": true,
+  "language": "pt"
+}
+```
+
+`harness_cwd: null` uses your home folder; **Browse…** selects a project and
+**Use home** restores that default. `harness_model: null` uses Claude's default.
+One Claude process stays alive across turns and receives the raw transcript.
+Its folder supplies project context and settings. Débora supplies voice rules
+from its packaged prompt, plus language and process-start date/time, through a
+temporary file; it creates no context files in the project. `harness_prompt_file`
+overrides those rules (relative paths are resolved from the harness folder).
+
+Voice recognition corrections have their own memory, separate from Claude's shared
+auto-memory: `harness_memory_file: null` creates `~/.debora/harness/voice_memory.md`
+with a header on first use. A custom path is resolved from the harness folder;
+its parent should be a dedicated memory directory, passed to Claude with `--add-dir`.
+Only Débora launches inject this file (last 100 lines, at most 8 KiB; truncation is
+logged). Claude records recurring or user-corrected mistakes as
+`- "dictêixon engine" → dictation_engine.py (debora-whisper)` and keeps fewer than
+100 lines. Content edits do not restart Claude; the next process start reloads them.
+Changing the file path restarts it on the next turn. Ordinary terminal sessions
+are not configured to load this file. `--add-dir` adds edit permission for the memory
+directory; it does not restrict existing permissions or the working directory
+(using your home as `harness_cwd` already includes `~/.debora`).
+
+With `harness_hotwords: true` (default), Claude voice chat also feeds the corrected
+terms to Whisper as recognition hints: newest entries first, deduplicated ignoring
+case, capped at 40 terms / 150 estimated tokens and cached by file modification time.
+Memory edits affect the next transcription without restarting Claude. The mode is
+captured when recording starts (including continuous listening); dictation and local
+Qwen receive no hints. Set it to `false` to disable. OpenVINO uses a hotwords string
+(or `initial_prompt` on older runtimes); faster-whisper uses hotwords when supported.
+Parakeet skips hints and logs that once; hint changes log counts, never the terms.
+
+`harness_allowed_tools: null` adds the packaged read-only diagnostic rules via
+`--allowedTools`, for both `Bash(...)` and `PowerShell(...)`. These are exact
+command forms: git status/log/diff/show/branch, Docker ps/info/images/version
+and compose ps, WSL list, zellij list-sessions, nvidia-smi, Get-ChildItem,
+Get-Process and Get-Service, plus `Get-Content README.md` and `Test-Path .`
+(including their `-Path` forms). Common variants such as `git status --short`,
+`git branch --all`, `docker ps -a` and `wsl -l -v` are included; the complete
+list is `DEFAULT_ALLOWED_TOOLS` in `debora_whisper/harness.py`. Exact forms
+avoid granting arbitrary flags that write files, delete branches, change GPU
+settings or follow logs indefinitely.
+
+A list replaces these defaults, for example
+`["PowerShell(docker info:*)", "PowerShell(docker ps:*)", "Bash(docker ps:*)"]`.
+Use `[]` to add no rules. Add explicit file paths for other Get-Content reads.
+Changing the list restarts the harness on the next turn. In CLI 2.1.295,
+`PowerShell(docker info)` and `PowerShell(docker ps)` also allow the compound
+`docker info; docker ps`; both `:*` and ` *` prefix forms worked in the manual
+[CLI probe](docs/benchmarks/harness-2026-10-09/README.md#regras-de-diagnóstico-sem-pergunta).
+
+Permissions already allowed by Claude's mode/settings proceed normally. Pending
+requests are denied and logged by default; `harness_permission_response: "allow"`
+automatically approves them instead. Spoken permission questions are a later phase.
+Tools and decisions appear in `~/.debora/logs/app.log`. Replies stream into the
+existing TTS; fenced code and list markers are removed. After 1.5 seconds without
+text, Débora queues “Um instante.” once. Actual playback depends on TTS readiness.
+
+Session IDs are saved by folder in `~/.debora/harness_session.json` and logged.
+After stopping Débora, open that folder in a terminal and run
+`claude --resume <session-id>` to continue. Restarting Débora resumes the same
+conversation; say “nova conversa” or “new conversation” to start a new one.
+Backend/folder changes take effect on the next turn. This backend has no local
+eight-turn history limit or idle reset. See the
+[protocol findings](docs/benchmarks/harness-2026-10-09/README.md).
+
+### Voice chat with the local OpenVINO LLM + Chatterbox
 
 Voice chat is on by default (`"voice_chat": true`; turn it off in Settings or
 the tray to dictate instead). While it is on, nothing is typed: each final transcription goes to a local LLM, and its reply
 is spoken by a local TTS server and shown in the overlay. The reply streams and
 plays sentence by sentence. The conversation keeps the last 8 turns and starts
-over after 10 minutes of silence. In continuous listening the microphone is
-muted while the reply plays; a hotkey press cuts the reply short. A sentence
-ends after 0.8 s of silence (`voice_chat_end_silence_seconds`; dictation
-waits 1.5–3 s), and the reply's sentences play back to back on one audio stream.
+over after 10 minutes of silence (Claude keeps its own persistent history).
+In continuous listening the microphone stays open during thinking and playback.
+New user speech interrupts the reply and becomes the next turn by default
+(`voice_chat_barge_in: true`); with `false`, transcriptions wait in order until
+the reply finishes. The hotkey also interrupts. This works with Claude and Qwen.
+A sentence normally ends after 0.8 s of silence (`voice_chat_end_silence_seconds`).
+An incomplete draft, including trailing `...`, `…`, or a dangling connective,
+allows 2 s (`voice_chat_incomplete_silence_seconds`; dictation waits 1.5–3 s).
+
+Headphones are recommended for simultaneous listening and playback. With speakers,
+`voice_chat_echo_filter: true` compares normalized words against audio actually
+played during the captured segment, allowing a 2 s echo tail. At least 60% token
+overlap is treated as echo and is not sent to the LLM. This is a text heuristic:
+it can mistake a user repeating Débora for echo, or miss distorted speaker audio.
+Headphone users can disable the filter. Every nonempty final transcription is
+logged in `app.log` and added immediately to the usual transcription history,
+including queued, interrupted, cancelled, failed and echo-filtered entries with
+status labels. History retains its usual last 20 entries; logs retain older text
+subject to log rotation. Raw recordings are not archived.
 
 Switch it on or off while the app runs, from **Voice chat** in the tray menu
 or in Settings: no restart. Switching on starts the TTS server and loads the
@@ -216,6 +318,9 @@ loaded until the app exits, so switching back is instant.
 ```json
 {
   "voice_chat": true,
+  "voice_chat_incomplete_silence_seconds": 2.0,
+  "voice_chat_echo_filter": true,
+  "voice_chat_barge_in": true,
   "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
   "llm_device": "GPU",
   "llm_prompt": null,
@@ -466,6 +571,25 @@ Remove-Item -Recurse $HOME\.debora; Rename-Item $HOME\.debora.bak $HOME\.debora
 if ($env:MODELS_DIR) { Rename-Item "$env:MODELS_DIR\voices.off" voices }
 uv tool install --editable .
 ```
+
+### Editable install with the NVIDIA backend
+
+The `cuda` extra adds faster-whisper and the CUDA runtime DLLs (~2 GB from
+PyPI). An editable install picks up code changes on restart, but changing
+extras needs a reinstall:
+
+```powershell
+uv tool install --editable ".[cuda]" --reinstall
+# back to the lighter install
+uv tool install --editable . --reinstall
+```
+
+With the extra installed, `device_priority` (`CUDA` first by default) moves
+Whisper to the RTX. When voice chat is on, Chatterbox also runs there, and an
+8 GB card can run out of video memory. To keep Whisper on the NPU, put `NPU`
+first in `device_priority` or start with `--device NPU`. The TTS server is not
+affected by the extra: it runs in its own uv environment with its own CUDA
+build of torch.
 
 `docs/` is source material (branding, voice recordings) and is not part of the
 wheel or the sdist; the voices the app uses ship in `debora_whisper/voices/`.
