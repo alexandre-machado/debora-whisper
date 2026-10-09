@@ -15,12 +15,25 @@ C_PROCESSING = "#06B6D4"       # Ciano Brilhante (Transcrevendo/Holograma)
 C_LOADING = "#3B82F6"          # Azul Elétrico (Carregando modelo)
 C_SPEAKING = "#0EA5E9"         # Azul/Ciano Vivo (Assistente falando)
 
+def draw_hexagon(draw, cx, cy, size, fill):
+    """Desenha um hexágono centrado em (cx, cy)."""
+    points = []
+    for i in range(6):
+        angle_deg = 60 * i - 30
+        angle_rad = math.pi / 180 * angle_deg
+        points.append((cx + size * math.cos(angle_rad), cy + size * math.sin(angle_rad)))
+    draw.polygon(points, outline=fill)
+
 def render_bars(color, heights, size=ICON_SIZE):
-    """Renderiza um ícone com 5 barras verticais de tamanhos variáveis."""
+    """Renderiza um ícone com 5 barras verticais estilo holograma/neon."""
     s = 3
     ss = size * s
     img = Image.new("RGBA", (ss, ss), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
+
+    # Extrai RGB da cor hexadecimal
+    hex_color = color.lstrip('#')
+    r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
     num_bars = 5
     bar_width = int(ss * 0.12)  # ~7-8px for 64px
@@ -29,11 +42,33 @@ def render_bars(color, heights, size=ICON_SIZE):
     total_width = (num_bars * bar_width) + ((num_bars - 1) * spacing)
     start_x = (ss - total_width) // 2
 
+    # Fundo: Malha hexagonal sutil (holograma)
+    hex_layer = Image.new("RGBA", (ss, ss), (0, 0, 0, 0))
+    hex_draw = ImageDraw.Draw(hex_layer)
+    hex_size = int(ss * 0.06)
+    hex_h = hex_size * math.sqrt(3)
+    hex_w = hex_size * 2
+    hex_color_t = (r, g, b, 40)  # Levemente mais visível
+    
+    for row in range(int(ss / (hex_h * 0.8)) + 2):
+        for col in range(int(ss / (hex_w * 0.75)) + 2):
+            cx = col * hex_w * 0.75
+            cy = row * hex_h
+            if col % 2 == 1:
+                cy += hex_h / 2
+            draw_hexagon(hex_draw, cx, cy, hex_size, hex_color_t)
+            
+    img = Image.alpha_composite(img, hex_layer)
+
     for i, h_pct in enumerate(heights):
-        # Max height is 80% of the icon size
+        # Cada barra numa camada própria, composta por cima: desenhada direto
+        # em img, o brilho de uma barra apagaria a anterior e a malha.
+        bar_layer = Image.new("RGBA", (ss, ss), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(bar_layer)
+        # Altura máxima é 80% do ícone
         max_h = ss * 0.8
         bar_h = int(max_h * h_pct)
-        # Minimum height so it's always visible
+        # Altura mínima para sempre ficar visível
         bar_h = max(bar_h, int(ss * 0.15))
 
         x0 = start_x + i * (bar_width + spacing)
@@ -41,7 +76,41 @@ def render_bars(color, heights, size=ICON_SIZE):
         y0 = (ss - bar_h) // 2
         y1 = y0 + bar_h
 
-        draw.rounded_rectangle([x0, y0, x1, y1], radius=bar_width//2, fill=color)
+        # Efeito Neon / Glow
+        glow_layers = 6
+        for glow_idx in range(glow_layers, 0, -1):
+            glow_expand = glow_idx * int(ss * 0.02)
+            glow_opacity = int(255 * (0.25 / glow_layers) * (glow_layers - glow_idx + 1))
+            draw.rounded_rectangle(
+                [x0 - glow_expand, y0 - glow_expand, x1 + glow_expand, y1 + glow_expand],
+                radius=int((bar_width // 2) + glow_expand),
+                fill=(r, g, b, glow_opacity)
+            )
+
+        # Barra principal
+        draw.rounded_rectangle([x0, y0, x1, y1], radius=int(bar_width//2), fill=(r, g, b, 210))
+        
+        # Núcleo brilhante (branco/tom claro da cor)
+        core_expand = int(ss * 0.02)
+        if bar_width - 2 * core_expand > 0 and bar_h - 2 * core_expand > 0:
+            core_r = min(255, r + 130)
+            core_g = min(255, g + 130)
+            core_b = min(255, b + 130)
+            draw.rounded_rectangle(
+                [x0 + core_expand, y0 + core_expand, x1 - core_expand, y1 - core_expand],
+                radius=int(max(1, (bar_width//2) - core_expand)),
+                fill=(core_r, core_g, core_b, 255)
+            )
+        img = Image.alpha_composite(img, bar_layer)
+
+    # Scanlines (Glitch/Holograma)
+    scanline_overlay = Image.new("RGBA", (ss, ss), (0, 0, 0, 0))
+    scan_draw = ImageDraw.Draw(scanline_overlay)
+    for y in range(0, ss, 6):
+        scan_draw.line([(0, y), (ss, y)], fill=(0, 0, 0, 40), width=2)
+        scan_draw.line([(0, y+2), (ss, y+2)], fill=(255, 255, 255, 25), width=1)
+    
+    img = Image.alpha_composite(img, scanline_overlay)
 
     return img.resize((size, size), Image.LANCZOS)
 

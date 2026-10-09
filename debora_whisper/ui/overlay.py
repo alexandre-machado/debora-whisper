@@ -14,6 +14,11 @@ from debora_whisper.ui.glass import (
 
 # Débora's face, shown at the panel's left edge.
 MASCOT_PATH = Path(__file__).parent / "assets" / "mascot.png"
+# Her animated bust, 12 fps, 228x128, cut from a generated video: a calm
+# loop (played forward then back, so it has no seam) and a zoom into her face
+# and back, played once when she starts to speak.
+MASCOT_LOOP_PATH = Path(__file__).parent / "assets" / "mascot_loop.webp"
+MASCOT_ZOOM_PATH = Path(__file__).parent / "assets" / "mascot_zoom.webp"
 
 # Color used for window transparency (never appears in UI)
 _TRANSPARENT = TRANSPARENT_COLOR
@@ -51,6 +56,12 @@ class OverlayWindow:
     AMBER = "#FF9F0A"
     BLUE = "#0A84FF"
     GRAY = "#48484A"
+
+    # The mascot moves only while she listens or speaks.
+    _MASCOT_ANIMATED_STATES = ("recording", "speaking")
+    MASCOT_FPS = 12
+    MASCOT_FEATHER = 2  # logical px of haze where the mascot meets the panel
+    MASCOT_ASPECT = 16 / 9  # the whole video frame, uncropped
 
     # States in which a click toggles recording (speaking: cuts the reply).
     _CLICK_STATES = ("ready", "recording", "speaking")
@@ -100,6 +111,9 @@ class OverlayWindow:
         # State
         self._state = "loading"
         self._hover = False
+        self._mascot_clip = "loop"
+        self._mascot_index = 0
+        self._mascot_anim_id = None
         self._result_text = ""
 
         # Timer IDs
@@ -361,36 +375,24 @@ class OverlayWindow:
         # Work on a copy so the cache stays clean
         frame = pill.copy()
 
-        # Draw the mascot thumbnail on the left
-        try:
-            if not hasattr(self, "_mascot_img"):
-                from PIL import Image
-                # Shipped inside the package, so every install has it.
-                self._mascot_img = Image.open(MASCOT_PATH).convert("RGBA")
-            
-            icon_size = h - int(4 * s) # 2px padding top/bottom
-            if getattr(self, "_last_icon_size", 0) != icon_size:
-                from PIL import Image, ImageDraw
-                img = self._mascot_img.resize((icon_size, icon_size), Image.LANCZOS)
-                mask = Image.new('L', (icon_size, icon_size), 0)
-                ImageDraw.Draw(mask).ellipse((0, 0, icon_size, icon_size), fill=255)
-                circular_img = Image.new('RGBA', (icon_size, icon_size), (0, 0, 0, 0))
-                circular_img.paste(img, (0, 0), mask)
-                self._mascot_thumb = circular_img
-                self._last_icon_size = icon_size
-            
-            frame.alpha_composite(self._mascot_thumb, (int(2 * s), int(2 * s)))
-        except Exception as e:
-            pass
+        # The mascot on the left; it moves while she listens or speaks.
+        self._sync_mascot_animation()
+        pad = int(2 * s)
+        frames = self._mascot_frames(h - 2 * pad, max(1, round(self.MASCOT_FEATHER * s)),
+                                     max(1, round(self.RADIUS * s)),
+                                     clip=self._mascot_clip)
+        icon_right = pad
+        if frames:
+            thumb = frames[self._mascot_index % len(frames)]
+            frame.alpha_composite(thumb, (pad, pad))
+            icon_right = pad + thumb.width
 
         label, fill, bold = self._label()
         text_items = []  # (x, y, text, fill, font, anchor) — drawn after image
         if label:
             font = self._font(font_size, semibold=bold)
-            # Shift text center to account for the mascot on the left
-            icon_w = h
-            remaining_w = w - icon_w
-            text_cx = icon_w + remaining_w // 2
+            # Centered in the space right of the mascot
+            text_cx = icon_right + (w - icon_right) // 2
             text_items.append((text_cx, mid, label, fill, font, "center"))
 
         # Flatten to RGB on transparent background and place as one image
@@ -490,6 +492,76 @@ class OverlayWindow:
         self._redraw()
         self._anim_id = self._root.after(16, self._anim_tick)
 
+    # --- Mascot -----------------------------------------------------------
+
+    def _mascot_frames(self, height: int, feather: int = 0, radius: int = 0,
+                       clip: str = "loop") -> list:
+        """A mascot clip's frames as rounded rectangles height px tall in the
+        video's 16:9, whose edge fades out over about feather px (a haze into
+        the panel), cached per size. The loop falls back to the still image
+        (center-cropped to 16:9); a clip that does not load has no frames."""
+        cache = self.__dict__.setdefault("_mascot_cache", {})
+        key = (clip, height, feather, radius)
+        if key in cache:
+            return cache[key]
+        from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageSequence
+        all_sources = self.__dict__.setdefault("_mascot_sources", {})
+        sources = all_sources.get(clip)
+        if sources is None:
+            sources = []
+            paths = (MASCOT_LOOP_PATH, MASCOT_PATH) if clip == "loop" else (MASCOT_ZOOM_PATH,)
+            for path in paths:
+                try:
+                    with Image.open(path) as img:
+                        sources = [f.convert("RGBA") for f in ImageSequence.Iterator(img)]
+                    break
+                except Exception:
+                    continue
+            all_sources[clip] = sources
+        frames = []
+        if sources and height > 0:
+            width = round(height * self.MASCOT_ASPECT)
+            ss = 4  # supersampled, for a smooth edge
+            inset = feather * ss
+            mask = Image.new("L", (width * ss, height * ss), 0)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (inset, inset, width * ss - 1 - inset, height * ss - 1 - inset),
+                radius=radius * ss, fill=255)
+            if feather:
+                mask = mask.filter(ImageFilter.GaussianBlur(inset / 2))
+            mask = mask.resize((width, height), Image.LANCZOS)
+            for src in sources:
+                thumb = ImageOps.fit(src, (width, height), Image.LANCZOS)
+                thumb.putalpha(mask)
+                frames.append(thumb)
+        cache[key] = frames
+        return frames
+
+    def _sync_mascot_animation(self):
+        """Run the mascot's frame timer only in the animated states; the
+        other states show the loop's first frame and cost nothing."""
+        animate = self._state in self._MASCOT_ANIMATED_STATES
+        running = self.__dict__.get("_mascot_anim_id")
+        if animate and not running:
+            self._mascot_anim_id = self._root.after(
+                1000 // self.MASCOT_FPS, self._mascot_tick)
+        elif not animate:
+            if running:
+                self._root.after_cancel(running)
+                self._mascot_anim_id = None
+            self._mascot_clip = "loop"
+            self._mascot_index = 0
+
+    def _mascot_tick(self):
+        self._mascot_anim_id = None
+        self._mascot_index += 1
+        if self._mascot_clip != "loop":
+            # A one-shot clip (the zoom) hands over to the loop when done.
+            if self._mascot_index >= len(self._mascot_frames(1, clip=self._mascot_clip)):
+                self._mascot_clip = "loop"
+                self._mascot_index = 0
+        self._redraw()  # reschedules through _sync_mascot_animation
+
     # --- Public state API -------------------------------------------------
 
     def _cancel_timers(self):
@@ -545,6 +617,8 @@ class OverlayWindow:
         if self._state != "speaking":
             self._cancel_timers()
             self._state = "speaking"
+            self._mascot_clip = "zoom"
+            self._mascot_index = 0
             self._animate(self.EXPANDED_W, self.COMPACT_H)
         if self._show_balloon and text.strip():
             self._show_balloon_popup(text)
