@@ -5,11 +5,15 @@ Uses PIL supersampled rendering via ui.glass for anti-aliased shapes.
 """
 
 import tkinter as tk
+from pathlib import Path
 
 from debora_whisper.ui.glass import (
     TRANSPARENT_COLOR, PillCache, composite_on_transparent, pil_to_photo,
     render_pill, _hex_to_rgba,
 )
+
+# Débora's face, shown at the panel's left edge.
+MASCOT_PATH = Path(__file__).parent / "assets" / "mascot.png"
 
 # Color used for window transparency (never appears in UI)
 _TRANSPARENT = TRANSPARENT_COLOR
@@ -361,9 +365,8 @@ class OverlayWindow:
         try:
             if not hasattr(self, "_mascot_img"):
                 from PIL import Image
-                import os
-                path = os.path.join(os.path.dirname(__file__), "..", "..", "docs", "assets", "branding", "mascot_v2_thumbnail.png")
-                self._mascot_img = Image.open(path).convert("RGBA")
+                # Shipped inside the package, so every install has it.
+                self._mascot_img = Image.open(MASCOT_PATH).convert("RGBA")
             
             icon_size = h - int(4 * s) # 2px padding top/bottom
             if getattr(self, "_last_icon_size", 0) != icon_size:

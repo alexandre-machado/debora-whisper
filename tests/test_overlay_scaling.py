@@ -112,7 +112,7 @@ def test_a_click_does_nothing_while_busy(state):
 
 @pytest.mark.parametrize("state, draft, label", [
     ("ready", "", "Ready"),
-    ("recording", "", "Listening..."),
+    ("recording", "", ""),  # the mascot alone says it is listening
     ("recording", "ola tudo bem", "ola tudo bem"),
     ("processing", "", "Transcribing..."),
     ("speaking", "", "Speaking..."),
@@ -229,3 +229,11 @@ def test_speaking_stays_until_the_next_state_and_shows_the_reply():
     overlay._animate.assert_called_once()
     overlay._root.after.assert_not_called()  # no auto-return to Ready
     assert overlay._show_balloon_popup.call_args.args == ("Oi, tudo bem!",)
+
+
+def test_mascot_ships_inside_the_package():
+    from PIL import Image
+    from debora_whisper.ui.overlay import MASCOT_PATH
+    assert "debora_whisper" in MASCOT_PATH.parts
+    with Image.open(MASCOT_PATH) as img:
+        assert img.size[0] == img.size[1] >= 64
