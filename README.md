@@ -418,6 +418,52 @@ Code lives in the `debora_whisper` package: `app.py` (tray app, `debora`),
 Dependencies are declared in `pyproject.toml`: runtime by default, plus the
 `cuda` (RTX), `export` (custom model export) and `test` extras.
 
+### Clean install from a branch
+
+To try a branch the way a user would get it, not from an editable install,
+quit the app first (tray → Quit, so it does not save its config on exit), then:
+
+```powershell
+# 1. Remove the current install
+uv tool uninstall debora-whisper
+
+# 2. Start from a fresh config (logs and config only; models stay put)
+Rename-Item $HOME\.debora $HOME\.debora.bak
+
+# 3. With MODELS_DIR set, hide your voices there so the bundled ones are used
+#    (a voice of the same name in the voices folder wins)
+if ($env:MODELS_DIR) { Rename-Item "$env:MODELS_DIR\voices" voices.off }
+
+# 4a. Install the pushed branch (exactly what others would get)...
+uv tool install "git+https://github.com/alexandre-machado/debora-whisper@<branch>"
+# 4b. ...or the local checkout, without pushing
+uv tool install --reinstall .
+
+# 5. Run as Administrator (global hotkeys)
+debora
+```
+
+What to check: Settings lists the bundled voices (`carol`, `debora`,
+`debora_v2`, `isabel`, `mari`) with `debora_v2` selected, and voice chat
+speaks with it.
+
+What this does not cover: with `MODELS_DIR` set, models still come from that
+folder (unsetting it downloads several GB of models again), and the
+uv and Hugging Face caches keep the Chatterbox environment and weights, which a
+new machine downloads on first use.
+
+Back to development:
+
+```powershell
+uv tool uninstall debora-whisper
+Remove-Item -Recurse $HOME\.debora; Rename-Item $HOME\.debora.bak $HOME\.debora
+if ($env:MODELS_DIR) { Rename-Item "$env:MODELS_DIR\voices.off" voices }
+uv tool install --editable .
+```
+
+`docs/` is source material (branding, voice recordings) and is not part of the
+wheel or the sdist; the voices the app uses ship in `debora_whisper/voices/`.
+
 ### Releasing
 
 Bump `__version__` in `debora_whisper/__init__.py`, then push a `vX.Y.Z` tag that
