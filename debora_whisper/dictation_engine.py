@@ -13,6 +13,7 @@ import re
 import argparse
 import inspect
 import threading
+import zlib
 from collections import deque
 from enum import Enum
 from pathlib import Path
@@ -39,6 +40,7 @@ LLM_SERVER_LOG = LOG_DIR / "llm_server.log"
 LOG_MAX_BYTES = 5_000_000
 # An NPU lost to DEVICE_LOST, until a recovery probe or a reboot (npu_lost_this_boot).
 NPU_LOST_FILE = CONFIG_DIR / "npu_lost.json"
+LAST_RECORDING = CONFIG_DIR / "last_recording.wav"
 
 DEFAULT_CONFIG = {
     "device": "NPU",           # Active device; chosen from device_priority at startup
@@ -103,6 +105,9 @@ DEFAULT_CONFIG = {
     # Command that starts the TTS server when nothing answers at tts_url.
     # null: uv runs debora_whisper/tts_server.py with tts_voice.
     "tts_server_command": None,
+    # Diagnostics: keep the audio of the last transcription in
+    # last_recording.wav (overwritten each time) to reproduce a bad result.
+    "save_last_recording": False,
 }
 
 # Supported languages (Whisper's top languages + display names)
@@ -834,17 +839,27 @@ class FasterWhisperCUDA:
         # an RTX 4070) and returned a temperature-1.0 sample. The OpenVINO
         # path is greedy with no fallback; this matches it.
         hints = {"hotwords": hotwords} if hotwords and self.supports_hotwords() else {}
-        segments, info = self.pipeline.transcribe(
-            audio_data,
-            language=language if language != "auto" else None,
-            condition_on_previous_text=False,
-            without_timestamps=True,
-            temperature=0.0,
-            **hints,
-        )
 
-        # segments is a lazy generator: decoding happens here.
-        text = "".join(segment.text for segment in segments).strip()
+        def decode(**extra):
+            segments, _info = self.pipeline.transcribe(
+                audio_data,
+                language=language if language != "auto" else None,
+                condition_on_previous_text=False,
+                without_timestamps=True,
+                temperature=0.0,
+                **hints,
+                **extra,
+            )
+            # segments is a lazy generator: decoding happens here.
+            return "".join(segment.text for segment in segments).strip()
+
+        text = decode()
+        if is_repetition_loop(text):
+            # With the fallback off, a loop is kept as is: decode again
+            # with repeats penalized, as the OpenVINO path does.
+            log(f"Repetition loop in the transcription ({len(text)} chars); "
+                f"decoding again with repetition_penalty={RETRY_REPETITION_PENALTY}.")
+            text = fix_repetition_loop(decode(repetition_penalty=RETRY_REPETITION_PENALTY))
 
         elapsed = time.time() - start
         audio_duration = len(audio_data) / sample_rate
@@ -852,6 +867,110 @@ class FasterWhisperCUDA:
         log(f"Transcribed {audio_duration:.1f}s audio in {elapsed:.1f}s (RTF: {rtf:.2f}) on CUDA")
 
         return text
+
+
+# ---------------------------------------------------------------------------
+# Repetition loops
+# ---------------------------------------------------------------------------
+# Whisper's own compression threshold (openai/whisper transcribe.py).
+# High compression needs consecutive repeats to count as a decoding loop.
+COMPRESSION_RATIO_THRESHOLD = 2.4
+# Retry setting for a detected loop. OpenVINO GenAI 2026.4 ignores
+# no_repeat_ngram_size in WhisperPipeline (verified on CPU and NPU: no effect
+# even at 1); repetition_penalty is applied on both.
+RETRY_REPETITION_PENALTY = 1.5
+
+
+# Dictated digits ("zero zero zero um ...") compress like a loop but are
+# speech. They are left out of the loop check and never collapsed, so a
+# number is not shortened; a loop made only of them is typed as is.
+_NUMBER_WORDS = frozenset("""
+    zero one two three four five six seven eight nine oh
+    um uma dois duas três tres quatro cinco seis meia sete oito nove
+    cero uno dos cuatro siete ocho nueve
+""".split())
+_WORD_PUNCTUATION = ".,!?;:…"
+
+
+def _is_number_word(word: str) -> bool:
+    word = word.lower().strip(_WORD_PUNCTUATION)
+    return word in _NUMBER_WORDS or (word != "" and all(c.isdigit() or c in ".,-/" for c in word))
+
+
+def is_repetition_loop(text: str) -> bool:
+    words = [w for w in text.split() if not _is_number_word(w)]
+    data = " ".join(words).encode("utf-8")
+    if len(data) < 60:  # short text compresses badly; nothing to judge
+        return False
+    return (len(data) / len(zlib.compress(data)) > COMPRESSION_RATIO_THRESHOLD
+            and collapse_repetitions(text) != " ".join(text.split()))
+
+
+def collapse_repetitions(text: str, max_ngram: int | None = None, min_repeats: int = 3) -> str:
+    """Keep one copy of any phrase repeated min_repeats or more times in a
+    row. By default, phrase length is unlimited. Two repeats are left alone."""
+    words = text.split()
+    norm = [w.lower().strip(_WORD_PUNCTUATION) for w in words]
+    size = len(words)
+    # Common prefix lengths make each phrase comparison constant-time.
+    # O(words²) time/space is bounded for Whisper's few hundred output words.
+    common = [[0] * (size + 1) for _ in range(size + 1)]
+    for i in range(size - 1, -1, -1):
+        for j in range(i + 1, size):
+            if norm[i] == norm[j]:
+                common[i][j] = 1 + common[i + 1][j + 1]
+    non_numbers = [0]
+    for word in norm:
+        non_numbers.append(non_numbers[-1] + (not _is_number_word(word)))
+    out, i = [], 0
+    while i < size:
+        keep, step = 1, 1
+        limit = (size - i) // min_repeats
+        if max_ngram is not None:
+            limit = min(limit, max_ngram)
+        for n in range(1, limit + 1):
+            reps = 1 + common[i][i + n] // n
+            if reps >= min_repeats and non_numbers[i + n] > non_numbers[i]:
+                keep, step = n, reps * n
+                break
+        out.extend(words[i:i + keep])
+        i += step
+    return " ".join(out)
+
+
+def save_wav(path: Path, audio, sample_rate: int):
+    """Write float32 [-1, 1] mono audio as 16-bit PCM. Never raises."""
+    import wave
+    import numpy as np
+    try:
+        pcm = (np.clip(np.asarray(audio, dtype=np.float32).reshape(-1), -1.0, 1.0)
+               * 32767).astype("<i2")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(path), "wb") as f:
+            f.setnchannels(1)
+            f.setsampwidth(2)
+            f.setframerate(sample_rate)
+            f.writeframes(pcm.tobytes())
+        log(f"Saved the recording to {path}")
+    except Exception as e:
+        log(f"Could not save the recording: {e}")
+
+
+def discard_last_recording():
+    """The saved voice is not left behind once the option is off."""
+    try:
+        LAST_RECORDING.unlink(missing_ok=True)
+    except OSError as e:
+        log(f"Could not delete {LAST_RECORDING}: {e}")
+
+
+def fix_repetition_loop(text: str) -> str:
+    """Last resort after a retry that still loops: drop the repeats."""
+    if not is_repetition_loop(text):
+        return text
+    collapsed = collapse_repetitions(text)
+    log(f"Still looping after the retry; collapsed {len(text)} -> {len(collapsed)} chars.")
+    return collapsed
 
 
 # ---------------------------------------------------------------------------
@@ -935,6 +1054,23 @@ class WhisperNPU:
                 config.initial_prompt = hotwords
 
         ensure_devices_usable()
+        text = self._generate(audio_data, config)
+        if is_repetition_loop(text):
+            # Greedy decoding has no fallback here: a loop fills all 448
+            # tokens with one phrase. Decode again with repeats penalized.
+            log(f"Repetition loop in the transcription ({len(text)} chars); "
+                f"decoding again with repetition_penalty={RETRY_REPETITION_PENALTY}.")
+            config.repetition_penalty = RETRY_REPETITION_PENALTY
+            text = fix_repetition_loop(self._generate(audio_data, config))
+
+        elapsed = time.time() - start
+        audio_duration = len(audio_data) / sample_rate
+        rtf = elapsed / audio_duration if audio_duration > 0 else 0
+        log(f"Transcribed {audio_duration:.1f}s audio in {elapsed:.1f}s (RTF: {rtf:.2f}) on {self.device}")
+
+        return text
+
+    def _generate(self, audio_data, config) -> str:
         try:
             result = self.pipeline.generate(audio_data, config)
         except Exception as e:
@@ -943,14 +1079,7 @@ class WhisperNPU:
                 raise
             log(f"{kind} failure during inference on {self.device}: {e}")
             raise DeviceFailureError(kind, e) from e
-        text = str(result).strip()
-
-        elapsed = time.time() - start
-        audio_duration = len(audio_data) / sample_rate
-        rtf = elapsed / audio_duration if audio_duration > 0 else 0
-        log(f"Transcribed {audio_duration:.1f}s audio in {elapsed:.1f}s (RTF: {rtf:.2f}) on {self.device}")
-
-        return text
+        return str(result).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -2451,6 +2580,8 @@ class DictationApp:
 
     def __init__(self, config: dict):
         self.config = config
+        if not config.get("save_last_recording"):
+            discard_last_recording()
         self.recorder = AudioRecorder(
             sample_rate=config["sample_rate"],
             max_record_seconds=config.get("max_record_seconds"),
@@ -2919,6 +3050,8 @@ class DictationApp:
                     else:
                         self._set_state(AppState.READY)
                 return
+            if is_final and self.config.get("save_last_recording"):
+                save_wav(LAST_RECORDING, audio, self.config["sample_rate"])
 
             # Continuous mode transcribes all the time while the microphone
             # stays open: keep showing RECORDING (live waveform and draft)
