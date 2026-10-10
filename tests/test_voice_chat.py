@@ -104,19 +104,34 @@ def _tts_texts(server):
     return [body["text"] for path, body in server.requests if path == "/tts"]
 
 
+def _pt_now(t):
+    return f" Agora é {vc._PT_WEEKDAYS[t.tm_wday]}, " + time.strftime("%d/%m/%Y, %H:%M.", t)
+
+
+def _en_now(t):
+    return time.strftime(" It is now %A, %Y-%m-%d %H:%M.", t)
+
+
+def _respond_timed(chat, text):
+    """respond() and the clock read around it: the prompt states the current
+    minute, which may tick over while the reply is produced."""
+    before = time.localtime()
+    reply = chat.respond(text)
+    return reply, (before, time.localtime())
+
+
 def test_reply_is_streamed_and_spoken_sentence_by_sentence(server):
     llm = FakeLLM(["A capital ", "é Canberra. Fica", " no sul! Mais", " algo?"])
     chat, played = _chat(server, llm)
-    assert chat.respond("qual é a capital da austrália") == \
-        "A capital é Canberra. Fica no sul! Mais algo?"
+    reply, around = _respond_timed(chat, "qual é a capital da austrália")
+    assert reply == "A capital é Canberra. Fica no sul! Mais algo?"
     # "Fica no sul!" is too short to send alone: it waits for the next one.
     assert _tts_texts(server) == ["A capital é Canberra.", "Fica no sul! Mais algo?"]
     assert played == [(2400, 24000)] * 2
-    assert llm.calls[0] == [
-        {"role": "system", "content": vc.VOICE_CHAT_PROMPTS["pt"] +
-         f" Agora é {vc._PT_WEEKDAYS[time.localtime().tm_wday]}, " +
-         time.strftime("%d/%m/%Y, %H:%M.")},
-        {"role": "user", "content": "qual é a capital da austrália"}]
+    system, user = llm.calls[0]
+    assert system["role"] == "system"
+    assert system["content"] in {vc.VOICE_CHAT_PROMPTS["pt"] + _pt_now(t) for t in around}
+    assert user == {"role": "user", "content": "qual é a capital da austrália"}
     assert [b["language"] for p, b in server.requests if p == "/tts"] == ["pt"] * 2
 
 
@@ -142,10 +157,10 @@ def test_emoji_inside_a_sentence_is_not_spoken():
 def test_other_languages_get_the_english_prompt_and_their_language(server):
     llm = FakeLLM(["Hola, ¿qué tal?"])
     chat, _ = _chat(server, llm, language="es")
-    chat.respond("hola")
-    assert llm.calls[0][0]["content"] == vc.DEFAULT_VOICE_CHAT_PROMPT + \
-        " The user speaks Spanish: reply in Spanish." + \
-        time.strftime(" It is now %A, %Y-%m-%d %H:%M.")
+    _, around = _respond_timed(chat, "hola")
+    assert llm.calls[0][0]["content"] in {
+        vc.DEFAULT_VOICE_CHAT_PROMPT + " The user speaks Spanish: reply in Spanish."
+        + _en_now(t) for t in around}
 
 
 def test_configured_prompt_wins_over_her_portuguese_one(server):
@@ -159,8 +174,8 @@ def test_configured_prompt_wins_over_her_portuguese_one(server):
 def test_configured_prompt_is_used(server):
     llm = FakeLLM(["ok"])
     chat, _ = _chat(server, llm, llm_prompt="Seja breve.", language="auto")
-    chat.respond("oi")
-    assert llm.calls[0][0]["content"] == "Seja breve." +         time.strftime(" It is now %A, %Y-%m-%d %H:%M.")
+    _, around = _respond_timed(chat, "oi")
+    assert llm.calls[0][0]["content"] in {"Seja breve." + _en_now(t) for t in around}
 
 
 def test_earlier_turns_are_sent_as_history(server):
