@@ -851,8 +851,8 @@ class FasterWhisperCUDA:
 # ---------------------------------------------------------------------------
 # Repetition loops
 # ---------------------------------------------------------------------------
-# Whisper's own threshold (openai/whisper transcribe.py): text that zlib
-# compresses better than this is a decoding loop ("Oi Oi Oi ..."), not speech.
+# Whisper's own compression threshold (openai/whisper transcribe.py).
+# High compression needs consecutive repeats to count as a decoding loop.
 COMPRESSION_RATIO_THRESHOLD = 2.4
 # Retry setting for a detected loop. OpenVINO GenAI 2026.4 ignores
 # no_repeat_ngram_size in WhisperPipeline (verified on CPU and NPU: no effect
@@ -881,23 +881,35 @@ def is_repetition_loop(text: str) -> bool:
     data = " ".join(words).encode("utf-8")
     if len(data) < 60:  # short text compresses badly; nothing to judge
         return False
-    return len(data) / len(zlib.compress(data)) > COMPRESSION_RATIO_THRESHOLD
+    return (len(data) / len(zlib.compress(data)) > COMPRESSION_RATIO_THRESHOLD
+            and collapse_repetitions(text) != " ".join(text.split()))
 
 
-def collapse_repetitions(text: str, max_ngram: int = 8, min_repeats: int = 3) -> str:
-    """Keep one copy of any 1..max_ngram-word phrase repeated min_repeats or
-    more times in a row. Two repeats ("não, não") are left alone."""
+def collapse_repetitions(text: str, max_ngram: int | None = None, min_repeats: int = 3) -> str:
+    """Keep one copy of any phrase repeated min_repeats or more times in a
+    row. By default, phrase length is unlimited. Two repeats are left alone."""
     words = text.split()
     norm = [w.lower().strip(_WORD_PUNCTUATION) for w in words]
+    size = len(words)
+    # Common prefix lengths make each phrase comparison constant-time.
+    # O(words²) time/space is bounded for Whisper's few hundred output words.
+    common = [[0] * (size + 1) for _ in range(size + 1)]
+    for i in range(size - 1, -1, -1):
+        for j in range(i + 1, size):
+            if norm[i] == norm[j]:
+                common[i][j] = 1 + common[i + 1][j + 1]
+    non_numbers = [0]
+    for word in norm:
+        non_numbers.append(non_numbers[-1] + (not _is_number_word(word)))
     out, i = [], 0
-    while i < len(words):
+    while i < size:
         keep, step = 1, 1
-        for n in range(1, min(max_ngram, len(words) - i) + 1):
-            gram = norm[i:i + n]
-            reps = 1
-            while norm[i + reps * n:i + (reps + 1) * n] == gram:
-                reps += 1
-            if reps >= min_repeats and not all(map(_is_number_word, gram)):
+        limit = (size - i) // min_repeats
+        if max_ngram is not None:
+            limit = min(limit, max_ngram)
+        for n in range(1, limit + 1):
+            reps = 1 + common[i][i + n] // n
+            if reps >= min_repeats and non_numbers[i + n] > non_numbers[i]:
                 keep, step = n, reps * n
                 break
         out.extend(words[i:i + keep])
