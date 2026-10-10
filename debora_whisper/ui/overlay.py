@@ -13,7 +13,7 @@ from debora_whisper.ui.glass import (
 )
 
 # Débora's face, shown at the panel's left edge.
-MASCOT_PATH = Path(__file__).parent / "assets" / "mascot.png"
+MASCOT_PATH = Path(__file__).parent / "assets" / "debora.jpg"
 # Her animated bust, 12 fps, 228x128, cut from a generated video: a calm
 # loop (played forward then back, so it has no seam) and a zoom into her face
 # and back, repeated while someone talks (the user or her voice).

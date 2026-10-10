@@ -79,7 +79,7 @@ of `mascot_concept_matrix.jpg` (gold and cyan), not the violet emphasis above.
 > **Composition:** Square 1:1, dark navy background, no text, generous margin around the head so it still reads when cropped to a circle at 32 px.
 
 Save the result as `docs/assets/branding/mascot_v2_bust.png` (1024×1024). The
-app ships a 128 px crop of it as `debora_whisper/ui/assets/mascot.png`.
+app ships a 128 px crop of it as `debora_whisper/ui/assets/debora.jpg`.
 
 ## Entrance Animation Prompt (Match to Loop)
 

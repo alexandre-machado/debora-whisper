@@ -9,7 +9,7 @@
 
 1. Resposta parece um tooltip e pula para outro monitor — corrigido neste commit: balão compartilhado, atualização da mesma janela e posição limitada ao monitor da pílula.
 2. Texto quebra antes de ocupar a largura do balão — corrigido neste commit: medição e desenho usam toda a largura interna, com padding e fonte escalados por DPI.
-3. Animação diferente durante a fala — conferido, sem alteração: gravação usa `mascot_loop.webp`; fala começa com `mascot_zoom.webp` e depois volta ao loop; `mascot.png` é a imagem estática.
+3. Animação diferente durante a fala — conferido, sem alteração: gravação usa `mascot_loop.webp`; fala começa com `mascot_zoom.webp` e depois volta ao loop; `debora.jpg` é a imagem estática.
 4. Diagnósticos de shell sem perguntar — corrigido neste commit: `harness_allowed_tools`, padrões conservadores para Bash/PowerShell e prova com o CLI real; pedidos restantes continuam no handler.
 5. TTS começar mais cedo a partir do stream — implementado: tempos por chunk no
    `app.log` (entrada na fila, início/fim da síntese, duração do WAV e início da
