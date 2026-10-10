@@ -64,6 +64,53 @@ def test_cuda_requires_the_cuda_extra(monkeypatch, has_backend):
     monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: (
         (object() if has_backend else None) if name == "faster_whisper"
         else real_find_spec(name, *a)))
+    monkeypatch.setattr(de, "import_faster_whisper", lambda: object)
     devices = de.detect_devices()
     assert ("CUDA" in devices) is has_backend
     assert de.select_device(_cfg(), devices) == ("CUDA" if has_backend else "NPU")
+
+
+def _nvidia_with_faster_whisper(monkeypatch):
+    import importlib.util
+    import sys
+    import types
+    monkeypatch.setattr(de, "has_nvidia_gpu", lambda return_name=False: True)
+    monkeypatch.setitem(sys.modules, "openvino", types.SimpleNamespace(
+        Core=lambda: types.SimpleNamespace(available_devices=["CPU", "NPU"])))
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: (
+        object() if name == "faster_whisper" else real_find_spec(name, *a)))
+
+
+def test_cuda_backend_that_cannot_load_falls_back(monkeypatch):
+    # Installed but blocked (e.g. Windows Application Control on a DLL):
+    # start on the next device instead of failing to load CUDA.
+    _nvidia_with_faster_whisper(monkeypatch)
+
+    def blocked():
+        raise RuntimeError("faster-whisper cannot be loaded: DLL load failed")
+    monkeypatch.setattr(de, "import_faster_whisper", blocked)
+    devices = de.detect_devices()
+    assert "CUDA" not in devices
+    assert de.select_device(_cfg(), devices) == "NPU"
+
+
+def test_faster_whisper_loads_without_pyav(monkeypatch):
+    # PyAV only decodes audio files; a blocked PyAV must not disable CUDA.
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, "av", None)  # `import av` raises ImportError
+    model = object()
+    monkeypatch.setitem(sys.modules, "faster_whisper",
+                        types.SimpleNamespace(WhisperModel=model))
+    assert de.import_faster_whisper() is model
+    assert isinstance(sys.modules["av"], types.ModuleType)
+
+
+def test_faster_whisper_load_error_names_the_cause(monkeypatch):
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, "av", types.ModuleType("av"))
+    monkeypatch.setitem(sys.modules, "faster_whisper", None)
+    with pytest.raises(RuntimeError, match="cannot be loaded"):
+        de.import_faster_whisper()
