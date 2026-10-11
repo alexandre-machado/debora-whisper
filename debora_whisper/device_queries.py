@@ -1,24 +1,16 @@
 """Shared hardware queries. Call these in an isolated process for inventory."""
 import csv
 import io
-import os
-import shutil
+import shutil  # Kept for callers patching queries.shutil.which.
 import subprocess
-from pathlib import Path
 
+from debora_whisper import platforms
 from debora_whisper.processes import NO_WINDOW
 
 
 def nvidia_smi():
-    """Absolute path, so Windows never runs an nvidia-smi.exe from the
-    current folder."""
-    system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe"
-    if os.name == "nt" and system.is_file():
-        return str(system)
-    found = shutil.which("nvidia-smi")
-    if found is None or Path(found).resolve().parent == Path.cwd().resolve():
-        return None
-    return str(Path(found).resolve())
+    """Absolute executable as resolved by the operating system's provider."""
+    return platforms.current().nvidia_smi()
 
 
 def nvidia_output(fields=None, *, timeout=None, units=True):

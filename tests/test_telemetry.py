@@ -30,8 +30,10 @@ def test_npu_memory_failure_is_silent(monkeypatch):
     assert _app("NPU")._accelerator_memory() == ""
 
 
-def test_cuda_memory_comes_from_nvidia_smi(monkeypatch):
+def test_cuda_memory_comes_from_nvidia_smi(monkeypatch, tmp_path):
     import subprocess
+    from debora_whisper import device_queries
+    monkeypatch.setattr(device_queries, "nvidia_smi", lambda: str(tmp_path / "nvidia-smi.exe"))
     monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: b"5324, 8192\n")
     assert _app("CUDA")._accelerator_memory() == " VRAM 5.2/8.0G"
 
