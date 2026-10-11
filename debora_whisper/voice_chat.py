@@ -6,12 +6,14 @@ The reply is streamed and spoken sentence by sentence: the first sentence
 plays while the LLM still writes the rest and the TTS renders the next one.
 """
 import atexit
+import http.client
 import io
 import json
 import os
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -193,6 +195,26 @@ def spoken_numbers(text: str, language) -> str:
     def words(n, to="cardinal"):
         return num2words(n, lang=lang, to=to)
 
+    def standalone(replace):
+        def convert(m):
+            # Keep identifiers intact, but allow sentence punctuation and labels.
+            before, after = m.string[:m.start()], m.string[m.end():]
+            # A path separator before the number, or a colon after a file
+            # name (app.py:10), is a reference; "Total:10" is a label.
+            if (re.search(r"\w$|[./\\]$|[\d./\\:-]:+$|[./\\]\S*:+$", before)
+                    or re.match(r"\w|[./\\]+(?=[\w-])|:+(?=[\d/\\.-])", after)):
+                return m[0]
+            if before.endswith("-") or after.startswith("-"):
+                # A minus or numeric range is spoken; hyphenated filenames and
+                # ISO dates stay intact, including later numeric components.
+                token = (re.search(r"[\w./\\-]*$", before)[0] + m[0]
+                         + re.match(r"[\w./\\-]*", after)[0])
+                if (re.search(r"[^\W\d]", token)
+                        or re.fullmatch(r"\d{4}-\d{2}-\d{2}", token.rstrip("."))):
+                    return m[0]
+            return replace(m)
+        return convert
+
     def hour(h):
         spoken = words(int(h))
         if language == "pt":  # uma hora, duas horas, vinte e uma horas
@@ -229,19 +251,22 @@ def spoken_numbers(text: str, language) -> str:
         except Exception:  # OverflowError past 10**36: read the digits
             return m[0]
 
-    text = _DATE.sub(date, text)
-    text = _TIME.sub(time_of_day, text)
+    text = _DATE.sub(standalone(date), text)
+    text = _TIME.sub(standalone(time_of_day), text)
     if language == "pt":
-        text = _HOURS.sub(lambda m: f"{hour(m[1])} hora{'s' if int(m[1]) != 1 else ''}", text)
+        text = _HOURS.sub(standalone(
+            lambda m: f"{hour(m[1])} hora{'s' if int(m[1]) != 1 else ''}"), text)
         # 1º de outubro, 2ª feira
-        text = re.sub(r"\b(\d+)º", lambda m: words(int(m[1]), "ordinal"), text)
-        text = re.sub(r"\b(\d+)ª", lambda m: re.sub(r"o\b", "a", words(int(m[1]), "ordinal")), text)
+        text = re.sub(r"\b(\d+)º", standalone(lambda m: words(int(m[1]), "ordinal")), text)
+        text = re.sub(r"\b(\d+)ª", standalone(
+            lambda m: re.sub(r"o\b", "a", words(int(m[1]), "ordinal"))), text)
     if language in _PERCENT:
-        text = re.sub(r"(\d)\s*%", rf"\1 {_PERCENT[language]}", text)
+        text = re.sub(r"(\d[\d.,]*)\s*%", standalone(
+            lambda m: f"{m[1]} {_PERCENT[language]}"), text)
     sep = r"\," if language in _DOT_DECIMAL else r"\."
     dec = r"\." if language in _DOT_DECIMAL else r","
     return re.sub(rf"\d{{1,3}}(?:{sep}\d{{3}})+(?:{dec}\d+)?|\d+(?:{dec}\d+)?",
-                  number, text)
+                  standalone(number), text)
 
 
 def split_sentences(buffer: str, first=False) -> tuple[list[str], str]:
@@ -504,6 +529,34 @@ class TTSRejected(Exception):
     fails on very short text such as "OK"): skip it, keep the voice on."""
 
 
+class TTSCancellation:
+    """Close a turn's in-flight connection, including before headers arrive."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sockets = set()
+        self.cancelled = False
+
+    def attach(self, sock):
+        with self._lock:
+            if self.cancelled:
+                raise TTSRejected("cancelled")
+            self._sockets.add(sock)
+
+    def detach(self, sock):
+        with self._lock:
+            self._sockets.discard(sock)
+
+    def cancel(self):
+        with self._lock:
+            self.cancelled = True
+            for sock in self._sockets:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+
 def synthesize(text: str, config: dict):
     """(float32 samples, sample rate) for text from config["tts_url"]."""
     import numpy as np
@@ -521,18 +574,33 @@ def synthesize(text: str, config: dict):
         body["voice"] = ""
     elif voice.is_file():
         body["voice"] = str(voice.resolve())
-    request = urllib.request.Request(
-        url.rstrip("/") + "/tts", data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"})
+    target = urllib.parse.urlsplit(url.rstrip("/") + "/tts")
+    connection_type = (http.client.HTTPSConnection if target.scheme == "https"
+                       else http.client.HTTPConnection)
+    connection = connection_type(target.hostname, target.port,
+                                 timeout=config["tts_timeout_seconds"])
+    cancellation = config.get("_tts_cancellation")
+    sock = None
     try:
-        with _opener().open(request, timeout=config["tts_timeout_seconds"]) as response:
+        connection.connect()
+        sock = connection.sock
+        if cancellation:
+            cancellation.attach(sock)
+        connection.request("POST", urllib.parse.urlunsplit(("", "", target.path, target.query, "")),
+                           body=json.dumps(body).encode("utf-8"),
+                           headers={"Content-Type": "application/json"})
+        with connection.getresponse() as response:
+            if response.status >= 400:
+                try:
+                    message = json.loads(response.read(4096))["error"]
+                except Exception:
+                    message = response.reason
+                raise TTSRejected(f"HTTP {response.status}: {message}")
             raw = response.read(TTS_MAX_RESPONSE_BYTES + 1)
-    except urllib.error.HTTPError as e:
-        try:
-            message = json.loads(e.read(4096))["error"]
-        except Exception:
-            message = e.reason
-        raise TTSRejected(f"HTTP {e.code}: {message}") from None
+    finally:
+        if cancellation and sock is not None:
+            cancellation.detach(sock)
+        connection.close()
     if len(raw) > TTS_MAX_RESPONSE_BYTES:
         raise ValueError(f"TTS response larger than {TTS_MAX_RESPONSE_BYTES} bytes")
     with wave.open(io.BytesIO(raw)) as w:
@@ -594,6 +662,7 @@ def tts_command(config: dict, log=print) -> list[str] | None:
 
 _tts_lock = threading.Lock()
 _tts_process: subprocess.Popen | None = None
+_tts_stopping = threading.Event()
 
 
 def tts_server_up(config: dict) -> bool:
@@ -612,6 +681,7 @@ def ensure_tts_server(config: dict, log=print, log_path=None):
     if not is_http_url(config.get("tts_url")):
         return
     with _tts_lock:
+        _tts_stopping.clear()
         if _tts_process is not None:
             if _tts_process.poll() is not None and not _tts_process.reported:
                 # Starting it again would only fail again, costing the wait
@@ -660,6 +730,7 @@ def stop_tts_server():
     """Stop the TTS server this process started, if any."""
     global _tts_process
     with _tts_lock:
+        _tts_stopping.set()
         process, _tts_process = _tts_process, None
     if process is None:
         return
@@ -675,6 +746,27 @@ def stop_tts_server():
 # ---------------------------------------------------------------------------
 # Conversation
 # ---------------------------------------------------------------------------
+def is_voice_filler(text):
+    normalized = unicodedata.normalize("NFKD", text.casefold())
+    words = re.findall(r"\w+", "".join(c for c in normalized if not unicodedata.combining(c)))
+    return (not words or all(word in {"hum", "ah", "a", "e", "uh", "hmm", "hm", "um", "eh"}
+                             or re.fullmatch(r"h*m+", word) for word in words)
+            or (len(words) == 1 and len(words[0]) == 1 and not words[0].isdigit()))
+
+
+# A pause never outlasts this, even if the end of speech is never reported.
+PAUSE_MAX_SECONDS = 30.0
+
+
+class PlaybackStop(threading.Event):
+    def __init__(self, stop):
+        super().__init__()
+        self.stop = stop
+
+    def is_set(self):
+        return super().is_set() or self.stop.is_set()
+
+
 class VoiceChat:
     """A conversation with the LLM, spoken through the TTS server.
 
@@ -704,6 +796,12 @@ class VoiceChat:
         # on_audio(bool) when her voice starts or stops coming out.
         self.on_audio = None
         self._audio_shown = False
+        self._playback = threading.Condition(threading.RLock())
+        self._paused = False
+        self._pause_deadline = 0.0
+        self._pause_limit = 0.0
+        self._clip_stop = None
+        self._tts_cancellation = TTSCancellation()
 
     def _show_audio(self, active: bool):
         if active == self._audio_shown:
@@ -783,7 +881,54 @@ class VoiceChat:
 
     def interrupt(self):
         """Stop the reply in progress: no more text, synthesis or audio."""
-        self._interrupt.set()
+        with self._playback:
+            self._interrupt.set()
+            self._paused = False
+            if self._clip_stop is not None:
+                self._clip_stop.set()
+            self._tts_cancellation.cancel()
+            self._playback.notify_all()
+
+    def pause(self):
+        with self._playback:
+            if (not self.config.get("voice_chat_pause_on_speech", True)
+                    or not self.config.get("voice_chat_barge_in", True)
+                    or not self.speaking or self._interrupt.is_set()):
+                return False
+            if self._paused:
+                # Talking again after a breath: no timeout while they talk.
+                self._pause_deadline = None
+                return False
+            # Also between sentences: the next one waits instead of starting
+            # over the user. The timeout counts from when they stop talking.
+            self._paused = True
+            self._pause_deadline = None
+            self._pause_limit = time.monotonic() + PAUSE_MAX_SECONDS
+            if self._clip_stop is not None:
+                self._clip_stop.set()
+            self._show_audio(False)
+            with self._spoken_lock:
+                now = time.monotonic()
+                self._spoken = [(begin, min(end, now), words) for begin, end, words in self._spoken]
+            self.log("Voice chat: paused reply on speech")
+            return True
+
+    def speech_ended(self):
+        """Start the pause timeout once the user stops talking."""
+        with self._playback:
+            if self._paused:
+                self._pause_deadline = (time.monotonic()
+                                        + self.config.get("voice_chat_pause_timeout", 3.0))
+                self._playback.notify_all()
+
+    def resume(self, reason="invalid transcription"):
+        with self._playback:
+            if not self._paused:
+                return False
+            self._paused = False
+            self.log(f"Voice chat: resumed reply ({reason})")
+            self._playback.notify_all()
+            return True
 
     def _remember_spoken(self, text, duration):
         now = time.monotonic()
@@ -816,7 +961,11 @@ class VoiceChat:
                               if ((begin <= started and ended <= end + 0.3) if short
                                   else (begin <= ended and end + 2 >= started)))
         overlap = sum((heard & tokens(recent)).values())
-        return overlap / sum(heard.values()) >= 0.6
+        # Her echo comes back as a piece of her sentence. In a few words, one
+        # of the user's own ("Isso do tempo" after "...previsão do tempo?")
+        # means it is them.
+        count = sum(heard.values())
+        return overlap == count if count <= 4 else overlap / count >= 0.6
 
     def _messages(self, text: str) -> list[dict]:
         if self.config.get("voice_chat_backend", "local") == "claude":
@@ -882,7 +1031,9 @@ class VoiceChat:
             # Her words enter the balloon together with her voice, and with
             # how long that voice lasts.
             if timing.get("shown") and on_reply:
-                shown.append(timing["shown"])
+                if not timing.get("displayed"):
+                    shown.append(timing["shown"])
+                    timing["displayed"] = True
                 seconds = timing.get("seconds") if audible else None
                 if seconds:
                     on_reply(" ".join(shown), seconds)
@@ -891,13 +1042,16 @@ class VoiceChat:
 
         def playback_started(timing):
             nonlocal first_audio
-            timing["play"] = time.perf_counter() - started
-            self._show_audio(True)
-            show(timing, audible=True)
-            self._remember_spoken(timing["spoken"], timing["audio"])
-            if first_audio is None:
-                first_audio = timing["play"]
-            log_timing(timing)
+            with self._playback:
+                if self._clip_stop.is_set():
+                    return
+                timing["play"] = time.perf_counter() - started
+                self._show_audio(True)
+                show(timing, audible=True)
+                self._remember_spoken(timing["spoken"], timing["audio"])
+                if first_audio is None:
+                    first_audio = timing["play"]
+                log_timing(timing)
 
         if (self.config.get("voice_chat_backend", "local") == "claude"
                 and text.strip().rstrip(".!?").casefold() in ("nova conversa", "new conversation")):
@@ -905,6 +1059,9 @@ class VoiceChat:
         # A fresh event per turn: an interrupted turn's threads keep seeing
         # theirs set, even after the next turn starts.
         stop = self._interrupt = stop if stop is not None else threading.Event()
+        with self._playback:
+            cancellation = self._tts_cancellation = TTSCancellation()
+            self._paused = False
         # Voice chat may have been switched on in Settings since startup.
         ensure_tts_server(self.config, self.log, self.tts_log_path)
         messages = self._messages(text)
@@ -1020,6 +1177,7 @@ class VoiceChat:
                     if tts_ok:
                         try:
                             config = dict(self.config)
+                            config["_tts_cancellation"] = cancellation
                             if is_feedback:
                                 audio = self._waiting_audio(config, timing, started)
                             else:
@@ -1033,7 +1191,10 @@ class VoiceChat:
                         except Exception as e:
                             # Keep showing the text even without a voice.
                             tts_ok = False
-                            self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
+                            if not stop.is_set() and not _tts_stopping.is_set():
+                                self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
+                    if stop.is_set():
+                        return
                     if audio is not None:
                         timing["audio"] = len(audio[0]) / audio[1]
                         timing["spoken"] = spoken
@@ -1070,12 +1231,35 @@ class VoiceChat:
                     break
                 if not len(clip[0]):
                     show(clip[2])  # nothing to hear (no TTS, or only silence)
-                elif self._play is None:
-                    play(clip[0], clip[1], stop,
-                         on_start=lambda timing=clip[2]: playback_started(timing))
                 else:
-                    playback_started(clip[2])
-                    play(clip[0], clip[1], stop)
+                    while not stop.is_set():
+                        with self._playback:
+                            while self._paused and not stop.is_set():
+                                deadline = min(self._pause_limit, self._pause_deadline
+                                               or self._pause_limit)
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    self.resume("timeout")
+                                else:
+                                    self._playback.wait(remaining)
+                            clip_stop = self._clip_stop = PlaybackStop(stop)
+                        if stop.is_set():
+                            break
+                        if self._play is None:
+                            play(clip[0], clip[1], clip_stop,
+                                 on_start=lambda timing=clip[2]: playback_started(timing),
+                                 wait_for_tail=(self.config.get("voice_chat_pause_on_speech", True)
+                                                and self.config.get("voice_chat_barge_in", True)))
+                        else:
+                            playback_started(clip[2])
+                            play(clip[0], clip[1], clip_stop)
+                        with self._playback:
+                            cut = clip_stop.is_set()
+                            self._clip_stop = None
+                        if cut and hasattr(play, "close"):
+                            play.close(interrupted=True)
+                        if not cut or stop.is_set():
+                            break
         finally:
             try:
                 if hasattr(play, "close"):
@@ -1084,6 +1268,11 @@ class VoiceChat:
                 self._show_audio(False)
                 self.speaking = False
                 stop.set()  # stops the writer and renderer threads
+                with self._playback:
+                    self._paused = False
+                    self._clip_stop = None
+                    cancellation.cancel()
+                    self._playback.notify_all()
                 # Drain Claude's result / local cancellation before the next
                 # turn. In particular, never clear its stop event early.
                 writer.join()
@@ -1175,7 +1364,8 @@ class StreamPlayer:
         self._stream = None
         self._rate = None
 
-    def __call__(self, samples, sample_rate: int, stop: threading.Event, on_start=None):
+    def __call__(self, samples, sample_rate: int, stop: threading.Event, on_start=None,
+                 wait_for_tail=False):
         import numpy as np
         import sounddevice as sd
         gap = 0
@@ -1201,6 +1391,10 @@ class StreamPlayer:
             # Blocks while the stream's buffer is full, so this keeps pace
             # with playback.
             self._stream.write(data[start:start + block])
+        if wait_for_tail and not stop.is_set():
+            # Keep the cut sentence available while its buffered tail plays,
+            # including short clips that fit entirely in the output buffer.
+            stop.wait(self._stream.latency)
 
     def close(self, interrupted: bool):
         """Let the queued audio finish (or drop it if interrupted)."""

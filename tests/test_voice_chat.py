@@ -242,6 +242,42 @@ def test_unreachable_tts_still_returns_the_reply(server, monkeypatch):
     assert vc.synthesize.call_count == 1  # no retry per sentence once the server is gone
 
 
+@pytest.mark.parametrize("ending", ["running", "interrupt", "shutdown"])
+def test_tts_reset_is_only_a_failure_while_running(server, monkeypatch, ending):
+    logs, renderers, stopping_at_kill = [], [], []
+    chat, played = _chat(server, FakeLLM(["Uma frase para falar."]))
+    chat.log = logs.append
+    monkeypatch.setattr(vc, "_tts_stopping", threading.Event())
+    vc._tts_stopping.set()  # starting a new turn clears a previous shutdown
+    monkeypatch.setattr(vc, "_tts_process", None)
+    monkeypatch.setattr(vc, "kill_tree", lambda process: stopping_at_kill.append(
+        vc._tts_stopping.is_set()))
+
+    def synthesize(text, config):
+        renderers.append(threading.current_thread())
+        if ending == "interrupt":
+            chat.interrupt()
+        elif ending == "shutdown":
+            monkeypatch.setattr(vc, "_tts_process", MagicMock())
+            vc.stop_tts_server()
+        raise ConnectionResetError(10054, "connection reset")
+
+    monkeypatch.setattr(vc, "synthesize", synthesize)
+    chat.respond("oi")
+    assert len(renderers) == 1
+    renderers[0].join(3)
+    assert not renderers[0].is_alive()
+    assert played == []
+    failures = [line for line in logs if "TTS failed" in line]
+    if ending == "running":
+        assert len(failures) == 1
+        assert "10054" in failures[0] and "showing the reply only" in failures[0]
+    else:
+        assert failures == []
+    if ending == "shutdown":
+        assert stopping_at_kill == [True]
+
+
 def test_interrupt_stops_the_reply(server):
     played = []
     chat = vc.VoiceChat(_cfg(server), log=lambda m: None, llm=FakeLLM(["Um. ", "Dois. ", "Três."]),
@@ -1285,6 +1321,53 @@ def test_numbers_are_spoken_as_words(language, text, spoken):
     assert vc.spoken_numbers(text, language) == spoken
 
 
+@pytest.mark.parametrize("language", ["pt", "en"])
+@pytest.mark.parametrize("token", [
+    "config.json.bak-20261010", "v2.1.296", "RTX4060", "abc123def456",
+    "20261010.json", "backup_20261010", "2026-10-10", "/2026/10/log.txt",
+    "backup-09/10/2026", "log-14:07", "v10h18", "build1h", "build3.5%",
+    "item1º", "item2ª", "3-files", "12_34", "2.1.296", "3/4",
+    r"C:\logs\20261010.txt", "file_2.txt", "a/b/3",
+    "app.py:10:20", "app.py:10", r"C:\123", "src/app.py:42",
+])
+def test_numbers_inside_identifiers_are_unchanged(language, token):
+    text = f"Arquivo ({token})."
+    assert vc.spoken_numbers(text, language) == text
+
+
+@pytest.mark.parametrize("language", ["pt", "en"])
+@pytest.mark.parametrize("text, pt, en", [
+    ("-10", "-dez", "-ten"),
+    ("Valor -10", "Valor -dez", "Valor -ten"),
+    ("(-10)", "(-dez)", "(-ten)"),
+    ("10-20", "dez-vinte", "ten-twenty"),
+    ("-5%", "-cinco por cento", "-five percent"),
+    ("Total:10", "Total:dez", "Total:ten"),
+    ("14:07", "catorze e sete", "fourteen oh seven"),
+    ("09/10/2026", "nove de outubro de dois mil e vinte e seis",
+     "September tenth, twenty twenty-six"),
+])
+def test_numeric_expressions_are_spoken_as_words(language, text, pt, en):
+    assert vc.spoken_numbers(text, language) == (pt if language == "pt" else en)
+
+
+@pytest.mark.parametrize("text, spoken", [
+    ("3 arquivos", "três arquivos"),
+    ("10,5", "dez vírgula cinco"),
+    ("2026", "dois mil e vinte e seis"),
+    ("foram 3.", "foram três."),
+    ("3. Depois 4!", "três. Depois quatro!"),
+    ("foram 3...", "foram três..."),
+    ("3: três arquivos.", "três: três arquivos."),
+    ("às 14:07", "às catorze e sete"),
+    ("(3), 4; 5?", "(três), quatro; cinco?"),
+    ("10 % e 2ª feira", "dez por cento e segunda feira"),
+    ("config.json.bak-20261010 e 3 arquivos.", "config.json.bak-20261010 e três arquivos."),
+])
+def test_standalone_numbers_keep_sentence_punctuation(text, spoken):
+    assert vc.spoken_numbers(text, "pt") == spoken
+
+
 @pytest.mark.parametrize("sentence, offer", [
     ("Como posso te ajudar hoje?", True),
     ("Pode dizer o que quer que eu faça?", True),
@@ -1323,6 +1406,7 @@ class FakeStream:
 
     def __init__(self, samplerate, channels, dtype):
         self.rate, self.written, self.ended = samplerate, [], None
+        self.latency = 0.0
         FakeStream.instances.append(self)
 
     def start(self):
@@ -1477,6 +1561,87 @@ def _harness_session(tmp_path, saved, events, closed=None):
         process_factory=lambda *a, **kw: process, session_file=session_file)
     return session, commands, lambda: _json.loads(
         session_file.read_text(encoding="utf-8")).get(key)
+
+
+@pytest.mark.parametrize("boundary", ["tool_use", "message_start", "text", "assistant"])
+def test_claude_text_blocks_are_separated_in_the_reply(server, tmp_path, boundary):
+    def stream(event):
+        return {"type": "stream_event", "event": event}
+
+    def delta(text):
+        return stream({"type": "content_block_delta", "delta": {
+            "type": "text_delta", "text": text}})
+
+    if boundary == "assistant":
+        between = {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Faço uma cópia de segurança."},
+            {"type": "tool_use", "id": "tool-1", "name": "Bash"}]}}
+    elif boundary == "message_start":
+        between = stream({"type": "message_start"})
+    else:
+        between = stream({"type": "content_block_start", "content_block": {
+            "type": boundary, "id": "tool-1", "name": "Bash"}})
+    events = [delta("Faço uma cópia de segu"), delta("rança."), between,
+              delta(""), delta("Pron"), delta("to."), {"type": "result"}]
+    closed = threading.Event()
+    session, _, _ = _harness_session(tmp_path, None, events, closed)
+    chunks, shown = [], []
+
+    def llm(messages, on_text, stop):
+        def emit(chunk):
+            chunks.append(chunk)
+            on_text(chunk)
+        session.send(messages[-1]["content"], emit, stop)
+
+    chat, _ = _chat(server, llm, voice_chat_backend="claude")
+    try:
+        reply = chat.respond("Faça a cópia.", on_reply=lambda text, seconds=None: shown.append(text))
+    finally:
+        closed.set()
+    expected = "Faço uma cópia de segurança. Pronto."
+    assert chunks == ["Faço uma cópia de segu", "rança.", " Pron", "to."]
+    assert reply == shown[-1] == expected
+    assert " ".join(_tts_texts(server)) == expected
+
+
+@pytest.mark.parametrize("before, after", [
+    ("segurança. ", "Pronto."), ("segurança.", " Pronto."),
+    ("segurança.\n", "Pronto."), ("segurança.", "\nPronto."),
+    ("Valor confirmado", ", correto."), ("Concluído", "."),
+    *[("Concluído", punctuation) for punctuation in ";:!?)]}…”’»›"],
+])
+@pytest.mark.parametrize("boundary", ["message_start", "tool_use"])
+def test_claude_block_separator_preserves_whitespace_and_punctuation(
+        tmp_path, before, after, boundary):
+    assert _blocks_across(tmp_path, before, after, boundary) == [before, after]
+
+
+@pytest.mark.parametrize("quote", ['"Sim."', "'Sim.'"])
+@pytest.mark.parametrize("boundary", ["message_start", "tool_use"])
+def test_claude_block_separator_keeps_the_space_before_an_opening_quote(
+        tmp_path, quote, boundary):
+    assert _blocks_across(tmp_path, "Ele respondeu:", quote, boundary) == [
+        "Ele respondeu:", " " + quote]
+
+
+def _blocks_across(tmp_path, before, after, boundary):
+    between = ({"type": "message_start"} if boundary == "message_start" else
+               {"type": "content_block_start", "content_block": {
+                   "type": "tool_use", "id": "tool-1", "name": "Bash"}})
+    events = [
+        {"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": before}}},
+        {"type": "stream_event", "event": between},
+        {"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": after}}},
+        {"type": "result"},
+    ]
+    closed = threading.Event()
+    session, _, _ = _harness_session(tmp_path, None, events, closed)
+    chunks = []
+    try:
+        session.send("oi", chunks.append, threading.Event())
+    finally:
+        closed.set()
+    return chunks
 
 
 def test_claude_session_that_does_not_resume_is_forgotten(tmp_path):
@@ -1704,3 +1869,458 @@ def test_her_text_still_shows_without_a_voice(server, monkeypatch):
     chat, played = _chat(server, FakeLLM(["A capital é Canberra."]))
     chat.respond("capital", on_reply=shown.append)
     assert shown == ["A capital é Canberra."] and played == []
+
+
+@pytest.fixture
+def playing_reply(monkeypatch):
+    """Hold the first clip until playback is paused or interrupted."""
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
+    monkeypatch.setattr(vc, "wait_tts_server", lambda *a: True)
+    instances = []
+
+    def start(**config):
+        app = _app(voice_chat=True, **config)
+        started, cut, rendered = threading.Event(), threading.Event(), threading.Event()
+        played, shown, talking, errors, logs = [], [], [], [], []
+        sentences = ["A capital é Canberra.", "Fica no sul, perto do mar."]
+
+        def synth(text, config):
+            index = sentences.index(text)
+            if index == 1:
+                rendered.set()
+            return np.full(2400, 0.1 * (index + 1), np.float32), 24000
+
+        def play(samples, rate, stop):
+            played.append(samples.copy())
+            if len(played) == 1:
+                started.set()
+                if not stop.wait(5):
+                    raise AssertionError("first clip was never stopped")
+                cut.set()
+
+        monkeypatch.setattr(vc, "synthesize", synth)
+        chat = app.voice_chat = vc.VoiceChat(app.config, log=logs.append, play=play,
+                                             llm=FakeLLM([sentences[0] + " ", sentences[1]]))
+        chat.on_audio = talking.append
+        app._voice_active = {"text": "capital", "voice_chat_status": "sent"}
+        app._voice_worker = object()  # inspect queued turns without starting another worker
+        app._voice_stop = threading.Event()
+
+        def respond():
+            try:
+                chat.respond("capital", on_reply=lambda text, seconds: shown.append((text, seconds)),
+                             stop=app._voice_stop)
+            except Exception as e:
+                errors.append(e)
+
+        worker = threading.Thread(target=respond, daemon=True)
+        instances.append((chat, worker, errors))
+        worker.start()
+        assert started.wait(3)
+        assert rendered.wait(3)
+        return app, worker, cut, played, shown, talking, logs
+
+    yield start
+    for chat, worker, errors in instances:
+        chat.interrupt()
+        worker.join(3)
+        assert not worker.is_alive()
+        assert errors == []
+
+
+@pytest.mark.parametrize("text", ["", "hum", "ah", "é", "uh", "hmm", "...", "x",
+                                  "A capital é Canberra."])
+def test_invalid_final_replays_the_cut_sentence(playing_reply, text):
+    app, worker, cut, played, shown, talking, logs = playing_reply(voice_chat_pause_timeout=10)
+    app._voice_activity(True)
+    assert cut.wait(2)
+    assert talking == [True, False]
+    assert not app._voice_stop.is_set()
+    assert not app.voice_chat._tts_cancellation.cancelled
+    app._voice_chat_turn(text, AUDIO, True)
+    worker.join(3)
+    assert not worker.is_alive()
+    assert len(played) == 3
+    np.testing.assert_array_equal(played[0], played[1])
+    assert not np.array_equal(played[1], played[2])
+    assert shown[0] == shown[1]  # same paced slide, without duplicated sentence text
+    assert shown[2][0] == "A capital é Canberra. Fica no sul, perto do mar."
+    assert talking == [True, False, True, False]
+    assert app._voice_pending == []
+    assert any("paused reply" in line for line in logs)
+    assert any("resumed reply" in line for line in logs)
+
+
+def test_valid_final_interrupts_a_paused_reply(playing_reply):
+    app, worker, cut, played, shown, talking, logs = playing_reply()
+    app._voice_activity(True)
+    assert cut.wait(2)
+    app._voice_chat_turn("quero mudar de assunto", AUDIO, True)
+    worker.join(3)
+    assert not worker.is_alive()
+    assert len(played) == 1
+    assert app._voice_stop.is_set()
+    assert app.voice_chat._tts_cancellation.cancelled
+    assert app._voice_active["voice_chat_status"] == "interrupted"
+    assert app._voice_pending[0][0] == "quero mudar de assunto"
+    assert app._voice_pending[0][1]["voice_chat_status"] == "barge-in"
+
+
+def test_pause_timeout_replays_without_a_final(playing_reply):
+    app, worker, cut, played, shown, talking, logs = playing_reply(voice_chat_pause_timeout=0.05)
+    app._voice_activity(True)
+    assert cut.wait(3)
+    time.sleep(0.2)  # still talking: no timeout yet
+    assert app.voice_chat._paused and len(played) == 1
+    app._voice_activity(False)
+    worker.join(3)
+    assert not worker.is_alive()
+    assert len(played) == 3
+    np.testing.assert_array_equal(played[0], played[1])
+    assert any("resumed reply (timeout)" in line for line in logs)
+
+
+@pytest.mark.parametrize("config", [{"voice_chat_pause_on_speech": False},
+                                    {"voice_chat_barge_in": False}])
+def test_disabled_pause_keeps_playing_until_final(playing_reply, config):
+    app, worker, cut, played, shown, talking, logs = playing_reply(**config)
+    app._voice_activity(True)
+    assert not app.voice_chat._paused
+    assert not app.voice_chat._clip_stop.is_set()
+    assert talking == [True]
+    app._voice_chat_turn("hum", AUDIO, True)
+    assert len(app._voice_pending) == 1  # legacy filler behavior
+    assert app._voice_stop.is_set() is config.get("voice_chat_barge_in", True)
+
+
+def test_draft_does_not_resolve_pause(playing_reply):
+    app, worker, cut, played, shown, talking, logs = playing_reply()
+    app._voice_activity(True)
+    app._voice_chat_turn("mude de assunto", AUDIO, False)
+    assert app.voice_chat._paused
+    assert not app._voice_stop.is_set()
+
+
+def test_empty_asr_result_resumes_playback(playing_reply):
+    app, worker, cut, played, shown, talking, logs = playing_reply()
+    app._voice_activity(True)
+    app.whisper.transcribe.return_value = ""
+    app._finish_recording(audio=AUDIO, is_final=True)
+    worker.join(3)
+    assert not worker.is_alive()
+    assert len(played) == 3
+
+
+@pytest.mark.parametrize("text", ["sim", "não", "oi", "ok", "quê?", "ah, mude de assunto", "2"])
+def test_short_meaningful_answers_are_not_fillers(text):
+    assert not vc.is_voice_filler(text)
+
+
+@pytest.mark.parametrize("key, value", [
+    ("voice_chat_pause_on_speech", "true"), ("voice_chat_pause_on_speech", 1),
+    ("voice_chat_pause_on_speech", None), ("voice_chat_pause_timeout", True),
+    ("voice_chat_pause_timeout", 0), ("voice_chat_pause_timeout", -1),
+    ("voice_chat_pause_timeout", "3"), ("voice_chat_pause_timeout", None),
+    ("voice_chat_pause_timeout", float("inf")), ("voice_chat_pause_timeout", float("nan")),
+])
+def test_invalid_pause_config_is_rejected(key, value):
+    with pytest.raises(ValueError, match=key):
+        de.validate_config({**DEFAULT_CONFIG, key: value})
+
+
+def test_recorder_speech_start_pauses_in_the_first_vad_block(monkeypatch):
+    app = DictationApp({**DEFAULT_CONFIG, "continuous_listening": True, "voice_chat": True})
+    recorder = app.recorder
+    calls = []
+
+    class Feed:
+        def wait(self, timeout):
+            if recorder._write_pos:
+                recorder._stop_vad = True
+                return
+            recorder._buffer[:512] = 0.1
+            recorder._write_pos = 512
+
+    recorder._data_cv = Feed()
+    monkeypatch.setattr(app.voice_chat, "pause", lambda: calls.append(recorder._write_pos))
+    recorder._vad_loop()
+    assert calls == [512]
+
+
+@pytest.fixture
+def cancellable_tts_server(monkeypatch, request):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from debora_whisper import tts_server
+
+    class Module:
+        def __init__(self):
+            self.hooks = []
+
+        def register_forward_pre_hook(self, hook):
+            self.hooks.append(hook)
+            return SimpleNamespace(remove=lambda: self.hooks.remove(hook))
+
+        def step(self):
+            for hook in self.hooks:
+                hook(self, ())
+
+    token, flow = Module(), Module()
+    started, release, cancelled = threading.Event(), threading.Event(), threading.Event()
+    steps = []
+    phase = getattr(request, "param", "tokens")
+    wav = MagicMock()
+    wav.squeeze.return_value.float.return_value.cpu.return_value.numpy.return_value = np.ones(2400)
+
+    def generate(text, language_id):
+        for index in range(5):
+            (token if phase == "tokens" else flow).step()
+            steps.append(index)
+            if not started.is_set():
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("test did not release synthesis")
+        return wav
+
+    model = SimpleNamespace(
+        sr=24000, conds=object(), generate=generate,
+        t3=SimpleNamespace(tfmr=SimpleNamespace(layers=[token])),
+        s3gen=SimpleNamespace(flow=SimpleNamespace(decoder=SimpleNamespace(
+            estimator=SimpleNamespace(time_mlp=flow)))))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(inference_mode=nullcontext))
+    monkeypatch.setattr(tts_server, "drop_attention_spies", lambda model: None)
+    monkeypatch.setattr(tts_server, "log", lambda line: cancelled.set() if "Cancelled" in line else None)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), tts_server.make_handler(model, "pt"))
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    config = {**DEFAULT_CONFIG, "tts_url": f"http://127.0.0.1:{srv.server_port}"}
+    # Omit voice so the stub keeps its startup conditionals.
+    monkeypatch.setattr(vc, "resolve_voice", lambda voice: Path("missing-reference.wav"))
+    try:
+        yield config, started, release, cancelled, steps, (token, flow)
+    finally:
+        release.set()
+        srv.shutdown()
+        srv.server_close()
+        thread.join(3)
+
+
+@pytest.mark.parametrize("cancellable_tts_server", ["tokens", "flow"], indirect=True)
+def test_interrupt_disconnects_inflight_tts_and_stops_server_work(cancellable_tts_server):
+    config, started, release, cancelled, steps, modules = cancellable_tts_server
+    chat = vc.VoiceChat(config, log=lambda line: None)
+    errors = []
+
+    def synthesize():
+        try:
+            vc.synthesize("Primeira frase.", {**config, "_tts_cancellation": chat._tts_cancellation})
+        except Exception as e:
+            errors.append(e)
+
+    worker = threading.Thread(target=synthesize, daemon=True)
+    worker.start()
+    try:
+        assert started.wait(3)
+        chat.interrupt()
+        release.set()
+        assert cancelled.wait(3)
+        worker.join(3)
+        assert not worker.is_alive() and errors
+        assert steps == [0]  # no subsequent token/flow step ran
+        assert all(not module.hooks for module in modules)
+        samples, rate = vc.synthesize("Segunda frase.", config)
+        assert len(samples) == 2400 and rate == 24000
+        assert steps == [0, 0, 1, 2, 3, 4]
+        assert all(not module.hooks for module in modules)
+    finally:
+        chat.interrupt()
+        release.set()
+        worker.join(3)
+
+
+def test_pause_keeps_inflight_server_synthesis_running(cancellable_tts_server):
+    config, started, release, cancelled, steps, modules = cancellable_tts_server
+    chat = vc.VoiceChat(config, log=lambda line: None)
+    result, errors = [], []
+    chat._clip_stop = vc.PlaybackStop(chat._interrupt)
+    chat._show_audio(True)
+    chat.speaking = True
+
+    def synthesize():
+        try:
+            result.append(vc.synthesize("Pode continuar.", {
+                **config, "_tts_cancellation": chat._tts_cancellation}))
+        except Exception as e:
+            errors.append(e)
+
+    worker = threading.Thread(target=synthesize, daemon=True)
+    worker.start()
+    try:
+        assert started.wait(3)
+        assert chat.pause()
+        assert not chat._tts_cancellation.cancelled
+        release.set()
+        worker.join(3)
+        assert not worker.is_alive() and not errors
+        assert len(result) == 1 and steps == [0, 1, 2, 3, 4]
+        assert not cancelled.is_set()
+    finally:
+        release.set()
+        chat.interrupt()
+        worker.join(3)
+
+
+def test_paused_stream_is_aborted_and_replayed_on_a_new_stream(server, stream, monkeypatch):
+    original = FakeStream.write
+    chat = vc.VoiceChat(_cfg(server), log=lambda line: None,
+                        llm=FakeLLM(["A capital é Canberra. Fica no sul do país."]))
+    shown = []
+
+    def write(output, data):
+        original(output, data)
+        if len(stream) == 1 and len(output.written) == 1:
+            assert chat.pause()
+            assert chat.resume("invalid transcription")  # may arrive before play() returns
+
+    monkeypatch.setattr(FakeStream, "write", write)
+    chat.respond("capital", on_reply=lambda text, seconds: shown.append((text, seconds)))
+    assert len(stream) == 2
+    assert stream[0].ended == "dropped" and stream[1].ended == "drained"
+    assert shown[0] == shown[1]
+    assert len(shown) == 3
+    assert sum(stream[1].written) == 4800 + int(24000 * vc.SENTENCE_GAP_SECONDS)
+
+
+def test_pause_can_cut_a_short_clips_buffered_tail(server, stream, monkeypatch):
+    waiting = threading.Event()
+    original = vc.PlaybackStop.wait
+
+    def wait(stop, timeout=None):
+        waiting.set()
+        return original(stop, timeout)
+
+    monkeypatch.setattr(vc.PlaybackStop, "wait", wait)
+    original_init = FakeStream.__init__
+
+    def init(output, *args, **kwargs):
+        original_init(output, *args, **kwargs)
+        output.latency = 1.0 if len(stream) == 1 else 0.0
+
+    monkeypatch.setattr(FakeStream, "__init__", init)
+    chat = vc.VoiceChat(_cfg(server), log=lambda line: None, llm=FakeLLM(["A capital é Canberra."]))
+    worker = threading.Thread(target=chat.respond, args=("capital",), daemon=True)
+    worker.start()
+    try:
+        assert waiting.wait(3)
+        assert chat.pause()
+        chat.resume("invalid transcription")
+        worker.join(3)
+        assert not worker.is_alive()
+        assert len(stream) == 2 and stream[0].ended == "dropped"
+        assert stream[0].written == stream[1].written
+    finally:
+        chat.interrupt()
+        worker.join(3)
+
+
+def test_tts_server_synthesizes_without_hooks_on_another_model_layout():
+    import socket
+    from types import SimpleNamespace
+    from debora_whisper import tts_server
+
+    client, server = socket.socketpair()
+    try:
+        with tts_server.cancellable_synthesis(SimpleNamespace(), server):
+            pass
+    finally:
+        client.close()
+        server.close()
+
+
+def test_pause_between_sentences_holds_the_next_one():
+    chat = vc.VoiceChat({**DEFAULT_CONFIG, "voice_chat": True}, log=lambda *a: None)
+    chat.speaking = True
+    assert chat._clip_stop is None  # no clip playing: the next one is still rendering
+    assert chat.pause()
+    assert chat._paused and chat._pause_deadline is None
+    chat.speech_ended()
+    assert chat._pause_deadline is not None
+
+
+def test_breath_while_paused_does_not_start_the_timeout(playing_reply):
+    app, worker, cut, played, shown, talking, logs = playing_reply(voice_chat_pause_timeout=0.1)
+    app._voice_activity(True)
+    assert cut.wait(3)
+    app._voice_activity(False)  # a breath
+    app._voice_activity(True)   # still talking
+    time.sleep(0.3)
+    assert app.voice_chat._paused and len(played) == 1
+    app._voice_activity(False)
+    worker.join(3)
+    assert not worker.is_alive() and len(played) == 3
+
+
+def test_pause_has_a_ceiling_without_end_of_speech(playing_reply, monkeypatch):
+    monkeypatch.setattr(vc, "PAUSE_MAX_SECONDS", 0.1)
+    app, worker, cut, played, shown, talking, logs = playing_reply()
+    app._voice_activity(True)
+    worker.join(3)
+    assert not worker.is_alive() and len(played) == 3
+
+
+@pytest.mark.parametrize("text, echo", [
+    ("Isso do tempo.", False),           # the user's own word in a short reply
+    ("Previsão do tempo.", True),        # a piece of her sentence
+    ("Você quer a previsão do tempo?", True),
+])
+def test_short_reply_sharing_her_words_is_not_echo(text, echo):
+    chat = vc.VoiceChat({"language": "pt"})
+    chat._spoken = [(10.0, 12.6, "Você quer a previsão do tempo?")]
+    assert chat.is_echo(text, 13.0, 14.0) is echo
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("Headphones (LE-HD 450BT)", True),
+    ("Headset (LE-HD 450BT Hands-Free)", True),
+    ("Speakers (Realtek(R) Audio)", False),
+    ("Headset (LE-HD 450BT Hands-Free", True),  # MME cuts at 31 characters
+    ("Headphones (Other)", None),
+    (None, None),
+])
+def test_windows_output_form_factor(name, expected):
+    from debora_whisper.platforms.windows import is_headphones
+    endpoints = [("Headphones (LE-HD 450BT)", 3), ("Headset (LE-HD 450BT Hands-Free)", 5),
+                 ("Speakers (Realtek(R) Audio)", 1)]
+    assert is_headphones(name, endpoints) is expected
+
+
+def test_generic_platform_does_not_know_the_output():
+    from debora_whisper.platforms.base import Platform
+    assert Platform().output_is_headphones("Headphones") is None
+
+
+@pytest.mark.parametrize("setting, headphones, on", [
+    ("auto", True, False), (True, True, False), ("auto", False, True),
+    ("auto", None, True), ("on", True, True), ("off", False, False), (False, None, False),
+])
+def test_echo_filter_follows_the_output_device(monkeypatch, setting, headphones, on):
+    from debora_whisper import platforms
+    from debora_whisper.platforms.base import Platform
+
+    class Fake(Platform):
+        def default_output_name(self):
+            return "Fone"
+
+        def output_is_headphones(self, name=None):
+            return headphones
+
+    monkeypatch.setattr(platforms, "_current", Fake())
+    app = _app(voice_chat=True, voice_chat_echo_filter=setting)
+    assert app._echo_filter_on() is on
+
+
+@pytest.mark.parametrize("value", ["sometimes", 1, 0])
+def test_echo_filter_setting_is_validated(value):
+    from debora_whisper.dictation_engine import validate_config
+    with pytest.raises(ValueError, match="voice_chat_echo_filter"):
+        validate_config({**DEFAULT_CONFIG, "voice_chat_echo_filter": value})

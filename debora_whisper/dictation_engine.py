@@ -86,6 +86,7 @@ DEFAULT_CONFIG = {
     "harness_permission_mode": "acceptEdits",
     "harness_permission_response": "deny",  # requests not already allowed by Claude
     "harness_allowed_tools": None,  # null uses the packaged read-only diagnostics
+    "harness_extra_allowed_tools": [],  # added to defaults or the explicit list
     "harness_prompt_file": None,   # null: packaged voice-channel rules
     "harness_memory_file": None,   # null: ~/.debora/harness/voice_memory.md
     "harness_hotwords": True,     # Memory/project hints only for Claude voice chat
@@ -93,8 +94,11 @@ DEFAULT_CONFIG = {
     # think). The reply cannot start before it has passed.
     "voice_chat_end_silence_seconds": 0.8,
     "voice_chat_incomplete_silence_seconds": 2.0,
-    "voice_chat_echo_filter": True,
+    # "auto": off with headphones or a headset, on otherwise. true = "auto".
+    "voice_chat_echo_filter": "auto",
     "voice_chat_barge_in": True,
+    "voice_chat_pause_on_speech": True,
+    "voice_chat_pause_timeout": 3.0,
     # Hugging Face repo (OpenVINO IR) or local directory. The int4-cw export
     # answers in ~0.4 s at ~15 tokens/s on a Core Ultra's Arc iGPU.
     "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
@@ -360,7 +364,8 @@ def validate_config(config: dict):
     if max_rec is not None and (not isinstance(max_rec, (int, float)) or max_rec <= 0):
         raise ValueError(f"max_record_seconds must be a positive number or null, got '{max_rec}'")
 
-    for key in ("vad_end_silence_seconds", "vad_incomplete_silence_seconds"):
+    for key in ("vad_end_silence_seconds", "vad_incomplete_silence_seconds",
+                "voice_chat_pause_timeout"):
         seconds = config.get(key, DEFAULT_CONFIG[key])
         if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
                 or not 0 < seconds < float("inf")):
@@ -382,6 +387,11 @@ def validate_config(config: dict):
         raise ValueError('voice_chat_hotkey must be a single key or "" to disable')
     if not isinstance(config.get("harness_hotwords", True), bool):
         raise ValueError("harness_hotwords must be a bool")
+    echo_filter = config.get("voice_chat_echo_filter", "auto")
+    if not isinstance(echo_filter, bool) and echo_filter not in ("auto", "on", "off"):
+        raise ValueError('voice_chat_echo_filter must be "auto", "on", "off" or a bool')
+    if not isinstance(config.get("voice_chat_pause_on_speech", True), bool):
+        raise ValueError("voice_chat_pause_on_speech must be a bool")
     if not isinstance(config.get("harness_new_session_on_start", False), bool):
         raise ValueError("harness_new_session_on_start must be a bool")
     from debora_whisper.harness import validate_session_name
@@ -399,6 +409,10 @@ def validate_config(config: dict):
     if rules is not None and (not isinstance(rules, list) or any(
             not isinstance(rule, str) or not rule.strip() for rule in rules)):
         raise ValueError("harness_allowed_tools must be null or a list of non-empty permission rules")
+    rules = config.get("harness_extra_allowed_tools", [])
+    if not isinstance(rules, list) or any(
+            not isinstance(rule, str) or not rule.strip() for rule in rules):
+        raise ValueError("harness_extra_allowed_tools must be a list of non-empty permission rules")
     voice = config.get("tts_voice")
     if voice is not None and (not isinstance(voice, str) or not voice.strip()):
         raise ValueError(f"tts_voice must be null or a file path or name, got {voice!r}")
@@ -2078,6 +2092,7 @@ class AudioRecorder:
                                 is_speaking = True
                                 segment_id = self.endpoint.start()
                                 speech_start_pos = (start_read_pos + i - self.lookback_frames) % self.capacity
+                                show_voice(True)
                                 silence_frames = 0
                                 speech_frames = self.lookback_frames + block_len
                                 voiced_frames = 0
@@ -2685,7 +2700,7 @@ class DictationApp:
         self._draft_target = None
         self.voice_chat = VoiceChat(config, log=log, tts_log_path=TTS_SERVER_LOG,
                                     llm_log_path=LLM_SERVER_LOG)
-        self.recorder.on_voice = lambda active: self._talking("user", active)
+        self.recorder.on_voice = self._voice_activity
         self.voice_chat.on_audio = lambda active: self._talking("debora", active)
         self._voice_chat_loading = threading.Lock()
         self._voice_lock = threading.RLock()
@@ -3112,6 +3127,8 @@ class DictationApp:
 
             if len(audio) < self.config["sample_rate"] * 0.3:
                 log("Recording too short, ignoring.")
+                if is_final and self.config.get("voice_chat"):
+                    self.voice_chat.resume("short recording")
                 if is_final:
                     if self._continuous and self.is_recording:
                         self._set_state(AppState.RECORDING)
@@ -3171,7 +3188,10 @@ class DictationApp:
                 if vad_segment and not is_final and segment_id is not None:
                     self.recorder.endpoint.update(segment_id, audio_end, text)
 
-                if text.strip() and self.config.get("voice_chat"):
+                if self.config.get("voice_chat") and (text.strip() or (
+                        self.config.get("voice_chat_pause_on_speech", True)
+                        and self.config.get("voice_chat_barge_in", True)
+                        and self.voice_chat.speaking)):
                     # Voice chat types nothing: the text goes to the LLM.
                     self._voice_chat_turn(text.strip(), audio, is_final, captured_at)
                     return
@@ -3283,18 +3303,50 @@ class DictationApp:
             with self._audio_lifecycle_lock:
                 self._transcribing = False
 
+    def _voice_activity(self, active):
+        self._talking("user", active)
+        if self.config.get("voice_chat") and not self._stopping.is_set():
+            if active:
+                self.voice_chat.pause()
+            else:
+                self.voice_chat.speech_ended()
+
+    def _echo_filter_on(self):
+        """Headphones keep her voice out of the microphone: no filter then."""
+        setting = self.config.get("voice_chat_echo_filter", "auto")
+        if setting in (False, "off"):
+            return False
+        if setting == "on":
+            return True
+        from debora_whisper import platforms
+        platform = platforms.current()
+        name = platform.default_output_name()
+        on = platform.output_is_headphones(name) is not True
+        if (name, on) != getattr(self, "_echo_filter_seen", None):
+            self._echo_filter_seen = (name, on)
+            log(f"Voice chat: echo filter {'on' if on else 'off'} for output {name!r}")
+        return on
+
     def _voice_chat_turn(self, text, audio, is_final, captured_at=None):
         """Save each final immediately; replies run separately from ASR."""
         if not is_final:
             if self._continuous and self.is_recording:
                 self._set_state(AppState.RECORDING, {"draft_text": text})
             return
+        if not text.strip():
+            self.voice_chat.resume("empty transcription")
+            return
         duration = len(audio) / self.config["sample_rate"]
         captured_at = time.monotonic() if captured_at is None else captured_at
-        echo = (self.config.get("voice_chat_echo_filter", True)
+        echo = (self._echo_filter_on()
                 and self.voice_chat.is_echo(text, captured_at - duration, captured_at))
+        from debora_whisper.voice_chat import is_voice_filler
+        filler = (self.config.get("voice_chat_pause_on_speech", True)
+                  and self.config.get("voice_chat_barge_in", True)
+                  and self._voice_active is not None and is_voice_filler(text))
         entry = {"timestamp": datetime.now().isoformat(), "text": text,
-                 "duration": duration, "voice_chat_status": "echo" if echo else "queued"}
+                 "duration": duration,
+                 "voice_chat_status": "echo" if echo else "ignored" if filler else "queued"}
         with self._output_lock:
             self._forget_draft_locked(erase=True)
             self._history.append(entry)
@@ -3303,6 +3355,10 @@ class DictationApp:
         log(f"Final transcription (voice chat, {entry['voice_chat_status']}): {text!r}")
         if echo:
             log(f"Voice chat: ignored echo {text!r}")
+            self.voice_chat.resume("echo")
+            return
+        if filler:
+            self.voice_chat.resume("filler transcription")
             return
         with self._voice_lock:
             if self._stopping.is_set() or not self.config.get("voice_chat"):

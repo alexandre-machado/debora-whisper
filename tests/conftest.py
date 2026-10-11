@@ -67,3 +67,11 @@ def _dictation_by_default(request, monkeypatch):
         return
     from debora_whisper import dictation_engine
     monkeypatch.setitem(dictation_engine.DEFAULT_CONFIG, "voice_chat", False)
+
+
+@pytest.fixture(autouse=True)
+def _unknown_audio_output(monkeypatch):
+    """The developer's headphones must not switch the echo filter off."""
+    from debora_whisper import platforms
+    from debora_whisper.platforms.base import Platform
+    monkeypatch.setattr(platforms, "_current", Platform())
