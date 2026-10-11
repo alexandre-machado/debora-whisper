@@ -385,7 +385,8 @@ def validate_config(config: dict):
         raise ValueError('voice_chat_hotkey must be a single key or "" to disable')
     if not isinstance(config.get("harness_hotwords", True), bool):
         raise ValueError("harness_hotwords must be a bool")
-    if config.get("voice_chat_echo_filter", "auto") not in (True, False, "auto", "on", "off"):
+    echo_filter = config.get("voice_chat_echo_filter", "auto")
+    if not isinstance(echo_filter, bool) and echo_filter not in ("auto", "on", "off"):
         raise ValueError('voice_chat_echo_filter must be "auto", "on", "off" or a bool')
     if not isinstance(config.get("voice_chat_pause_on_speech", True), bool):
         raise ValueError("voice_chat_pause_on_speech must be a bool")

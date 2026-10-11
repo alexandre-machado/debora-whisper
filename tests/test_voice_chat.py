@@ -2155,7 +2155,8 @@ def test_echo_filter_follows_the_output_device(monkeypatch, setting, headphones,
     assert app._echo_filter_on() is on
 
 
-def test_echo_filter_setting_is_validated():
+@pytest.mark.parametrize("value", ["sometimes", 1, 0])
+def test_echo_filter_setting_is_validated(value):
     from debora_whisper.dictation_engine import validate_config
     with pytest.raises(ValueError, match="voice_chat_echo_filter"):
-        validate_config({**DEFAULT_CONFIG, "voice_chat_echo_filter": "sometimes"})
+        validate_config({**DEFAULT_CONFIG, "voice_chat_echo_filter": value})
