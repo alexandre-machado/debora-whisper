@@ -19,7 +19,7 @@ from enum import Enum
 from pathlib import Path
 from datetime import datetime
 
-from debora_whisper import paths
+from debora_whisper import paths, processes
 from debora_whisper.harness import MemoryHotwords, ProjectHotwords, bounded_hotwords
 from debora_whisper.solo_key import SoloKeyTap
 from debora_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
@@ -2722,7 +2722,7 @@ class DictationApp:
                 import subprocess
                 output = subprocess.check_output(
                     ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,nounits,noheader"],
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                    creationflags=processes.NO_WINDOW
                 ).decode("utf-8").strip()
                 used, total = (int(v) / 1024 for v in output.split(", "))
                 return f" VRAM {used:.1f}/{total:.1f}G"

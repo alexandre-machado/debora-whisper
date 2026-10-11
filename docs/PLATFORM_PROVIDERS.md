@@ -15,19 +15,19 @@ sem esse recurso.
 | Recurso | Windows | Linux (futuro) |
 |---|---|---|
 | Tipo do dispositivo de saída (fone ou alto-falante), usado pelo filtro de eco `"auto"` | Form factor do endpoint no registro (`MMDevices\Audio\Render`) | Tipo da porta no PipeWire/PulseAudio (`pactl`, `headphones`/`headset`) |
+| Processos: janela oculta e encerramento da árvore | `CREATE_NO_WINDOW` + `taskkill /T` | `process.kill` / `killpg` em um grupo de processos |
 
 ## Migração, em PRs pequenos e sem mudar comportamento
 
 | Ordem | Recurso | Onde está hoje |
 |---|---|---|
-| 1 | Processos: janela oculta e encerramento da árvore (`taskkill`) | `processes.py` (`NO_WINDOW`, `kill_tree`), `dictation_engine.py` (`CREATE_NO_WINDOW`) |
-| 2 | Ferramentas de GPU: caminho absoluto do `nvidia-smi` e carga das DLLs NVIDIA (cuBLAS/cuDNN via `add_dll_directory`) | `device_queries.py` (PR #36), `FasterWhisperCUDA` em `dictation_engine.py` |
-| 3 | Escrita no aplicativo em foco: digitar, apagar e rascunhos em tempo real dentro das caixas de texto (SendInput, `keyboard`, UI Automation) | `type_text`, `_type_text_ctypes`, `delete_text`, `type_draft_text` em `dictation_engine.py`; estudos em `docs/diagnostics/windows-text-insertion-2026-10-08.md` e `inline-drafts-any-textbox-2026-10-08.md` |
-| 4 | Atalhos globais e tecla isolada (Right Alt/AltGr), incluindo a exigência de administrador | `dictation_engine.py` (`import keyboard`), `solo_key.py` |
-| 5 | Janela do overlay: DPI, sempre no topo, sem foco, fora da barra de tarefas | `ui/overlay.py` (`GetDpiForWindow`, `WS_EX_*`) |
-| 6 | Instalação: atalhos do Menu Iniciar e início automático | `shortcuts.py` (`.lnk` via PowerShell) |
-| 7 | Hora do boot, usada para saber se a NPU caiu nesta sessão | `_boot_time` em `dictation_engine.py` |
-| 8 | Pastas de usuário e variáveis de ambiente persistentes | `paths.py` (`user_env`) |
+| 1 | Ferramentas de GPU: caminho absoluto do `nvidia-smi` e carga das DLLs NVIDIA (cuBLAS/cuDNN via `add_dll_directory`) | `device_queries.py` (PR #36), `FasterWhisperCUDA` em `dictation_engine.py` |
+| 2 | Escrita no aplicativo em foco: digitar, apagar e rascunhos em tempo real dentro das caixas de texto (SendInput, `keyboard`, UI Automation) | `type_text`, `_type_text_ctypes`, `delete_text`, `type_draft_text` em `dictation_engine.py`; estudos em `docs/diagnostics/windows-text-insertion-2026-10-08.md` e `inline-drafts-any-textbox-2026-10-08.md` |
+| 3 | Atalhos globais e tecla isolada (Right Alt/AltGr), incluindo a exigência de administrador | `dictation_engine.py` (`import keyboard`), `solo_key.py` |
+| 4 | Janela do overlay: DPI, sempre no topo, sem foco, fora da barra de tarefas | `ui/overlay.py` (`GetDpiForWindow`, `WS_EX_*`) |
+| 5 | Instalação: atalhos do Menu Iniciar e início automático | `shortcuts.py` (`.lnk` via PowerShell) |
+| 6 | Hora do boot, usada para saber se a NPU caiu nesta sessão | `_boot_time` em `dictation_engine.py` |
+| 7 | Pastas de usuário e variáveis de ambiente persistentes | `paths.py` (`user_env`) |
 
 Cada etapa move o código para `WindowsPlatform`, deixa em `Platform` o
 comportamento atual para outros sistemas (ou `None`) e mantém os testes

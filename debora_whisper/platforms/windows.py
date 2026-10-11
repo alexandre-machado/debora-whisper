@@ -3,6 +3,8 @@
 Each playback endpoint's form factor is in the registry, so telling
 headphones from speakers needs no extra package.
 """
+import subprocess
+
 from debora_whisper.platforms.base import Platform
 
 _RENDER = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
@@ -65,6 +67,21 @@ def is_headphones(name, endpoints):
 
 class WindowsPlatform(Platform):
     name = "windows"
+
+    @property
+    def no_window(self):
+        return subprocess.CREATE_NO_WINDOW
+
+    def kill_tree(self, process):
+        """Kill process and its children, without waiting for them.
+
+        On Windows a venv's python.exe and uv both run the real interpreter as a
+        child: killing only the parent leaves that child running, holding its
+        GPU or NPU."""
+        if process.poll() is not None:
+            return
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                       capture_output=True, creationflags=self.no_window)
 
     def output_is_headphones(self, name=None):
         name = self.default_output_name() if name is None else name

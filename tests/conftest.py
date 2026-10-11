@@ -73,5 +73,7 @@ def _dictation_by_default(request, monkeypatch):
 def _unknown_audio_output(monkeypatch):
     """The developer's headphones must not switch the echo filter off."""
     from debora_whisper import platforms
-    from debora_whisper.platforms.base import Platform
-    monkeypatch.setattr(platforms, "_current", Platform())
+    monkeypatch.setattr(platforms, "_current", None)
+    provider = platforms.current()
+    monkeypatch.setattr(provider, "default_output_name", lambda: None)
+    monkeypatch.setattr(provider, "output_is_headphones", lambda name=None: None)
