@@ -55,7 +55,7 @@ Para avaliar qualquer classificador, é essencial diferenciar onde cada modelo o
 Resultados sintetizados do benchmark executado localmente em AMD Strix Halo (64 GB) e nuvem:
 
 | Modelo | Parâmetros | Onde Roda | Acerto PT-BR (Compacto) | Latência Mediana | Requisitos de Memória | Adequação ao Débora Whisper |
-|---|:---:|:---:|:---:|:---:|---|
+|---|:---:|:---:|:---:|:---:|---|---|
 | **Jev 1.13.0** | Proprietário | API (Nuvem) | **97,6%** | ~255 ms (WAN) | US$ 0,19 / 10k decisões | Inviável offline; adiciona dependência de nuvem e latência de rede. |
 | **Clef (27B)** | 27B | API / Local | 94,0% | ~302 ms (WAN) | ~54 GB VRAM em BF16 | Pesado demais para máquina cliente comum. |
 | **Jebadiah 4B v2** | 4B | Local | **89,3%** | ~205 ms (LAN) | ~8 GB VRAM | **Inviável para loop de voz**: consome 8 GB de VRAM (concorrendo com o Whisper) e adiciona 200 ms por rascunho. |
@@ -105,7 +105,7 @@ Para o problema real do aplicativo (evitar cortes prematuros durante o ditado e 
 | Abordagem | Modelo | Entrada | Onde Roda | Latência | Custo de RAM/VRAM | Impacto no Débora Whisper |
 |---|---|---|---|---|---|---|
 | **VAD Acústico Atual** | Silero VAD v5 | Áudio (32 ms) | CPU (ONNX) | < 1 ms | ~2 MB | Base contínua mantida; não sabe quando a frase terminou. |
-| **Turn Detection Acústico** | **Smart Turn v3** | Áudio (últimos 8s) | CPU (ONNX) | 12–30 ms | **8 MB** | **Máximo**: Evita cortes prematuros em PT-BR sem custo de GPU. |
+| **Turn Detection Acústico** | **Smart Turn v3** | Áudio (últimos 8s) | CPU (ONNX) | 12–95 ms | **8 MB** | **Máximo**: Evita cortes prematuros em PT-BR sem custo de GPU. |
 | **Endpointing de Texto (Atual)** | Heurística regex | Texto transcrito | CPU (Python) | < 0.1 ms | 0 MB | Básico: só verifica pontuação e conjunções no final. |
 | **Endpointing Semântico IA** | Laya (ajustado) | Texto transcrito | CPU (ONNX) | ~20 ms | ~600 MB | Alto: substitui o regex por entendimento de contexto do texto. |
 | **Decisão Geral (Jev-like)** | Jebadiah / Kev 4B | Texto estruturado | GPU (CUDA/ROCm) | ~200 ms | ~8 GB | Inviável no desktop: pesado demais para rodar em paralelo. |
@@ -114,5 +114,5 @@ Para o problema real do aplicativo (evitar cortes prematuros durante o ditado e 
 
 ## 6. Próximos Passos Recomendados
 
-1. **Prioridade 1 (Turn Detection Acústico)**: Validar o **Smart Turn v3** como complemento ao Silero VAD, conforme o plano de testes traçado em [turn-detection-2026-10-09.md](turn-detection-2026-10-09.md#L27-L32).
+1. **Prioridade 1 (Turn Detection Acústico)**: Validar o **Smart Turn v3** como complemento ao Silero VAD, conforme o plano de testes traçado em [turn-detection-2026-10-09.md](turn-detection-2026-10-09.md), seção "Plano de teste offline".
 2. **Prioridade 2 (Endpointing Textual)**: Manter a heurística em `vad_endpoint.py` no curto prazo; caso se deseje sofisticação semântica no texto transcrito, prototipar um classificador baseado no **Laya** (exportado para ONNX int8 em CPU) ajustado especificamente para detecção de completude de sentenças em português.
