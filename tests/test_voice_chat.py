@@ -2277,3 +2277,50 @@ def test_short_reply_sharing_her_words_is_not_echo(text, echo):
     chat = vc.VoiceChat({"language": "pt"})
     chat._spoken = [(10.0, 12.6, "Você quer a previsão do tempo?")]
     assert chat.is_echo(text, 13.0, 14.0) is echo
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("Headphones (LE-HD 450BT)", True),
+    ("Headset (LE-HD 450BT Hands-Free)", True),
+    ("Speakers (Realtek(R) Audio)", False),
+    ("Headset (LE-HD 450BT Hands-Free", True),  # MME cuts at 31 characters
+    ("Headphones (Other)", None),
+    (None, None),
+])
+def test_windows_output_form_factor(name, expected):
+    from debora_whisper.platforms.windows import is_headphones
+    endpoints = [("Headphones (LE-HD 450BT)", 3), ("Headset (LE-HD 450BT Hands-Free)", 5),
+                 ("Speakers (Realtek(R) Audio)", 1)]
+    assert is_headphones(name, endpoints) is expected
+
+
+def test_generic_platform_does_not_know_the_output():
+    from debora_whisper.platforms.base import Platform
+    assert Platform().output_is_headphones("Headphones") is None
+
+
+@pytest.mark.parametrize("setting, headphones, on", [
+    ("auto", True, False), (True, True, False), ("auto", False, True),
+    ("auto", None, True), ("on", True, True), ("off", False, False), (False, None, False),
+])
+def test_echo_filter_follows_the_output_device(monkeypatch, setting, headphones, on):
+    from debora_whisper import platforms
+    from debora_whisper.platforms.base import Platform
+
+    class Fake(Platform):
+        def default_output_name(self):
+            return "Fone"
+
+        def output_is_headphones(self, name=None):
+            return headphones
+
+    monkeypatch.setattr(platforms, "_current", Fake())
+    app = _app(voice_chat=True, voice_chat_echo_filter=setting)
+    assert app._echo_filter_on() is on
+
+
+@pytest.mark.parametrize("value", ["sometimes", 1, 0])
+def test_echo_filter_setting_is_validated(value):
+    from debora_whisper.dictation_engine import validate_config
+    with pytest.raises(ValueError, match="voice_chat_echo_filter"):
+        validate_config({**DEFAULT_CONFIG, "voice_chat_echo_filter": value})

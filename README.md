@@ -356,11 +356,14 @@ An incomplete draft, including trailing `...`, `…`, or a dangling connective,
 allows 2 s (`voice_chat_incomplete_silence_seconds`; dictation waits 1.5–3 s).
 
 Headphones are recommended for simultaneous listening and playback. With speakers,
-`voice_chat_echo_filter: true` compares normalized words against audio actually
-played during the captured segment, allowing a 2 s echo tail. At least 60% token
-overlap is treated as echo and is not sent to the LLM. This is a text heuristic:
-it can mistake a user repeating Débora for echo, or miss distorted speaker audio.
-Headphone users can disable the filter. Every nonempty final transcription is
+the echo filter compares normalized words against audio actually played during
+the captured segment, allowing a 2 s echo tail. Up to four words must all match;
+longer text needs 60% token overlap. Echo is not sent to the LLM. This is a text
+heuristic: it can mistake a user repeating Débora for echo, or miss distorted
+speaker audio. `voice_chat_echo_filter: "auto"` (default; `true` means the same)
+turns it off when Windows reports the output device as headphones or a headset,
+and keeps it on for speakers or an unknown device (wired headphones on a shared
+jack may show as speakers). `"on"` and `"off"` (or `false`) force it. Every nonempty final transcription is
 logged in `app.log` and added immediately to the usual transcription history,
 including queued, interrupted, cancelled, failed and echo-filtered entries with
 status labels. History retains its usual last 20 entries; logs retain older text
@@ -376,7 +379,7 @@ loaded until the app exits, so switching back is instant.
 {
   "voice_chat": true,
   "voice_chat_incomplete_silence_seconds": 2.0,
-  "voice_chat_echo_filter": true,
+  "voice_chat_echo_filter": "auto",
   "voice_chat_barge_in": true,
   "voice_chat_pause_on_speech": true,
   "voice_chat_pause_timeout": 3.0,
