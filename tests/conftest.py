@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 @pytest.fixture(autouse=True, scope="session")
 def _private_logs(tmp_path_factory):
     """Tests log to a temporary folder, never to the user's app.log, and
-    never record a lost NPU for the real app. Not restored afterwards: daemon
+    never record a lost NPU or a hardware inventory for the real app. Not restored afterwards: daemon
     threads of finished tests may still log."""
     from debora_whisper import dictation_engine as engine
     home = tmp_path_factory.mktemp("debora")
@@ -28,6 +28,7 @@ def _private_logs(tmp_path_factory):
     engine.TTS_SERVER_LOG = engine.LOG_DIR / "tts_server.log"
     engine.LLM_SERVER_LOG = engine.LOG_DIR / "llm_server.log"
     engine.NPU_LOST_FILE = home / "npu_lost.json"
+    engine.HARDWARE_INVENTORY = home / "hardware-inventory.json"
 
 
 @pytest.fixture(autouse=True)

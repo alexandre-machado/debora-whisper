@@ -129,6 +129,9 @@ def load_model(device: str, voice: str | None):
         device = "cpu"
     start = time.time()
     model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+    # Report the device actually loaded, without another CUDA probe. The UI's
+    # STT environment cannot infer this server's PyTorch capabilities.
+    model._debora_device = device.upper()
     _stub_sklearn()
     model.builtin_conds = model.conds
     if voice:
@@ -243,6 +246,16 @@ def make_handler(model, default_language: str):
     # thread-safe.
     lock = threading.Lock()
     voices = Voices(model)
+    from importlib.metadata import PackageNotFoundError, version
+    versions = {}
+    for package in ("torch", "chatterbox-tts"):
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = None
+    inventory = {"schema_version": 1, "device": getattr(model, "_debora_device", None),
+                 "versions": versions, "loaded": True,
+                 "model": "ChatterboxMultilingualTTS", "precision": "unknown"}
 
     class Handler(BaseHTTPRequestHandler):
         def _reply(self, code, body: bytes, content_type="application/json"):
@@ -261,7 +274,8 @@ def make_handler(model, default_language: str):
         def do_GET(self):
             if self.path != "/health":
                 return self._error(404, "not found")
-            self._reply(200, json.dumps({"ok": True, "sample_rate": model.sr}).encode())
+            self._reply(200, json.dumps({"ok": True, "sample_rate": model.sr,
+                                        "inventory": inventory}).encode())
 
         def do_POST(self):
             if self.path != "/tts":

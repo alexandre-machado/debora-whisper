@@ -16,7 +16,7 @@ from debora_whisper.dictation_engine import (
     load_config, save_config, start_in_dictation, validate_config, log, create_model,
     is_model_downloaded, device_failure, set_voice_chat_config,
     apply_device_priority, avoid_lost_npu, detect_devices, rotate_logs, log_folder_moves,
-    select_device,
+    select_device, log_hardware_inventory,
 )
 from debora_whisper.npu_probe import probe_npu
 from debora_whisper.ui.tray import TrayManager
@@ -647,6 +647,7 @@ def main():
 
     validate_config(config)
     rotate_logs()
+    log_hardware_inventory(config)
     if not args.device:
         apply_device_priority(config)
     check_npu = avoid_lost_npu(config)

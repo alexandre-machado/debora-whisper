@@ -41,6 +41,7 @@ LLM_SERVER_LOG = LOG_DIR / "llm_server.log"
 LOG_MAX_BYTES = 5_000_000
 # An NPU lost to DEVICE_LOST, until a recovery probe or a reboot (npu_lost_this_boot).
 NPU_LOST_FILE = CONFIG_DIR / "npu_lost.json"
+HARDWARE_INVENTORY = CONFIG_DIR / "hardware-inventory.json"
 LAST_RECORDING = CONFIG_DIR / "last_recording.wav"
 
 DEFAULT_CONFIG = {
@@ -563,23 +564,10 @@ def _exception_chain(exc: BaseException):
 def has_nvidia_gpu(return_name: bool = False):
     """Check if an NVIDIA GPU is present and accessible via nvidia-smi.
     If return_name is True, returns the GPU name string or None if not found."""
-    import shutil
-    import os
-    if not shutil.which("nvidia-smi"):
-        return None if return_name else False
     try:
-        import subprocess
-        
-        args = ["nvidia-smi"]
-        if return_name:
-            args = ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]
-            
-        output = subprocess.check_output(
-            args,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        )
-        return output.decode("utf-8").strip() if return_name else True
+        from debora_whisper.device_queries import nvidia_output
+        output = nvidia_output("name" if return_name else None)
+        return output if return_name else output is not None
     except Exception:
         return None if return_name else False
 
@@ -625,9 +613,9 @@ def detect_devices() -> set:
             except RuntimeError as e:
                 log(f"NVIDIA GPU found but {e}; skipping CUDA")
     try:
-        import openvino as ov
+        from debora_whisper.device_queries import openvino_core
         # "GPU.0"/"GPU.1" on multi-GPU machines; the app addresses "GPU".
-        found.update(d.split(".")[0] for d in ov.Core().available_devices)
+        found.update(d.split(".")[0] for d in openvino_core().available_devices)
     except Exception as e:
         log(f"OpenVINO device query failed: {e}")
     return found
@@ -658,6 +646,23 @@ def apply_device_priority(config: dict):
     log(f"Device priority {config['device_priority']} -> {chosen} "
         f"for {config['model_size']} (override with --device)")
     config["device"] = chosen
+
+
+def log_hardware_inventory(config: dict):
+    """Collect diagnostics only; keep preferences and all loaders untouched."""
+    from debora_whisper.device_inventory import probe_inventory, inventory_summary
+    request = {"config": dict(config), "model_info": MODEL_REGISTRY[config["model_size"]],
+               "model_dir": str(MODEL_DIR), "npu_loss_file": str(NPU_LOST_FILE)}
+    def probe():
+        try:
+            log(inventory_summary(probe_inventory(request, HARDWARE_INVENTORY)))
+        except Exception as e:
+            log(f"Hardware inventory failed: {type(e).__name__}: {e}")
+
+    # Startup never waits for it: it only informs, nothing reads it yet.
+    thread = threading.Thread(target=probe, name="hardware-inventory", daemon=True)
+    thread.start()
+    return thread
 
 
 def _failure_detail(exc: BaseException) -> str:
@@ -4037,6 +4042,7 @@ def main():
 
     validate_config(config)
     rotate_logs()
+    log_hardware_inventory(config)
     if not args.device:
         apply_device_priority(config)
     avoid_lost_npu(config)
