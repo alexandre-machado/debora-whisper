@@ -158,7 +158,8 @@ def _validated_cache(observed, now=100):
 
 def test_inventory_nvidia_multiple_gpus_one_query(monkeypatch):
     calls = []
-    monkeypatch.setattr(queries.shutil, "which", lambda name: name)
+    # CI runners have no nvidia-smi anywhere.
+    monkeypatch.setattr(queries, "nvidia_smi", lambda: "nvidia-smi.exe")
 
     def output(args, **kwargs):
         calls.append((args, kwargs))
