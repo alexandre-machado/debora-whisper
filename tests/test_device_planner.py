@@ -155,20 +155,38 @@ def test_explicit_override_wins(changes, component, expected):
     assert "explicit" in result["reason"]
 
 
-@pytest.mark.parametrize("preference", ["GPU.1", "gpu.1", "OV:GPU.1"])
-def test_explicit_llm_backend_index_selects_second_gpu(preference):
-    observed = _inventory(("GPU",))["observed"]
+@pytest.mark.parametrize("preference", ["GPU.1", "gpu.1", "OV:GPU.1", "ov:gpu.1"])
+@pytest.mark.parametrize("model,key,components", [
+    ("turbo", "device", ["stt"]),
+    ("turbo", "llm_device", ["llm"]),
+    ("parakeet", "device", ["stt.parakeet.encoder", "stt.parakeet.decoder"]),
+])
+def test_explicit_backend_index_selects_second_gpu(preference, model, key, components):
+    observed = _inventory(("GPU",), parakeet=model == "parakeet")["observed"]
     gpu = next(d for d in observed["openvino"]["devices"] if d["kind"] == "GPU")
     observed["openvino"]["devices"] = [d for d in observed["openvino"]["devices"] if d["kind"] != "GPU"] + [
         {**gpu, "id": f"OV:GPU.{index}", "index": f"GPU.{index}", "physical_id": f"gpu-{index}"}
         for index in range(2)]
     inventory = device_inventory.make_inventory(observed, now=100)
-    result = plan(inventory, mode="chat_local", config=_config(llm_device=preference))["components"]["llm"]
-    assert result["device"] == "OV:GPU.1"
-    assert result["index"] == "GPU.1"
-    assert result["physical_id"] == "gpu-1"
-    assert result["reason"] == "explicit device choice"
-    assert "OV:GPU.0" in result["fallbacks"]
+    results = plan(inventory, mode="chat_local", config=_config(model_size=model, **{key: preference}))["components"]
+    for component in components:
+        result = results[component]
+        assert result["device"] == "OV:GPU.1"
+        assert result["index"] == "GPU.1"
+        assert result["physical_id"] == "gpu-1"
+        assert result["reason"] == "explicit device choice"
+        assert "OV:GPU.0" in result["fallbacks"]
+
+
+@pytest.mark.parametrize("preference", ["CPU", "cpu", "OV:CPU", "ov:cpu"])
+@pytest.mark.parametrize("model", ["turbo", "parakeet"])
+def test_cpu_aliases_apply_to_every_override(preference, model):
+    results = plan(_inventory(parakeet=model == "parakeet"), mode="chat_local",
+                   config=_config(model_size=model, device=preference, llm_device=preference,
+                                  tts_device=preference))["components"]
+    for result in results.values():
+        assert result["kind"] == "CPU"
+        assert result["reason"] == "explicit device choice"
 
 
 def test_explicit_stt_reserves_before_automatic_tts():

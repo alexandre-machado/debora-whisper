@@ -4,6 +4,11 @@ import math
 from urllib.parse import urlparse
 
 
+def _normalize_device(value):
+    """Use OpenVINO backend names for both inventory IDs and config aliases."""
+    return str(value).upper().removeprefix("OV:")
+
+
 def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
 
@@ -160,16 +165,16 @@ def plan(inventory, *, mode, config, loaded=None, generation=0):
 
     def override(component):
         key = "device" if component in stt else component + "_device"
-        value = str(config.get(key, "auto")).upper()
+        value = _normalize_device(config.get(key, "auto"))
         # Encoder choices do not force an unsupported NPU decoder.
-        if component == "stt.parakeet.decoder" and value not in {"CPU", "GPU"} and not value.startswith("OV:GPU"):
+        if component == "stt.parakeet.decoder" and value.split(".")[0] not in {"CPU", "GPU"}:
             return "AUTO"
         return value
 
     def explicit(component, candidate):
         device = candidate["target"]
-        return override(component) in {device["id"].upper(), device["kind"],
-                                       str(device.get("index", "")).upper()}
+        return override(component) in {_normalize_device(value) for value in (
+            device["id"], device["kind"], device.get("index", ""))}
 
     def ordered(component):
         available = [c for c in candidates[component] if fits(component, c)]
