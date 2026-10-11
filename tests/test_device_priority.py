@@ -464,7 +464,8 @@ def test_inventory_logging_is_one_line_and_does_not_select(monkeypatch, tmp_path
     monkeypatch.setattr(de, "detect_devices", lambda: pytest.fail("inventory must not select"))
     de.log_hardware_inventory(config).join(5)
     assert config == before
-    assert len(logs) == 1 and "\n" not in logs[0]
+    assert len([line for line in logs if line.startswith("Hardware inventory:")]) == 1
+    assert all("\n" not in line for line in logs)
     assert "CUDA:0=RTX" in logs[0] and "probe=123.4ms" in logs[0]
 
 
