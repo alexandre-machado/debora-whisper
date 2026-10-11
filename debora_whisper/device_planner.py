@@ -15,6 +15,12 @@ def _pool(device):
     return device.get("physical_id") or device["id"]
 
 
+def _accelerator_memory_known(device):
+    # A RAM budget does not establish an accelerator's capacity or sharing mode.
+    return (isinstance(device.get("memory_shared"), bool)
+            and _number(device.get("memory_total")) and _number(device.get("memory_free")))
+
+
 def _estimate(component, model):
     # Initial peak MiB (weights + workspace), to refine with measurements.
     # Parakeet includes resident buckets; LLM includes context/KV workspace.
@@ -147,8 +153,8 @@ def plan(inventory, *, mode, config, loaded=None, generation=0):
         used = sum(reservation(name, c) for name, c in selected.items()
                    if name != component and _pool(c["target"]) == pool and not resident(name, c))
         others = occupants(component, device)
-        if device["kind"] != "CPU" and others and (pool not in limits or any(
-                _pool(d) != pool for d in others)):
+        if device["kind"] != "CPU" and others and (not _accelerator_memory_known(device) or any(
+                not _accelerator_memory_known(d) or _pool(d) != pool for d in others)):
             return False
         return pool not in limits or used + reservation(component, candidate) <= limits[pool]
 
@@ -162,7 +168,8 @@ def plan(inventory, *, mode, config, loaded=None, generation=0):
 
     def explicit(component, candidate):
         device = candidate["target"]
-        return override(component) in {device["id"].upper(), device["kind"]}
+        return override(component) in {device["id"].upper(), device["kind"],
+                                       str(device.get("index", "")).upper()}
 
     def ordered(component):
         available = [c for c in candidates[component] if fits(component, c)]
@@ -240,7 +247,8 @@ def plan(inventory, *, mode, config, loaded=None, generation=0):
                     reason += "; already resident, no new reservation"
                 if override(component) != "AUTO" and not explicit(component, chosen):
                     reason += "; requested device unavailable or unsafe"
-                known = _pool(chosen["target"]) in limits
+                device = chosen["target"]
+                known = _pool(device) in limits and (device["kind"] == "CPU" or _accelerator_memory_known(device))
                 peak = measurements.get(chosen["id"], {}).get("peak_bytes")
                 entry["confidence"] = "unknown" if partial or not known or chosen.get("assumed") else (
                     "measured" if _number(peak) else "estimated")

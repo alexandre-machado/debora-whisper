@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from debora_whisper import device_inventory, device_planner
+from debora_whisper import device_inventory, device_planner, device_queries
 from debora_whisper.device_planner import plan
 
 
@@ -90,6 +90,44 @@ def test_unknown_memory_allows_one_accelerator_load():
     assert result["confidence"] == "unknown"
 
 
+@pytest.mark.parametrize("mode", ["dictation", "chat_local"])
+def test_live_openvino_unknown_memory_does_not_inherit_ram_certainty(monkeypatch, mode):
+    class Core:
+        available_devices = ["CPU", "GPU.0"]
+
+        def get_property(self, device, prop):
+            raise RuntimeError("unsupported")
+
+    monkeypatch.setattr(device_queries, "openvino_core", Core)
+    updates = []
+    device_queries.openvino_inventory(updates.append)
+    observed = _inventory(("GPU",))["observed"]
+    observed["openvino"] = updates[-1]
+    inventory = device_inventory.make_inventory(observed, now=100)
+    gpu = next(d for d in inventory["devices"] if d["kind"] == "GPU")
+    assert all(gpu[field] is None for field in ("memory_shared", "memory_total", "memory_free"))
+    result = plan(inventory, mode=mode, config=_config())["components"]
+    component = "stt" if mode == "dictation" else "llm"
+    assert result[component]["device"] == "OV:GPU.0"
+    assert result[component]["confidence"] == "unknown"
+    if mode == "chat_local":
+        assert _chain(result["stt"]) == ["CPU"]
+
+
+@pytest.mark.parametrize("unknown_field", [None, "memory_shared", "memory_total", "memory_free"])
+def test_accelerator_sharing_requires_known_capacity_and_sharing(unknown_field):
+    inventory = _inventory(("GPU",))
+    gpu = next(d for d in inventory["devices"] if d["kind"] == "GPU")
+    if unknown_field:
+        gpu[unknown_field] = None
+    result = plan(inventory, mode="chat_local", config=_config())["components"]
+    assert result["llm"]["kind"] == "GPU"
+    assert result["llm"]["confidence"] == ("unknown" if unknown_field else "estimated")
+    assert result["stt"]["kind"] == ("CPU" if unknown_field else "GPU")
+    if unknown_field:
+        assert "GPU" not in _chain(result["stt"])
+
+
 @pytest.mark.parametrize("kinds,expected", [(("CUDA", "NPU", "GPU"), "CUDA"), (("NPU", "GPU"), None)])
 def test_shared_ram_is_one_budget(kinds, expected):
     inventory = _inventory(kinds, ram_free=14000 if "CUDA" not in kinds else 11000)
@@ -115,6 +153,22 @@ def test_explicit_override_wins(changes, component, expected):
     result = plan(_inventory(), mode="chat_local", config=_config(**changes))["components"][component]
     assert result["kind"] == expected
     assert "explicit" in result["reason"]
+
+
+@pytest.mark.parametrize("preference", ["GPU.1", "gpu.1", "OV:GPU.1"])
+def test_explicit_llm_backend_index_selects_second_gpu(preference):
+    observed = _inventory(("GPU",))["observed"]
+    gpu = next(d for d in observed["openvino"]["devices"] if d["kind"] == "GPU")
+    observed["openvino"]["devices"] = [d for d in observed["openvino"]["devices"] if d["kind"] != "GPU"] + [
+        {**gpu, "id": f"OV:GPU.{index}", "index": f"GPU.{index}", "physical_id": f"gpu-{index}"}
+        for index in range(2)]
+    inventory = device_inventory.make_inventory(observed, now=100)
+    result = plan(inventory, mode="chat_local", config=_config(llm_device=preference))["components"]["llm"]
+    assert result["device"] == "OV:GPU.1"
+    assert result["index"] == "GPU.1"
+    assert result["physical_id"] == "gpu-1"
+    assert result["reason"] == "explicit device choice"
+    assert "OV:GPU.0" in result["fallbacks"]
 
 
 def test_explicit_stt_reserves_before_automatic_tts():
