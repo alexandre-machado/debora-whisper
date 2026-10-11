@@ -25,6 +25,30 @@ def _estimate(component, model):
             "llm": 8192, "tts": 3072}[component]
 
 
+def _tts_device(devices, kind, physical_id):
+    device = next((d for d in devices.values() if d["kind"] == kind and (
+        kind == "CPU" or physical_id and d.get("physical_id") == physical_id)), None)
+    # The server's CUDA index belongs to its own environment, not ours.
+    if device is None and kind == "CUDA":
+        device = {"id": "TTS:CUDA", "kind": kind, "physical_id": physical_id,
+                  "memory_shared": False}
+    return device
+
+
+def resident_tts(inventory):
+    """Translate a live server report into allocations already in free memory."""
+    inventory = inventory or {}
+    report = inventory.get("observed", {}).get("tts", {})
+    if report.get("status") != "ok" or report.get("loaded") is not True or report.get("external"):
+        return {}
+    devices = {d["id"]: d for d in inventory.get("devices", [])}
+    devices.setdefault("CPU", {"id": "CPU", "kind": "CPU"})
+    device = _tts_device(devices, report.get("device"), report.get("physical_id"))
+    if device is None:
+        return {}
+    return {"tts": {"device": device["id"], "model": report.get("model")}}
+
+
 def plan(inventory, *, mode, config, loaded=None, generation=0):
     """Return preferences only; never mutate inputs or change model/precision.
 
@@ -65,12 +89,8 @@ def plan(inventory, *, mode, config, loaded=None, generation=0):
         device = devices.get(row["device"])
         if row["device"].startswith("TTS:"):
             kind = row["device"].split(":")[1]
-            device = next((d for d in devices.values() if d["kind"] == kind and (
-                kind == "CPU" or row.get("physical_id") and d.get("physical_id") == row["physical_id"])), None)
-            # An unknown server UUID must not be assigned to CUDA:0 by guesswork.
-            if device is None and kind == "CUDA":
-                device = {"id": row["device"], "kind": kind, "physical_id": row.get("physical_id"),
-                          "memory_shared": False}
+            device = _tts_device(devices, kind, row.get("physical_id"))
+            if device is not None:
                 devices[device["id"]] = device
         if device is None or device.get("validation") == "quarantined":
             continue

@@ -352,3 +352,111 @@ def test_logging_failure_is_contained(monkeypatch, failure):
         assert any("Device plan failed:" in line for line in logs)
     else:
         assert any(line.startswith("Device plan 1 ") and "confidence=unknown" in line for line in logs)
+
+
+def test_logging_uses_one_snapshot_while_caller_changes_config(monkeypatch):
+    from debora_whisper import dictation_engine as engine
+
+    config = _config(voice_chat=True, voice_chat_backend="claude")
+    original = copy.deepcopy(config)
+    started, release = threading.Event(), threading.Event()
+    requests, calls, results, logs = [], [], [], []
+
+    def blocked_probe(request, cache_path):
+        requests.append(request)
+        started.set()
+        assert release.wait(5)
+        return {**_inventory(), "elapsed_ms": 1.0, "timed_out": False}
+
+    def capture(inventory, **kwargs):
+        calls.append(kwargs)
+        result = plan(inventory, **kwargs)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(device_inventory, "probe_inventory", blocked_probe)
+    monkeypatch.setattr(device_planner, "plan", capture)
+    monkeypatch.setattr(engine, "log", logs.append)
+    thread = engine.log_hardware_inventory(config)
+    try:
+        assert started.wait(5)
+        # Startup priority resolution and settings edits both mutate this object.
+        config.update(device="CUDA", model_size="small", voice_chat=False,
+                      voice_chat_backend="local", llm_model="different-model")
+        config["device_priority"][:] = ["CPU"]
+    finally:
+        release.set()
+        thread.join(5)
+
+    assert not thread.is_alive()
+    assert len(calls) == 1
+    assert requests[0]["config"] is calls[0]["config"]
+    assert calls[0]["config"] == original
+    assert requests[0]["model_info"] == engine.MODEL_REGISTRY[original["model_size"]]
+    assert calls[0]["mode"] == "chat_claude"
+    assert results[0]["components"]["stt"]["model"] == "turbo"
+    assert "explicit device choice" not in results[0]["components"]["stt"]["reason"]
+    assert not any("failed:" in line for line in logs)
+
+
+@pytest.mark.parametrize("kind,physical_id,expected", [
+    ("CPU", None, "CPU"),
+    ("CUDA", "CUDA-uuid", "CUDA:0"),
+    ("CUDA", "second-uuid", "CUDA:1"),
+    ("CUDA", None, "TTS:CUDA"),
+    ("CUDA", "unmatched-uuid", "TTS:CUDA"),
+])
+def test_logging_reuses_live_tts_allocation(monkeypatch, kind, physical_id, expected):
+    from debora_whisper import dictation_engine as engine
+
+    # Rebuild from observations so only the loaded server's device is ready,
+    # exactly as in the live capability matrix (no synthetic CPU fallback).
+    observed = copy.deepcopy(_inventory(
+        ("CUDA",) if kind == "CUDA" else (), cuda_free=4500, ram_free=12000)["observed"])
+    observed["tts"].update(loaded=True, schema_version=1, external=False,
+                           device=kind, physical_id=physical_id, index=0)
+    if expected == "CUDA:1":
+        first = observed["nvidia"]["devices"][0]
+        observed["nvidia"]["devices"].append({
+            **first, "id": "CUDA:1", "index": 1, "physical_id": "second-uuid"})
+    inventory = {**device_inventory.make_inventory(observed, now=100),
+                 "elapsed_ms": 1.0, "timed_out": False}
+    ready = [r["device"] for r in inventory["capabilities"] if r["component"] == "tts" and r["ready"]]
+    assert ready == ["TTS:" + kind]
+    results, calls, logs = [], [], []
+
+    def capture(inventory, **kwargs):
+        calls.append(kwargs)
+        result = plan(inventory, **kwargs)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(device_inventory, "probe_inventory", lambda *args: inventory)
+    monkeypatch.setattr(device_planner, "plan", capture)
+    monkeypatch.setattr(engine, "log", logs.append)
+    config = _config(voice_chat=True, voice_chat_backend="claude")
+    thread = engine.log_hardware_inventory(config)
+    thread.join(5)
+    assert not thread.is_alive()
+    assert len(results) == 1
+    assert calls[0]["loaded"] == {"tts": {"device": expected, "model": observed["tts"]["model"]}}
+    components = results[0]["components"]
+    assert components["tts"]["state"] == "planned"
+    assert components["tts"]["device"] == expected
+    assert "already resident" in components["tts"]["reason"]
+    assert components["stt"]["state"] == "planned"
+    assert components["stt"]["kind"] == ("CPU" if kind == "CUDA" and physical_id is None else kind)
+    assert not any("failed:" in line for line in logs)
+
+
+@pytest.mark.parametrize("report", [
+    {}, {"status": "unknown", "loaded": True},
+    {"status": "ok", "loaded": False}, {"status": "ok"},
+    {"status": "ok", "loaded": True, "external": True},
+])
+def test_unobserved_tts_is_not_resident(report):
+    inventory = _inventory()
+    inventory["observed"]["tts"].update(report)
+    if "loaded" not in report:
+        inventory["observed"]["tts"].pop("loaded", None)
+    assert device_planner.resident_tts(inventory) == {}
