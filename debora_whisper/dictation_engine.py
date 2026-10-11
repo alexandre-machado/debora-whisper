@@ -12,6 +12,7 @@ import json
 import re
 import argparse
 import inspect
+from copy import deepcopy
 import threading
 import zlib
 from collections import deque
@@ -655,13 +656,33 @@ def apply_device_priority(config: dict):
 def log_hardware_inventory(config: dict):
     """Collect diagnostics only; keep preferences and all loaders untouched."""
     from debora_whisper.device_inventory import probe_inventory, inventory_summary
-    request = {"config": dict(config), "model_info": MODEL_REGISTRY[config["model_size"]],
+    snapshot = deepcopy(config)
+    request = {"config": snapshot, "model_info": MODEL_REGISTRY[snapshot["model_size"]],
                "model_dir": str(MODEL_DIR), "npu_loss_file": str(NPU_LOST_FILE)}
     def probe():
+        inventory = None
         try:
-            log(inventory_summary(probe_inventory(request, HARDWARE_INVENTORY)))
+            inventory = probe_inventory(request, HARDWARE_INVENTORY)
+            log(inventory_summary(inventory))
         except Exception as e:
             log(f"Hardware inventory failed: {type(e).__name__}: {e}")
+        try:
+            from debora_whisper.device_planner import plan, resident_tts
+            mode = "dictation"
+            if snapshot.get("voice_chat"):
+                mode = "chat_claude" if snapshot.get("voice_chat_backend") == "claude" else "chat_local"
+            proposed = plan(inventory, mode=mode, config=snapshot,
+                            loaded=resident_tts(inventory), generation=1)
+            for component, placement in proposed["components"].items():
+                fallbacks = ",".join(d["kind"] for d in placement["fallback_details"]) or "none"
+                reservation = placement["reservation_mib"]
+                reservation = f"{reservation}MiB" if reservation is not None else "unknown"
+                reason = " ".join(placement["reason"].split())
+                log(f"Device plan {proposed['id']} mode={mode} component={component} "
+                    f"device={placement['kind'] or placement['state']} fallbacks={fallbacks} "
+                    f"reservation={reservation} reason={reason} confidence={placement['confidence']}")
+        except Exception as e:
+            log(f"Device plan failed: {type(e).__name__}: {e}")
 
     # Startup never waits for it: it only informs, nothing reads it yet.
     thread = threading.Thread(target=probe, name="hardware-inventory", daemon=True)

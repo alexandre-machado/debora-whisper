@@ -284,6 +284,8 @@ ampliar essa dependência, com estado desconhecido conservador onde não existir
 
 ## 7. Entrega em PRs pequenos
 
+PR 2 entregou o planejador em modo apenas registrado (log-only); a integração da configuração Auto fica para o PR 3.
+
 | PR | Escopo | Testes focados |
 |---|---|---|
 | 1 | Inventário com prazo, cache versionado e matriz por backend; ainda sem mudar a escolha. | `tests/test_device_priority.py`: consulta travada, múltiplas GPUs, driver desconhecido, invalidação/cache corrompido, ambientes STT/TTS diferentes e nenhuma instalação. |
