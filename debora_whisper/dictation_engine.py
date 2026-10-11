@@ -92,7 +92,8 @@ DEFAULT_CONFIG = {
     # think). The reply cannot start before it has passed.
     "voice_chat_end_silence_seconds": 0.8,
     "voice_chat_incomplete_silence_seconds": 2.0,
-    "voice_chat_echo_filter": True,
+    # "auto": off with headphones or a headset, on otherwise. true = "auto".
+    "voice_chat_echo_filter": "auto",
     "voice_chat_barge_in": True,
     "voice_chat_pause_on_speech": True,
     "voice_chat_pause_timeout": 3.0,
@@ -384,6 +385,9 @@ def validate_config(config: dict):
         raise ValueError('voice_chat_hotkey must be a single key or "" to disable')
     if not isinstance(config.get("harness_hotwords", True), bool):
         raise ValueError("harness_hotwords must be a bool")
+    echo_filter = config.get("voice_chat_echo_filter", "auto")
+    if not isinstance(echo_filter, bool) and echo_filter not in ("auto", "on", "off"):
+        raise ValueError('voice_chat_echo_filter must be "auto", "on", "off" or a bool')
     if not isinstance(config.get("voice_chat_pause_on_speech", True), bool):
         raise ValueError("voice_chat_pause_on_speech must be a bool")
     if not isinstance(config.get("harness_new_session_on_start", False), bool):
@@ -3297,6 +3301,22 @@ class DictationApp:
             else:
                 self.voice_chat.speech_ended()
 
+    def _echo_filter_on(self):
+        """Headphones keep her voice out of the microphone: no filter then."""
+        setting = self.config.get("voice_chat_echo_filter", "auto")
+        if setting in (False, "off"):
+            return False
+        if setting == "on":
+            return True
+        from debora_whisper import platforms
+        platform = platforms.current()
+        name = platform.default_output_name()
+        on = platform.output_is_headphones(name) is not True
+        if (name, on) != getattr(self, "_echo_filter_seen", None):
+            self._echo_filter_seen = (name, on)
+            log(f"Voice chat: echo filter {'on' if on else 'off'} for output {name!r}")
+        return on
+
     def _voice_chat_turn(self, text, audio, is_final, captured_at=None):
         """Save each final immediately; replies run separately from ASR."""
         if not is_final:
@@ -3308,7 +3328,7 @@ class DictationApp:
             return
         duration = len(audio) / self.config["sample_rate"]
         captured_at = time.monotonic() if captured_at is None else captured_at
-        echo = (self.config.get("voice_chat_echo_filter", True)
+        echo = (self._echo_filter_on()
                 and self.voice_chat.is_echo(text, captured_at - duration, captured_at))
         from debora_whisper.voice_chat import is_voice_filler
         filler = (self.config.get("voice_chat_pause_on_speech", True)
