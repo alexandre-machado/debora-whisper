@@ -232,6 +232,7 @@ the default (`"voice_chat_backend": "local"`); speech recognition and TTS stay l
   "harness_permission_mode": "acceptEdits",
   "harness_permission_response": "deny",
   "harness_allowed_tools": null,
+  "harness_extra_allowed_tools": [],
   "harness_prompt_file": null,
   "harness_memory_file": null,
   "harness_hotwords": true,
@@ -286,8 +287,12 @@ settings or follow logs indefinitely.
 
 A list replaces these defaults, for example
 `["PowerShell(docker info:*)", "PowerShell(docker ps:*)", "Bash(docker ps:*)"]`.
-Use `[]` to add no rules. Add explicit file paths for other Get-Content reads.
-Changing the list restarts the harness on the next turn. In CLI 2.1.295,
+Use `[]` to add no base rules. `harness_extra_allowed_tools` (default `[]`)
+appends rules to the defaults or the explicit list, removing duplicates while
+preserving order. For example, `"harness_extra_allowed_tools": ["WebSearch"]`
+keeps the default diagnostics and adds web search. Add explicit file paths for
+other Get-Content reads. Changing the effective list restarts the harness on the
+next turn. In CLI 2.1.295,
 `PowerShell(docker info)` and `PowerShell(docker ps)` also allow the compound
 `docker info; docker ps`; both `:*` and ` *` prefix forms worked in the manual
 [CLI probe](docs/benchmarks/harness-2026-10-09/README.md#regras-de-diagnóstico-sem-pergunta).
@@ -295,6 +300,9 @@ Changing the list restarts the harness on the next turn. In CLI 2.1.295,
 Permissions already allowed by Claude's mode/settings proceed normally. Pending
 requests are denied and logged by default; `harness_permission_response: "allow"`
 automatically approves them instead. Spoken permission questions are a later phase.
+File-edit deny rules protect Débora's resolved `config.json` and `config.json*`
+siblings even with automatic approval; reads remain available for diagnosis.
+Bash can still bypass these rules, so this is defense in depth.
 Tools and decisions appear in `~/.debora/logs/app.log`. Replies stream into the
 existing TTS; fenced code and list markers are removed. After 1.5 seconds without
 text, Débora queues “Um instante.” once. Actual playback depends on TTS readiness.
