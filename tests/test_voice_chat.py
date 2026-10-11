@@ -2102,3 +2102,14 @@ def test_pause_has_a_ceiling_without_end_of_speech(playing_reply, monkeypatch):
     app._voice_activity(True)
     worker.join(3)
     assert not worker.is_alive() and len(played) == 3
+
+
+@pytest.mark.parametrize("text, echo", [
+    ("Isso do tempo.", False),           # the user's own word in a short reply
+    ("Previsão do tempo.", True),        # a piece of her sentence
+    ("Você quer a previsão do tempo?", True),
+])
+def test_short_reply_sharing_her_words_is_not_echo(text, echo):
+    chat = vc.VoiceChat({"language": "pt"})
+    chat._spoken = [(10.0, 12.6, "Você quer a previsão do tempo?")]
+    assert chat.is_echo(text, 13.0, 14.0) is echo

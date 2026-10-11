@@ -935,7 +935,11 @@ class VoiceChat:
                               if ((begin <= started and ended <= end + 0.3) if short
                                   else (begin <= ended and end + 2 >= started)))
         overlap = sum((heard & tokens(recent)).values())
-        return overlap / sum(heard.values()) >= 0.6
+        # Her echo comes back as a piece of her sentence. In a few words, one
+        # of the user's own ("Isso do tempo" after "...previsão do tempo?")
+        # means it is them.
+        count = sum(heard.values())
+        return overlap == count if count <= 4 else overlap / count >= 0.6
 
     def _messages(self, text: str) -> list[dict]:
         if self.config.get("voice_chat_backend", "local") == "claude":
