@@ -2081,3 +2081,24 @@ def test_pause_between_sentences_holds_the_next_one():
     assert chat._paused and chat._pause_deadline is None
     chat.speech_ended()
     assert chat._pause_deadline is not None
+
+
+def test_breath_while_paused_does_not_start_the_timeout(playing_reply):
+    app, worker, cut, played, shown, talking, logs = playing_reply(voice_chat_pause_timeout=0.1)
+    app._voice_activity(True)
+    assert cut.wait(3)
+    app._voice_activity(False)  # a breath
+    app._voice_activity(True)   # still talking
+    time.sleep(0.3)
+    assert app.voice_chat._paused and len(played) == 1
+    app._voice_activity(False)
+    worker.join(3)
+    assert not worker.is_alive() and len(played) == 3
+
+
+def test_pause_has_a_ceiling_without_end_of_speech(playing_reply, monkeypatch):
+    monkeypatch.setattr(vc, "PAUSE_MAX_SECONDS", 0.1)
+    app, worker, cut, played, shown, talking, logs = playing_reply()
+    app._voice_activity(True)
+    worker.join(3)
+    assert not worker.is_alive() and len(played) == 3

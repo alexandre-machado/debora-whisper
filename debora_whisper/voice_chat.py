@@ -728,6 +728,10 @@ def is_voice_filler(text):
             or (len(words) == 1 and len(words[0]) == 1 and not words[0].isdigit()))
 
 
+# A pause never outlasts this, even if the end of speech is never reported.
+PAUSE_MAX_SECONDS = 30.0
+
+
 class PlaybackStop(threading.Event):
     def __init__(self, stop):
         super().__init__()
@@ -769,6 +773,7 @@ class VoiceChat:
         self._playback = threading.Condition(threading.RLock())
         self._paused = False
         self._pause_deadline = 0.0
+        self._pause_limit = 0.0
         self._clip_stop = None
         self._tts_cancellation = TTSCancellation()
 
@@ -862,12 +867,17 @@ class VoiceChat:
         with self._playback:
             if (not self.config.get("voice_chat_pause_on_speech", True)
                     or not self.config.get("voice_chat_barge_in", True)
-                    or self._paused or not self.speaking or self._interrupt.is_set()):
+                    or not self.speaking or self._interrupt.is_set()):
+                return False
+            if self._paused:
+                # Talking again after a breath: no timeout while they talk.
+                self._pause_deadline = None
                 return False
             # Also between sentences: the next one waits instead of starting
             # over the user. The timeout counts from when they stop talking.
             self._paused = True
             self._pause_deadline = None
+            self._pause_limit = time.monotonic() + PAUSE_MAX_SECONDS
             if self._clip_stop is not None:
                 self._clip_stop.set()
             self._show_audio(False)
@@ -1195,10 +1205,9 @@ class VoiceChat:
                     while not stop.is_set():
                         with self._playback:
                             while self._paused and not stop.is_set():
-                                if self._pause_deadline is None:
-                                    self._playback.wait()
-                                    continue
-                                remaining = self._pause_deadline - time.monotonic()
+                                deadline = min(self._pause_limit, self._pause_deadline
+                                               or self._pause_limit)
+                                remaining = deadline - time.monotonic()
                                 if remaining <= 0:
                                     self.resume("timeout")
                                 else:
