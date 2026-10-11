@@ -125,7 +125,7 @@ def test_synthesis_model_learns_observed_ratio_and_spoken_speed():
     model = vc.SynthesisModel(k=0)
     spoken = "x" * 40
     for _ in range(150):
-        model.update(spoken, synth=4, audio=2)
+        model.update(spoken, synth=4, audio=2, seconds=2)
     synth, audio = model.predict(spoken)
     assert audio == pytest.approx(2)
     assert synth / audio == pytest.approx(2)
@@ -133,21 +133,35 @@ def test_synthesis_model_learns_observed_ratio_and_spoken_speed():
     assert vc.SynthesisModel().predict("x" * 28) == pytest.approx((4.19, 2))
 
 
+def test_synthesis_model_separates_raw_duration_from_playback_coverage():
+    model = vc.SynthesisModel()
+    spoken = "x" * 20
+    for _ in range(150):
+        model.update(spoken, synth=2, audio=4, seconds=1)
+    synth, playback = model.predict(spoken)
+    assert synth == pytest.approx(2 + model.k * model.sd)
+    assert playback == pytest.approx(1)
+    assert model.raw_chars_per_second == pytest.approx(5)
+    assert model.chars_per_second == pytest.approx(20)
+
+
 @pytest.mark.parametrize("bad", [0, -1, float("inf"), float("nan")])
 def test_synthesis_model_ignores_invalid_durations(bad):
     model = vc.SynthesisModel()
-    model.update("texto", synth=bad, audio=1)
-    model.update("texto", synth=1, audio=bad)
+    model.update("texto", synth=bad, audio=1, seconds=1)
+    model.update("texto", synth=1, audio=bad, seconds=1)
+    model.update("texto", synth=1, audio=1, seconds=bad)
     assert model == vc.SynthesisModel()
 
 
 def test_synthesis_model_bounds_outliers():
     model = vc.SynthesisModel()
     for synth, audio in [(1e100, 1e-100), (1e-100, 1e100)] * 100:
-        model.update("texto", synth, audio)
+        model.update("texto", synth, audio, seconds=audio)
         assert 0 <= model.a <= 5
         assert 0.05 <= model.b <= 5
         assert 3 <= model.chars_per_second <= 40
+        assert 3 <= model.raw_chars_per_second <= 40
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -184,6 +198,37 @@ def test_slow_synthesis_prebuffers_without_underruns(monkeypatch, enabled):
         assert starts[0][1] == 1
         assert max(gaps) > 0.03
         assert holds == []
+
+
+def test_prebuffer_trailing_silence_does_not_count_as_playback(monkeypatch):
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
+    monkeypatch.setattr(vc, "wait_tts_server", lambda *a: True)
+    starts, ends, durations, logs = [], [], [], []
+    sentences = ["Primeira frase longa.", "Segunda frase longa.",
+                 "Terceira frase longa.", "Uma quarta frase aqui."]
+    # trim_silence keeps 50 ms of the trailing silence: 4 s raw -> 1 s heard.
+    audio = np.concatenate((np.full(950, 0.1, np.float32), np.zeros(3050, np.float32)))
+
+    def synth(spoken, config):
+        time.sleep(2)
+        return audio, 1000
+
+    def play(samples, rate, stop):
+        starts.append(time.monotonic())
+        durations.append(len(samples) / rate)
+        stop.wait(durations[-1] + vc.SENTENCE_GAP_SECONDS)
+        ends.append(time.monotonic())
+
+    monkeypatch.setattr(vc, "synthesize", synth)
+    chat = vc.VoiceChat(DEFAULT_CONFIG, llm=FakeLLM([" ".join(sentences)]),
+                        play=play, log=logs.append)
+    assert chat.respond("oi") == " ".join(sentences)
+    assert durations == [1.0] * 4
+    assert max(starts[i + 1] - ends[i] for i in range(3)) < 0.2
+    holds = [line for line in logs if "prebuffer held" in line]
+    assert len(holds) == 1
+    held = float(re.search(r"prebuffer held ([\d.]+)s", holds[0])[1])
+    assert 2.5 < held <= DEFAULT_CONFIG["voice_chat_prebuffer_max"] + 0.2
 
 
 @pytest.fixture

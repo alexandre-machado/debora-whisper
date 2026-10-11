@@ -778,21 +778,26 @@ class SynthesisModel:
     sd: float = 0.94
     k: float = 1.0
     chars_per_second: float = 14.0
+    raw_chars_per_second: float = 14.0
     alpha: float = 0.2
 
     def predict(self, spoken):
-        duration = len(spoken) / self.chars_per_second
-        return self.a + self.b * duration + self.k * self.sd, duration
+        raw_duration = len(spoken) / self.raw_chars_per_second
+        playback_duration = len(spoken) / self.chars_per_second
+        return self.a + self.b * raw_duration + self.k * self.sd, playback_duration
 
-    def update(self, spoken, synth, audio):
-        if not spoken or not all(math.isfinite(t) and t > 0 for t in (synth, audio)):
+    def update(self, spoken, synth, audio, seconds):
+        if not spoken or not all(math.isfinite(t) and t > 0 for t in (synth, audio, seconds)):
             return
         # Bound outliers before an EWMA step. Normalized error updates both
         # coefficients without letting a long clip dominate the fit.
         audio = min(audio, 300.0)
         synth = min(synth, 1800.0)
-        speed = min(40.0, max(3.0, len(spoken) / audio))
+        # Coverage uses trimmed playback; synthesis cost still uses raw audio.
+        speed = min(40.0, max(3.0, len(spoken) / min(seconds, 300.0)))
         self.chars_per_second += self.alpha * (speed - self.chars_per_second)
+        raw_speed = min(40.0, max(3.0, len(spoken) / audio))
+        self.raw_chars_per_second += self.alpha * (raw_speed - self.raw_chars_per_second)
         error = synth - (self.a + self.b * audio)
         step = self.alpha * error / (1 + audio * audio)
         self.a = min(5.0, max(0.0, self.a + step))
@@ -1306,7 +1311,7 @@ class VoiceChat:
                             if not is_feedback and not timing.get("cached"):
                                 self._synthesis_model.update(
                                     spoken, timing["synth_end"] - timing["synth_start"],
-                                    timing["audio"])
+                                    timing["audio"], timing.get("seconds", 0.0))
                             buffered += timing.get("seconds", 0.0)
                             pending.pop(timing["chunk"], None)
                             clips.put((samples, audio[1], timing))
