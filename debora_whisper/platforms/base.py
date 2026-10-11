@@ -8,6 +8,13 @@ rest of the app never checks sys.platform itself.
 
 class Platform:
     name = "generic"
+    no_window = 0
+
+    def kill_tree(self, process):
+        """Kill a running process, without waiting for it."""
+        if process.poll() is not None:
+            return
+        process.kill()
 
     def default_output_name(self):
         """Name of the device her voice plays on, as the audio API shows it."""

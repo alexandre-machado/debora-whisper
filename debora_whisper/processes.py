@@ -3,8 +3,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+from debora_whisper import platforms
+
 # No console window for children of the windowless (pythonw) app.
-NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+NO_WINDOW = platforms.current().no_window
 
 
 def python_executable() -> str:
@@ -18,15 +20,5 @@ def python_executable() -> str:
 
 
 def kill_tree(process: subprocess.Popen):
-    """Kill process and its children, without waiting for them.
-
-    On Windows a venv's python.exe and uv both run the real interpreter as a
-    child: killing only the parent leaves that child running, holding its
-    GPU or NPU."""
-    if process.poll() is not None:
-        return
-    if sys.platform == "win32":
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
-                       capture_output=True, creationflags=NO_WINDOW)
-    else:
-        process.kill()
+    """Kill process and its children as supported by the operating system."""
+    platforms.current().kill_tree(process)
