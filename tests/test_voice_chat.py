@@ -242,6 +242,42 @@ def test_unreachable_tts_still_returns_the_reply(server, monkeypatch):
     assert vc.synthesize.call_count == 1  # no retry per sentence once the server is gone
 
 
+@pytest.mark.parametrize("ending", ["running", "interrupt", "shutdown"])
+def test_tts_reset_is_only_a_failure_while_running(server, monkeypatch, ending):
+    logs, renderers, stopping_at_kill = [], [], []
+    chat, played = _chat(server, FakeLLM(["Uma frase para falar."]))
+    chat.log = logs.append
+    monkeypatch.setattr(vc, "_tts_stopping", threading.Event())
+    vc._tts_stopping.set()  # starting a new turn clears a previous shutdown
+    monkeypatch.setattr(vc, "_tts_process", None)
+    monkeypatch.setattr(vc, "kill_tree", lambda process: stopping_at_kill.append(
+        vc._tts_stopping.is_set()))
+
+    def synthesize(text, config):
+        renderers.append(threading.current_thread())
+        if ending == "interrupt":
+            chat.interrupt()
+        elif ending == "shutdown":
+            monkeypatch.setattr(vc, "_tts_process", MagicMock())
+            vc.stop_tts_server()
+        raise ConnectionResetError(10054, "connection reset")
+
+    monkeypatch.setattr(vc, "synthesize", synthesize)
+    chat.respond("oi")
+    assert len(renderers) == 1
+    renderers[0].join(3)
+    assert not renderers[0].is_alive()
+    assert played == []
+    failures = [line for line in logs if "TTS failed" in line]
+    if ending == "running":
+        assert len(failures) == 1
+        assert "10054" in failures[0] and "showing the reply only" in failures[0]
+    else:
+        assert failures == []
+    if ending == "shutdown":
+        assert stopping_at_kill == [True]
+
+
 def test_interrupt_stops_the_reply(server):
     played = []
     chat = vc.VoiceChat(_cfg(server), log=lambda m: None, llm=FakeLLM(["Um. ", "Dois. ", "Três."]),
@@ -1285,6 +1321,53 @@ def test_numbers_are_spoken_as_words(language, text, spoken):
     assert vc.spoken_numbers(text, language) == spoken
 
 
+@pytest.mark.parametrize("language", ["pt", "en"])
+@pytest.mark.parametrize("token", [
+    "config.json.bak-20261010", "v2.1.296", "RTX4060", "abc123def456",
+    "20261010.json", "backup_20261010", "2026-10-10", "/2026/10/log.txt",
+    "backup-09/10/2026", "log-14:07", "v10h18", "build1h", "build3.5%",
+    "item1º", "item2ª", "3-files", "12_34", "2.1.296", "3/4",
+    r"C:\logs\20261010.txt", "file_2.txt", "a/b/3",
+    "app.py:10:20", "app.py:10", r"C:\123", "src/app.py:42",
+])
+def test_numbers_inside_identifiers_are_unchanged(language, token):
+    text = f"Arquivo ({token})."
+    assert vc.spoken_numbers(text, language) == text
+
+
+@pytest.mark.parametrize("language", ["pt", "en"])
+@pytest.mark.parametrize("text, pt, en", [
+    ("-10", "-dez", "-ten"),
+    ("Valor -10", "Valor -dez", "Valor -ten"),
+    ("(-10)", "(-dez)", "(-ten)"),
+    ("10-20", "dez-vinte", "ten-twenty"),
+    ("-5%", "-cinco por cento", "-five percent"),
+    ("Total:10", "Total:dez", "Total:ten"),
+    ("14:07", "catorze e sete", "fourteen oh seven"),
+    ("09/10/2026", "nove de outubro de dois mil e vinte e seis",
+     "September tenth, twenty twenty-six"),
+])
+def test_numeric_expressions_are_spoken_as_words(language, text, pt, en):
+    assert vc.spoken_numbers(text, language) == (pt if language == "pt" else en)
+
+
+@pytest.mark.parametrize("text, spoken", [
+    ("3 arquivos", "três arquivos"),
+    ("10,5", "dez vírgula cinco"),
+    ("2026", "dois mil e vinte e seis"),
+    ("foram 3.", "foram três."),
+    ("3. Depois 4!", "três. Depois quatro!"),
+    ("foram 3...", "foram três..."),
+    ("3: três arquivos.", "três: três arquivos."),
+    ("às 14:07", "às catorze e sete"),
+    ("(3), 4; 5?", "(três), quatro; cinco?"),
+    ("10 % e 2ª feira", "dez por cento e segunda feira"),
+    ("config.json.bak-20261010 e 3 arquivos.", "config.json.bak-20261010 e três arquivos."),
+])
+def test_standalone_numbers_keep_sentence_punctuation(text, spoken):
+    assert vc.spoken_numbers(text, "pt") == spoken
+
+
 @pytest.mark.parametrize("sentence, offer", [
     ("Como posso te ajudar hoje?", True),
     ("Pode dizer o que quer que eu faça?", True),
@@ -1477,6 +1560,87 @@ def _harness_session(tmp_path, saved, events, closed=None):
         process_factory=lambda *a, **kw: process, session_file=session_file)
     return session, commands, lambda: _json.loads(
         session_file.read_text(encoding="utf-8")).get(key)
+
+
+@pytest.mark.parametrize("boundary", ["tool_use", "message_start", "text", "assistant"])
+def test_claude_text_blocks_are_separated_in_the_reply(server, tmp_path, boundary):
+    def stream(event):
+        return {"type": "stream_event", "event": event}
+
+    def delta(text):
+        return stream({"type": "content_block_delta", "delta": {
+            "type": "text_delta", "text": text}})
+
+    if boundary == "assistant":
+        between = {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Faço uma cópia de segurança."},
+            {"type": "tool_use", "id": "tool-1", "name": "Bash"}]}}
+    elif boundary == "message_start":
+        between = stream({"type": "message_start"})
+    else:
+        between = stream({"type": "content_block_start", "content_block": {
+            "type": boundary, "id": "tool-1", "name": "Bash"}})
+    events = [delta("Faço uma cópia de segu"), delta("rança."), between,
+              delta(""), delta("Pron"), delta("to."), {"type": "result"}]
+    closed = threading.Event()
+    session, _, _ = _harness_session(tmp_path, None, events, closed)
+    chunks, shown = [], []
+
+    def llm(messages, on_text, stop):
+        def emit(chunk):
+            chunks.append(chunk)
+            on_text(chunk)
+        session.send(messages[-1]["content"], emit, stop)
+
+    chat, _ = _chat(server, llm, voice_chat_backend="claude")
+    try:
+        reply = chat.respond("Faça a cópia.", on_reply=lambda text, seconds=None: shown.append(text))
+    finally:
+        closed.set()
+    expected = "Faço uma cópia de segurança. Pronto."
+    assert chunks == ["Faço uma cópia de segu", "rança.", " Pron", "to."]
+    assert reply == shown[-1] == expected
+    assert " ".join(_tts_texts(server)) == expected
+
+
+@pytest.mark.parametrize("before, after", [
+    ("segurança. ", "Pronto."), ("segurança.", " Pronto."),
+    ("segurança.\n", "Pronto."), ("segurança.", "\nPronto."),
+    ("Valor confirmado", ", correto."), ("Concluído", "."),
+    *[("Concluído", punctuation) for punctuation in ";:!?)]}…”’»›"],
+])
+@pytest.mark.parametrize("boundary", ["message_start", "tool_use"])
+def test_claude_block_separator_preserves_whitespace_and_punctuation(
+        tmp_path, before, after, boundary):
+    assert _blocks_across(tmp_path, before, after, boundary) == [before, after]
+
+
+@pytest.mark.parametrize("quote", ['"Sim."', "'Sim.'"])
+@pytest.mark.parametrize("boundary", ["message_start", "tool_use"])
+def test_claude_block_separator_keeps_the_space_before_an_opening_quote(
+        tmp_path, quote, boundary):
+    assert _blocks_across(tmp_path, "Ele respondeu:", quote, boundary) == [
+        "Ele respondeu:", " " + quote]
+
+
+def _blocks_across(tmp_path, before, after, boundary):
+    between = ({"type": "message_start"} if boundary == "message_start" else
+               {"type": "content_block_start", "content_block": {
+                   "type": "tool_use", "id": "tool-1", "name": "Bash"}})
+    events = [
+        {"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": before}}},
+        {"type": "stream_event", "event": between},
+        {"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": after}}},
+        {"type": "result"},
+    ]
+    closed = threading.Event()
+    session, _, _ = _harness_session(tmp_path, None, events, closed)
+    chunks = []
+    try:
+        session.send("oi", chunks.append, threading.Event())
+    finally:
+        closed.set()
+    return chunks
 
 
 def test_claude_session_that_does_not_resume_is_forgotten(tmp_path):

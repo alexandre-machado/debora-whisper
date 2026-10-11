@@ -85,6 +85,7 @@ DEFAULT_CONFIG = {
     "harness_permission_mode": "acceptEdits",
     "harness_permission_response": "deny",  # requests not already allowed by Claude
     "harness_allowed_tools": None,  # null uses the packaged read-only diagnostics
+    "harness_extra_allowed_tools": [],  # added to defaults or the explicit list
     "harness_prompt_file": None,   # null: packaged voice-channel rules
     "harness_memory_file": None,   # null: ~/.debora/harness/voice_memory.md
     "harness_hotwords": True,     # Memory/project hints only for Claude voice chat
@@ -398,6 +399,10 @@ def validate_config(config: dict):
     if rules is not None and (not isinstance(rules, list) or any(
             not isinstance(rule, str) or not rule.strip() for rule in rules)):
         raise ValueError("harness_allowed_tools must be null or a list of non-empty permission rules")
+    rules = config.get("harness_extra_allowed_tools", [])
+    if not isinstance(rules, list) or any(
+            not isinstance(rule, str) or not rule.strip() for rule in rules):
+        raise ValueError("harness_extra_allowed_tools must be a list of non-empty permission rules")
     voice = config.get("tts_voice")
     if voice is not None and (not isinstance(voice, str) or not voice.strip()):
         raise ValueError(f"tts_voice must be null or a file path or name, got {voice!r}")

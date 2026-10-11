@@ -48,7 +48,8 @@ DEFAULT_ALLOWED_TOOLS = tuple(
 
 def harness_allowed_tools(config: dict) -> tuple[str, ...]:
     rules = config.get("harness_allowed_tools")
-    return DEFAULT_ALLOWED_TOOLS if rules is None else tuple(rules)
+    rules = DEFAULT_ALLOWED_TOOLS if rules is None else rules
+    return tuple(dict.fromkeys((*rules, *config.get("harness_extra_allowed_tools", []))))
 
 
 def validate_session_name(name):
@@ -75,6 +76,15 @@ def harness_command(config: dict, session_id: str, resume: bool) -> list[str]:
     config_dir = paths.CONFIG_DIR.resolve()
     if not config_dir.is_relative_to(harness_cwd(config)):
         command += ["--add-dir", str(config_dir)]
+    config_path = paths.CONFIG_FILE.resolve().as_posix()
+    # Claude uses // absolute paths and /c/... for Windows drive paths.
+    config_path = re.sub(r"^([A-Za-z]):/", lambda m: f"/{m[1].lower()}/", config_path)
+    # Read/Edit use gitignore syntax: backslash escapes literal pattern characters.
+    config_path = re.sub(r"[\\*?\[\]{}]", lambda m: "\\" + m[0], config_path)
+    config_rule = "//" + config_path.lstrip("/") + "*"
+    # An Edit rule covers every file editor (Write rules only warn). Bash can
+    # still bypass this: defense in depth, not a permission boundary.
+    command += ["--disallowedTools", f"Edit({config_rule})"]
     if config.get("harness_model"):
         command += ["--model", config["harness_model"]]
     rules = harness_allowed_tools(config)
@@ -452,6 +462,8 @@ class HarnessSession:
             last_event = time.monotonic()
             tools_seen = set()
             denials_seen = set()
+            last_text = ""
+            new_text_block = True
             try:
                 while True:
                     now = time.monotonic()
@@ -490,15 +502,27 @@ class HarnessSession:
                                 "error": "Unsupported control request"}})
                     elif kind == "stream_event" and not message.get("parent_tool_use_id"):
                         event = message.get("event", {})
+                        if event.get("type") in ("message_start", "content_block_start"):
+                            new_text_block = True
                         block = event.get("content_block", {})
                         if block.get("type") == "tool_use":
                             tools_seen.add(block.get("id"))
                             self._notice("tool_use", f"Claude está usando {block['name']}…", on_event)
                         delta = event.get("delta", {})
                         if delta.get("type") == "text_delta" and not stop.is_set():
-                            on_text(delta["text"])
+                            chunk = delta["text"]
+                            if chunk:
+                                if (new_text_block and last_text and not last_text[-1].isspace()
+                                        and not chunk[0].isspace()
+                                        # Straight quotes may open a quote.
+                                        and chunk[0] not in ".,;:!?)]}…”’»›"):
+                                    chunk = " " + chunk
+                                on_text(chunk)
+                                last_text = chunk
+                                new_text_block = False
                     elif kind == "assistant":
                         # The full message repeats deltas, but may reveal a tool without partials.
+                        new_text_block = True
                         for block in message.get("message", {}).get("content", []):
                             if block.get("type") == "tool_use" and block.get("id") not in tools_seen:
                                 tools_seen.add(block.get("id"))
