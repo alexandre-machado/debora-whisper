@@ -351,6 +351,14 @@ cut sentence from its beginning. If no final arrives within
 `voice_chat_pause_timeout` seconds (default `3.0`, a finite positive number), she
 also resumes from that sentence. Set `voice_chat_pause_on_speech: false` to keep
 playing until the final transcription arrives. Pausing requires `voice_chat_barge_in: true`.
+With `voice_chat_prebuffer: true` (default), playback briefly buffers audio before
+the first sentence and after a gap, using synthesis timings and speech speed
+learned during the session to reduce gaps between known sentences. Each hold is
+limited to `voice_chat_prebuffer_max` seconds (default `3.0`, a finite positive
+number). Sentences still unwritten by the LLM cannot be predicted, and the limit
+can allow gaps on slow hardware. Waiting feedback ("Um instante.") and cached
+clips play immediately. Set `voice_chat_prebuffer: false` for immediate playback
+as each clip becomes ready.
 A sentence normally ends after 0.8 s of silence (`voice_chat_end_silence_seconds`).
 An incomplete draft, including trailing `...`, `…`, or a dangling connective,
 allows 2 s (`voice_chat_incomplete_silence_seconds`; dictation waits 1.5–3 s).
@@ -383,6 +391,8 @@ loaded until the app exits, so switching back is instant.
   "voice_chat_barge_in": true,
   "voice_chat_pause_on_speech": true,
   "voice_chat_pause_timeout": 3.0,
+  "voice_chat_prebuffer": true,
+  "voice_chat_prebuffer_max": 3.0,
   "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
   "llm_device": "GPU",
   "llm_prompt": null,

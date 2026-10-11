@@ -104,6 +104,311 @@ def _tts_texts(server):
     return [body["text"] for path, body in server.requests if path == "/tts"]
 
 
+@pytest.mark.parametrize("buffered, pending, expected", [
+    (2, [(1, 2), (1, 2)], 0),  # synthesis faster than playback
+    (2, [(3, 2), (3, 2)], 2),  # the last sentence determines the gap
+    (2, [(4, 10), (1, 1)], 2),  # the first sentence determines the gap
+    (2, [(0, 2), (3, 2)], 0),  # active synthesis's elapsed time was subtracted
+    (2, [], 0),  # no speculation about sentences the writer has not written
+])
+def test_prebuffer_known_sentence_schedule(buffered, pending, expected):
+    assert vc.prebuffer_wait(buffered, pending) == expected
+
+
+def test_prebuffer_cap_counts_time_already_held():
+    assert vc.prebuffer_wait(1, [(10, 2)], max_wait=3) == 3
+    assert vc.prebuffer_wait(1, [(10, 2)], max_wait=3, held=2.5) == 0.5
+    assert vc.prebuffer_wait(1, [(10, 2)], max_wait=3, held=4) == 0
+
+
+def test_synthesis_model_learns_observed_ratio_and_spoken_speed():
+    model = vc.SynthesisModel(k=0)
+    spoken = "x" * 40
+    for _ in range(150):
+        model.update(spoken, synth=4, audio=2)
+    synth, audio = model.predict(spoken)
+    assert audio == pytest.approx(2)
+    assert synth / audio == pytest.approx(2)
+    assert model.chars_per_second == pytest.approx(20)
+    assert vc.SynthesisModel().predict("x" * 28) == pytest.approx((4.19, 2))
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("inf"), float("nan")])
+def test_synthesis_model_ignores_invalid_durations(bad):
+    model = vc.SynthesisModel()
+    model.update("texto", synth=bad, audio=1)
+    model.update("texto", synth=1, audio=bad)
+    assert model == vc.SynthesisModel()
+
+
+def test_synthesis_model_bounds_outliers():
+    model = vc.SynthesisModel()
+    for synth, audio in [(1e100, 1e-100), (1e-100, 1e100)] * 100:
+        model.update("texto", synth, audio)
+        assert 0 <= model.a <= 5
+        assert 0.05 <= model.b <= 5
+        assert 3 <= model.chars_per_second <= 40
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_slow_synthesis_prebuffers_without_underruns(monkeypatch, enabled):
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
+    monkeypatch.setattr(vc, "wait_tts_server", lambda *a: True)
+    rendered, starts, ends, logs = [], [], [], []
+    sentences = ["Primeira frase longa.", "Segunda frase longa.", "Terceira frase longa."]
+
+    def synth(spoken, config):
+        time.sleep(0.12)
+        rendered.append(spoken)
+        return np.full(600, 0.1, np.float32), 10000
+
+    def play(samples, rate, stop):
+        starts.append((time.monotonic(), len(rendered)))
+        stop.wait(len(samples) / rate)
+        ends.append(time.monotonic())
+
+    monkeypatch.setattr(vc, "synthesize", synth)
+    chat = vc.VoiceChat({**DEFAULT_CONFIG, "voice_chat_prebuffer": enabled},
+                        llm=FakeLLM([" ".join(sentences)]), play=play, log=logs.append)
+    chat.respond("oi")
+    assert len(starts) == len(ends) == 3
+    holds = [line for line in logs if "prebuffer held" in line]
+    gaps = [starts[i + 1][0] - ends[i] for i in range(2)]
+    if enabled:
+        assert starts[0][1] == 3
+        assert max(gaps) < 0.05
+        assert len(holds) == 1
+        assert re.fullmatch(r"Voice chat: prebuffer held \d+\.\d{2}s "
+                            r"\(predicted gap \d+\.\d{2}s, buffered 0\.06s, pending 2\)", holds[0])
+    else:
+        assert starts[0][1] == 1
+        assert max(gaps) > 0.03
+        assert holds == []
+
+
+@pytest.fixture
+def held_reply(monkeypatch):
+    """The second synthesis waits while the first clip is in the prebuffer."""
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
+    monkeypatch.setattr(vc, "wait_tts_server", lambda *a: True)
+    instances = []
+
+    def start(**config):
+        holding, release, played = threading.Event(), threading.Event(), threading.Event()
+        stop = threading.Event()
+        calls, logs, errors, workers = [], [], [], []
+        original_wait = vc.prebuffer_wait
+
+        def predict(*args, **kwargs):
+            result = original_wait(*args, **kwargs)
+            if result:
+                holding.set()
+            return result
+
+        def synth(spoken, config):
+            workers.append(threading.current_thread())
+            calls.append(spoken)
+            if len(calls) == 2:
+                assert release.wait(5)
+            return np.full(1000, 0.1, np.float32), 10000
+
+        monkeypatch.setattr(vc, "prebuffer_wait", predict)
+        monkeypatch.setattr(vc, "synthesize", synth)
+        chat = vc.VoiceChat({**DEFAULT_CONFIG, **config}, log=logs.append,
+                            llm=FakeLLM(["Primeira frase longa. Segunda frase longa."]),
+                            play=lambda *a: played.set())
+
+        def respond():
+            try:
+                chat.respond("oi", stop=stop)
+            except Exception as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=respond, daemon=True)
+        instances.append((chat, worker, release, errors, workers))
+        worker.start()
+        assert holding.wait(2)
+        assert not played.is_set()
+        return chat, worker, release, played, stop, logs
+
+    yield start
+    for chat, worker, release, errors, workers in instances:
+        chat.interrupt()
+        release.set()
+        worker.join(2)
+        for renderer in workers:
+            renderer.join(2)
+            assert not renderer.is_alive()
+        assert not worker.is_alive()
+        assert not errors
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_interrupt_during_prebuffer_returns_promptly(held_reply, external):
+    chat, worker, release, played, stop, logs = held_reply()
+    before = time.monotonic()
+    stop.set() if external else chat.interrupt()
+    worker.join(0.5)
+    assert not worker.is_alive()
+    assert time.monotonic() - before < 0.5
+    assert not played.is_set()
+    assert len([line for line in logs if "prebuffer held" in line]) == 1
+
+
+def test_pause_during_prebuffer_resumes_without_another_hold(held_reply):
+    chat, worker, release, played, stop, logs = held_reply()
+    assert chat.pause()
+    assert not played.wait(0.15)
+    assert chat.resume()
+    # Even though the next synthesis is still blocked, resume is immediate.
+    assert played.wait(0.5)
+    release.set()
+    worker.join(2)
+    assert not worker.is_alive()
+
+
+def test_prebuffer_cap_releases_first_clip(held_reply):
+    chat, worker, release, played, stop, logs = held_reply(voice_chat_prebuffer_max=0.15)
+    assert played.wait(0.5)
+    assert any("prebuffer held" in line for line in logs)
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_prebuffer_does_not_wait_for_unknown_sentences(monkeypatch, finished):
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
+    monkeypatch.setattr(vc, "wait_tts_server", lambda *a: True)
+    monkeypatch.setattr(vc, "synthesize", lambda *a: (np.full(1000, 0.1, np.float32), 10000))
+    played = threading.Event()
+    logs = []
+
+    def llm(messages, on_text, stop):
+        on_text("Primeira frase longa. ")
+        if not finished:
+            assert played.wait(2)  # writer is still running when playback begins
+
+    chat = vc.VoiceChat(DEFAULT_CONFIG, llm=llm, play=lambda *a: played.set(), log=logs.append)
+    chat.respond("oi")
+    assert played.is_set()
+    assert not any("prebuffer held" in line or "LLM failed" in line for line in logs)
+
+
+def test_prebuffer_restarts_after_an_underrun(monkeypatch):
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
+    monkeypatch.setattr(vc, "wait_tts_server", lambda *a: True)
+    first_played = threading.Event()
+    rendered, played, logs = [], [], []
+
+    def synth(spoken, config):
+        if rendered:
+            time.sleep(0.12)
+        rendered.append(spoken)
+        return np.full(600, 0.1, np.float32), 10000
+
+    def play(*args):
+        played.append(len(rendered))
+        first_played.set()
+
+    def llm(messages, on_text, stop):
+        on_text("Primeira frase longa. ")
+        assert first_played.wait(2)
+        on_text("Segunda frase longa. Terceira frase longa.")
+
+    monkeypatch.setattr(vc, "synthesize", synth)
+    chat = vc.VoiceChat(DEFAULT_CONFIG, llm=llm, play=play, log=logs.append)
+    chat.respond("oi")
+    assert played == [1, 3, 3]
+    assert len([line for line in logs if "prebuffer held" in line]) == 1
+
+
+def test_prebuffer_clears_audio_indicator_between_clips(monkeypatch):
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
+    monkeypatch.setattr(vc, "wait_tts_server", lambda *a: True)
+    first_played, idle = threading.Event(), threading.Event()
+    calls, talking, logs = [], [], []
+
+    def synth(spoken, config):
+        calls.append(spoken)
+        if len(calls) == 2:
+            assert first_played.wait(2)
+        elif len(calls) == 3:
+            assert idle.wait(2)
+        return np.full(600, 0.1, np.float32), 10000
+
+    def play(*args):
+        first_played.set()
+
+    def on_audio(active):
+        talking.append(active)
+        if not active:
+            idle.set()
+
+    def llm(messages, on_text, stop):
+        on_text("Primeira frase longa. ")
+        assert first_played.wait(2)
+        on_text("Segunda frase longa. Terceira frase longa.")
+
+    monkeypatch.setattr(vc, "synthesize", synth)
+    chat = vc.VoiceChat(DEFAULT_CONFIG, llm=llm, play=play, log=logs.append)
+    chat.on_audio = on_audio
+    chat.respond("oi")
+    assert talking == [True, False, True, False]
+    assert not any("TTS failed" in line for line in logs)
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_waiting_feedback_bypasses_prebuffer(monkeypatch, cached):
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
+    monkeypatch.setattr(vc, "wait_tts_server", lambda *a: True)
+    monkeypatch.setattr(vc.threading, "Timer", lambda delay, callback: MagicMock(start=callback))
+    feedback_played, written = threading.Event(), threading.Event()
+    logs = []
+    audio = np.full(600, 0.1, np.float32), 10000
+
+    def synth(spoken, config):
+        if spoken != "Um instante.":
+            assert feedback_played.wait(1)
+        return audio
+
+    def llm(messages, on_text, stop):
+        on_text("Primeira frase longa. ")
+        written.set()
+
+    monkeypatch.setattr(vc, "synthesize", synth)
+    chat = vc.VoiceChat({**DEFAULT_CONFIG, "voice_chat_backend": "claude"},
+                        llm=llm, play=lambda *a: feedback_played.set(), log=logs.append)
+    if cached:
+        chat._waiting_audio(chat.config)
+    original_waiting = chat._waiting_audio
+
+    def waiting(*args):
+        assert written.wait(1)  # ensure there is pending speech to predict
+        return original_waiting(*args)
+
+    monkeypatch.setattr(chat, "_waiting_audio", waiting)
+    chat.respond("oi")
+    assert feedback_played.is_set()
+    assert not any("prebuffer held" in line or "TTS failed" in line for line in logs)
+
+
+@pytest.mark.parametrize("key, value", [
+    ("voice_chat_prebuffer", "true"), ("voice_chat_prebuffer", 1),
+    ("voice_chat_prebuffer", None), ("voice_chat_prebuffer_max", True),
+    ("voice_chat_prebuffer_max", 0), ("voice_chat_prebuffer_max", -1),
+    ("voice_chat_prebuffer_max", "3"), ("voice_chat_prebuffer_max", None),
+    ("voice_chat_prebuffer_max", float("inf")), ("voice_chat_prebuffer_max", float("nan")),
+])
+def test_invalid_prebuffer_config_is_rejected(key, value):
+    with pytest.raises(ValueError, match=key):
+        de.validate_config({**DEFAULT_CONFIG, key: value})
+
+
+def test_prebuffer_defaults_and_valid_config():
+    assert DEFAULT_CONFIG["voice_chat_prebuffer"] is True
+    assert DEFAULT_CONFIG["voice_chat_prebuffer_max"] == 3.0
+    de.validate_config({**DEFAULT_CONFIG, "voice_chat_prebuffer": False,
+                        "voice_chat_prebuffer_max": 0.1})
+
+
 def _pt_now(t):
     return f" Agora é {vc._PT_WEEKDAYS[t.tm_wday]}, " + time.strftime("%d/%m/%Y, %H:%M.", t)
 

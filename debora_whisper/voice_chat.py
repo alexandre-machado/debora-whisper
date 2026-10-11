@@ -9,6 +9,7 @@ import atexit
 import http.client
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -23,6 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+from dataclasses import dataclass
 from pathlib import Path
 
 from debora_whisper import paths
@@ -767,6 +769,50 @@ class PlaybackStop(threading.Event):
         return super().is_set() or self.stop.is_set()
 
 
+@dataclass
+class SynthesisModel:
+    """Session estimates, in seconds, learned only from uncached speech."""
+
+    a: float = 0.95
+    b: float = 1.15
+    sd: float = 0.94
+    k: float = 1.0
+    chars_per_second: float = 14.0
+    alpha: float = 0.2
+
+    def predict(self, spoken):
+        duration = len(spoken) / self.chars_per_second
+        return self.a + self.b * duration + self.k * self.sd, duration
+
+    def update(self, spoken, synth, audio):
+        if not spoken or not all(math.isfinite(t) and t > 0 for t in (synth, audio)):
+            return
+        # Bound outliers before an EWMA step. Normalized error updates both
+        # coefficients without letting a long clip dominate the fit.
+        audio = min(audio, 300.0)
+        synth = min(synth, 1800.0)
+        speed = min(40.0, max(3.0, len(spoken) / audio))
+        self.chars_per_second += self.alpha * (speed - self.chars_per_second)
+        error = synth - (self.a + self.b * audio)
+        step = self.alpha * error / (1 + audio * audio)
+        self.a = min(5.0, max(0.0, self.a + step))
+        self.b = min(5.0, max(0.05, self.b + step * audio))
+
+
+def prebuffer_wait(buffered, pending, *, held=0.0, max_wait=3.0):
+    """Required hold for known (remaining synthesis, audio) pairs, capped.
+
+    Unknown sentences add nothing, whether the writer is running or done.
+    The caller subtracts elapsed synthesis from the active sentence only.
+    """
+    finish, play, gap = 0.0, buffered, 0.0
+    for synth, audio in pending:
+        finish += max(0.0, synth)
+        gap = max(gap, finish - play)
+        play += max(0.0, audio)
+    return min(gap, max(0.0, max_wait - held))
+
+
 class VoiceChat:
     """A conversation with the LLM, spoken through the TTS server.
 
@@ -802,6 +848,7 @@ class VoiceChat:
         self._pause_limit = 0.0
         self._clip_stop = None
         self._tts_cancellation = TTSCancellation()
+        self._synthesis_model = SynthesisModel()
 
     def _show_audio(self, active: bool):
         if active == self._audio_shown:
@@ -911,6 +958,7 @@ class VoiceChat:
                 now = time.monotonic()
                 self._spoken = [(begin, min(end, now), words) for begin, end, words in self._spoken]
             self.log("Voice chat: paused reply on speech")
+            self._playback.notify_all()
             return True
 
     def speech_ended(self):
@@ -1008,12 +1056,59 @@ class VoiceChat:
         timings = []
         timing_lock = threading.Lock()
         first_audio = None
+        pending = {}
+        buffered = 0.0
+        prebuffer = self.config.get("voice_chat_prebuffer", True)
 
         def enqueue(sentence):
+            is_feedback = sentence is waiting
+            shown = without_emoji(speakable("Um instante." if is_feedback else sentence))
+            spoken = spoken_numbers(shown, self.config.get("language"))
             with timing_lock:
-                timing = {"chunk": len(timings) + 1, "enqueued": time.perf_counter() - started}
+                timing = {"chunk": len(timings) + 1, "enqueued": time.perf_counter() - started,
+                          "spoken": spoken, "feedback": is_feedback}
                 timings.append(timing)
+            with self._playback:
+                if any(c.isalnum() for c in spoken):
+                    pending[timing["chunk"]] = timing
                 sentences.put((sentence, timing))
+                self._playback.notify_all()
+
+        def hold(timing):
+            if not prebuffer or timing.get("feedback") or timing.get("cached"):
+                return
+            began = None
+            snapshot = None
+            with self._playback:
+                while not stop.is_set() and not self._paused:
+                    now = time.perf_counter()
+                    plan = []
+                    for item in pending.values():
+                        synth, audio = self._synthesis_model.predict(item["spoken"])
+                        if "synth_start" in item:
+                            synth = max(0.0, synth - (now - started - item["synth_start"]))
+                        plan.append((synth, audio))
+                    gap = prebuffer_wait(buffered, plan, max_wait=math.inf)
+                    elapsed = now - began if began is not None else 0.0
+                    delay = min(gap, max(0.0, self.config.get("voice_chat_prebuffer_max", 3.0)
+                                         - elapsed))
+                    if delay <= 0:
+                        break
+                    if began is None:
+                        began = now
+                        snapshot = gap, buffered, len(plan)
+                        self._show_audio(False)
+                    self._playback.wait(min(0.1, delay))
+            if began is not None:
+                gap, ready, count = snapshot
+                self.log(f"Voice chat: prebuffer held {time.perf_counter() - began:.2f}s "
+                         f"(predicted gap {gap:.2f}s, buffered {ready:.2f}s, pending {count})")
+
+        def wake_on_stop():
+            # An externally supplied Event cannot notify our condition.
+            stop.wait()
+            with self._playback:
+                self._playback.notify_all()
 
         def log_timing(timing):
             with timing_lock:
@@ -1143,8 +1238,11 @@ class VoiceChat:
                     if timer:
                         timer.cancel()
                     sentences.put(None)
+                with self._playback:
+                    self._playback.notify_all()
 
         def render():
+            nonlocal buffered
             tts_ok = None  # unknown until the first sentence
             try:
                 while not stop.is_set():
@@ -1166,7 +1264,7 @@ class VoiceChat:
                         state["reply"] = f"{state['reply']} {spoken}".strip()
                         timing["shown"] = spoken
                     self.log(f"Voice chat: reply {spoken!r}")
-                    spoken = spoken_numbers(spoken, self.config.get("language"))
+                    spoken = timing["spoken"]
                     if not any(c.isalnum() for c in spoken):
                         continue  # an emoji or punctuation: nothing to say
                     audio = None
@@ -1181,7 +1279,9 @@ class VoiceChat:
                             if is_feedback:
                                 audio = self._waiting_audio(config, timing, started)
                             else:
-                                timing["synth_start"] = time.perf_counter() - started
+                                with self._playback:
+                                    timing["synth_start"] = time.perf_counter() - started
+                                    self._playback.notify_all()
                                 try:
                                     audio = synthesize(spoken, config)
                                 finally:
@@ -1202,15 +1302,31 @@ class VoiceChat:
                         if len(samples):
                             # What is heard; the balloon slides at this pace.
                             timing["seconds"] = len(samples) / audio[1]
-                        clips.put((samples, audio[1], timing))
+                        with self._playback:
+                            if not is_feedback and not timing.get("cached"):
+                                self._synthesis_model.update(
+                                    spoken, timing["synth_end"] - timing["synth_start"],
+                                    timing["audio"])
+                            buffered += timing.get("seconds", 0.0)
+                            pending.pop(timing["chunk"], None)
+                            clips.put((samples, audio[1], timing))
+                            self._playback.notify_all()
                     else:
                         log_timing(timing)
-                        clips.put(((), None, timing))  # text only, in order
+                        with self._playback:
+                            pending.pop(timing["chunk"], None)
+                            clips.put(((), None, timing))  # text only, in order
+                            self._playback.notify_all()
             finally:
-                clips.put(None)
+                with self._playback:
+                    pending.clear()
+                    clips.put(None)
+                    self._playback.notify_all()
 
         writer = threading.Thread(target=write, daemon=True)
         renderer = threading.Thread(target=render, daemon=True)
+        if prebuffer:
+            threading.Thread(target=wake_on_stop, daemon=True).start()
         if timer:
             timer.daemon = True
             timer.start()
@@ -1218,10 +1334,15 @@ class VoiceChat:
         renderer.start()
         self.speaking = True
         play = self._play or StreamPlayer()
+        idle = True
         try:
             while not stop.is_set():
                 try:
-                    clip = clips.get(timeout=0.1)
+                    try:
+                        clip = clips.get_nowait()
+                    except queue.Empty:
+                        idle = True
+                        clip = clips.get(timeout=0.1)
                 except queue.Empty:
                     # The last clip has played out; the next is still being
                     # synthesized.
@@ -1232,6 +1353,11 @@ class VoiceChat:
                 if not len(clip[0]):
                     show(clip[2])  # nothing to hear (no TTS, or only silence)
                 else:
+                    if idle:
+                        hold(clip[2])
+                    with self._playback:
+                        buffered = max(0.0, buffered - clip[2].get("seconds", 0.0))
+                    idle = False
                     while not stop.is_set():
                         with self._playback:
                             while self._paused and not stop.is_set():

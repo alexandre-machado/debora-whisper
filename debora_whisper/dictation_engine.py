@@ -99,6 +99,8 @@ DEFAULT_CONFIG = {
     "voice_chat_barge_in": True,
     "voice_chat_pause_on_speech": True,
     "voice_chat_pause_timeout": 3.0,
+    "voice_chat_prebuffer": True,
+    "voice_chat_prebuffer_max": 3.0,
     # Hugging Face repo (OpenVINO IR) or local directory. The int4-cw export
     # answers in ~0.4 s at ~15 tokens/s on a Core Ultra's Arc iGPU.
     "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
@@ -365,7 +367,7 @@ def validate_config(config: dict):
         raise ValueError(f"max_record_seconds must be a positive number or null, got '{max_rec}'")
 
     for key in ("vad_end_silence_seconds", "vad_incomplete_silence_seconds",
-                "voice_chat_pause_timeout"):
+                "voice_chat_pause_timeout", "voice_chat_prebuffer_max"):
         seconds = config.get(key, DEFAULT_CONFIG[key])
         if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
                 or not 0 < seconds < float("inf")):
@@ -392,6 +394,8 @@ def validate_config(config: dict):
         raise ValueError('voice_chat_echo_filter must be "auto", "on", "off" or a bool')
     if not isinstance(config.get("voice_chat_pause_on_speech", True), bool):
         raise ValueError("voice_chat_pause_on_speech must be a bool")
+    if not isinstance(config.get("voice_chat_prebuffer", True), bool):
+        raise ValueError("voice_chat_prebuffer must be a bool")
     if not isinstance(config.get("harness_new_session_on_start", False), bool):
         raise ValueError("harness_new_session_on_start must be a bool")
     from debora_whisper.harness import validate_session_name
