@@ -8,8 +8,9 @@ e não foram reproduzidos aqui.
 voz, o turno termina após `voice_chat_end_silence_seconds` (0.8 s) de
 silêncio; o `AdaptiveEndpoint` só vale no ditado.
 
-O pedido original ("teste com o JEV") veio por voz; nenhum modelo chamado
-JEV foi encontrado. O palpite mais provável é o TEN VAD.
+O pedido original ("teste com o JEV") veio por voz; em 2026-10-10 o JEV e sua
+safra de modelos de decisão foram identificados e avaliados em
+[turn-detection-e-classificadores-2026-10-10.md](turn-detection-e-classificadores-2026-10-10.md).
 
 | Candidato | O que faz | PT-BR | Formato e licença | Observações |
 |---|---|---|---|---|
