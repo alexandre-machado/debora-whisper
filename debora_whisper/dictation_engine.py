@@ -41,6 +41,7 @@ LLM_SERVER_LOG = LOG_DIR / "llm_server.log"
 LOG_MAX_BYTES = 5_000_000
 # An NPU lost to DEVICE_LOST, until a recovery probe or a reboot (npu_lost_this_boot).
 NPU_LOST_FILE = CONFIG_DIR / "npu_lost.json"
+HARDWARE_INVENTORY = CONFIG_DIR / "hardware-inventory.json"
 LAST_RECORDING = CONFIG_DIR / "last_recording.wav"
 
 DEFAULT_CONFIG = {
@@ -640,7 +641,7 @@ def log_hardware_inventory(config: dict):
                "model_dir": str(MODEL_DIR), "npu_loss_file": str(NPU_LOST_FILE)}
     def probe():
         try:
-            log(inventory_summary(probe_inventory(request, CONFIG_DIR / "hardware-inventory.json")))
+            log(inventory_summary(probe_inventory(request, HARDWARE_INVENTORY)))
         except Exception as e:
             log(f"Hardware inventory failed: {type(e).__name__}: {e}")
 

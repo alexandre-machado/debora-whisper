@@ -457,7 +457,7 @@ def test_inventory_logging_is_one_line_and_does_not_select(monkeypatch, tmp_path
     before = copy.deepcopy(config)
     result = {**inventory.make_inventory(_observed()), "elapsed_ms": 123.4, "timed_out": False}
     monkeypatch.setattr(inventory, "probe_inventory", lambda *args: result)
-    monkeypatch.setattr(de, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(de, "HARDWARE_INVENTORY", tmp_path / "inventory.json")
     logs = []
     monkeypatch.setattr(de, "log", logs.append)
     monkeypatch.setattr(de, "detect_devices", lambda: pytest.fail("inventory must not select"))
@@ -465,3 +465,13 @@ def test_inventory_logging_is_one_line_and_does_not_select(monkeypatch, tmp_path
     assert config == before
     assert len(logs) == 1 and "\n" not in logs[0]
     assert "CUDA:0=RTX" in logs[0] and "probe=123.4ms" in logs[0]
+
+
+def test_nvidia_smi_never_runs_from_the_current_folder(monkeypatch, tmp_path):
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "no-windows"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(queries.shutil, "which", lambda name: str(tmp_path / "nvidia-smi.exe"))
+    assert queries.nvidia_smi() is None
+    elsewhere = tmp_path / "bin" / "nvidia-smi.exe"
+    monkeypatch.setattr(queries.shutil, "which", lambda name: str(elsewhere))
+    assert queries.nvidia_smi() == str(elsewhere.resolve())

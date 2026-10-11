@@ -336,7 +336,10 @@ def _query_process(source, request, deadline, events):
             return
         process = subprocess.Popen([python_executable(), "-m", __name__, source],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+                                   stderr=subprocess.DEVNULL, creationflags=NO_WINDOW,
+                                   # Not the launch folder: "-m" puts the
+                                   # working directory first on sys.path.
+                                   cwd=Path(__file__).resolve().parents[1])
         # A separate reader preserves completed enumeration if a later driver
         # property hangs. It only handles small JSON packets, never native code.
         def read():

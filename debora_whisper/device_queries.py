@@ -1,17 +1,32 @@
 """Shared hardware queries. Call these in an isolated process for inventory."""
 import csv
 import io
+import os
 import shutil
 import subprocess
+from pathlib import Path
 
 from debora_whisper.processes import NO_WINDOW
 
 
+def nvidia_smi():
+    """Absolute path, so Windows never runs an nvidia-smi.exe from the
+    current folder."""
+    system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe"
+    if os.name == "nt" and system.is_file():
+        return str(system)
+    found = shutil.which("nvidia-smi")
+    if found is None or Path(found).resolve().parent == Path.cwd().resolve():
+        return None
+    return str(Path(found).resolve())
+
+
 def nvidia_output(fields=None, *, timeout=None, units=True):
     """Keep the legacy detection command, with optional inventory fields."""
-    if not shutil.which("nvidia-smi"):
+    executable = nvidia_smi()
+    if executable is None:
         return None
-    args = ["nvidia-smi"]
+    args = [executable]
     if fields:
         args += ["--query-gpu=" + fields,
                  "--format=csv,noheader" + ("" if units else ",nounits")]
