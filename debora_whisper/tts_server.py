@@ -41,12 +41,15 @@ import io
 import json
 import logging
 import os
+import select
+import socket
 import sys
 import threading
 import time
 import types
 import warnings
 import wave
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_TEXT_CHARS = 1000
@@ -195,6 +198,46 @@ def check_voice(voice) -> str | None:
     return voice
 
 
+class SynthesisCancelled(Exception):
+    pass
+
+
+def check_connection(connection):
+    try:
+        readable, _, _ = select.select([connection], [], [], 0)
+        if not readable or connection.recv(1, socket.MSG_PEEK):
+            return
+    except OSError:
+        pass
+    raise SynthesisCancelled()
+
+
+@contextmanager
+def cancellable_synthesis(model, connection):
+    """Check between speech tokens and flow steps; always remove our hooks."""
+    def check(*args):
+        check_connection(connection)
+
+    hooks = []
+    try:
+        check()
+        # Hook inner modules: Chatterbox calls the transformer/estimator's
+        # forward directly, bypassing hooks on those outer modules.
+        for path in ("t3.tfmr.layers.0", "s3gen.flow.decoder.estimator.time_mlp"):
+            try:
+                module = model
+                for name in path.split("."):
+                    module = module[int(name)] if name.isdigit() else getattr(module, name)
+                hooks.append(module.register_forward_pre_hook(check))
+            except (AttributeError, IndexError, TypeError):
+                pass  # another Chatterbox layout: synthesize without cancelling
+        yield
+        check()
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
 def make_handler(model, default_language: str):
     # One generation at a time: the GPU is shared and Chatterbox is not
     # thread-safe.
@@ -203,11 +246,14 @@ def make_handler(model, default_language: str):
 
     class Handler(BaseHTTPRequestHandler):
         def _reply(self, code, body: bytes, content_type="application/json"):
-            self.send_response(code)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass  # the client interrupted this request
 
         def _error(self, code, message):
             self._reply(code, json.dumps({"error": message}).encode("utf-8"))
@@ -246,14 +292,21 @@ def make_handler(model, default_language: str):
             with lock:
                 start = time.time()
                 try:
+                    check_connection(self.connection)
                     voices.use(voice)
+                except SynthesisCancelled:
+                    log("Cancelled queued synthesis (client disconnected)")
+                    return
                 except Exception as e:
                     log(f"Voice {voice!r} unusable: {type(e).__name__}: {e}")
                     return self._error(400, f"voice unusable: {e}")
                 try:
                     drop_attention_spies(model)
-                    with torch.inference_mode():
+                    with cancellable_synthesis(model, self.connection), torch.inference_mode():
                         wav = model.generate(text, language_id=language)
+                except SynthesisCancelled:
+                    log(f"Cancelled synthesis after {time.time() - start:.1f}s (client disconnected)")
+                    return
                 except Exception as e:
                     # Chatterbox fails on text too short to speak ("OK").
                     log(f"Failed after {time.time() - start:.1f}s on {text[:300]!r}: "

@@ -344,16 +344,26 @@ In continuous listening the microphone stays open during thinking and playback.
 New user speech interrupts the reply and becomes the next turn by default
 (`voice_chat_barge_in: true`); with `false`, transcriptions wait in order until
 the reply finishes. The hotkey also interrupts. This works with Claude and Qwen.
+With `voice_chat_pause_on_speech: true` (default), speech detection immediately
+pauses her audio while upcoming sentences continue synthesizing. Meaningful final
+text interrupts and starts a new turn; empty text, echoes and fillers replay the
+cut sentence from its beginning. If no final arrives within
+`voice_chat_pause_timeout` seconds (default `3.0`, a finite positive number), she
+also resumes from that sentence. Set `voice_chat_pause_on_speech: false` to keep
+playing until the final transcription arrives. Pausing requires `voice_chat_barge_in: true`.
 A sentence normally ends after 0.8 s of silence (`voice_chat_end_silence_seconds`).
 An incomplete draft, including trailing `...`, `…`, or a dangling connective,
 allows 2 s (`voice_chat_incomplete_silence_seconds`; dictation waits 1.5–3 s).
 
 Headphones are recommended for simultaneous listening and playback. With speakers,
-`voice_chat_echo_filter: true` compares normalized words against audio actually
-played during the captured segment, allowing a 2 s echo tail. At least 60% token
-overlap is treated as echo and is not sent to the LLM. This is a text heuristic:
-it can mistake a user repeating Débora for echo, or miss distorted speaker audio.
-Headphone users can disable the filter. Every nonempty final transcription is
+the echo filter compares normalized words against audio actually played during
+the captured segment, allowing a 2 s echo tail. Up to four words must all match;
+longer text needs 60% token overlap. Echo is not sent to the LLM. This is a text
+heuristic: it can mistake a user repeating Débora for echo, or miss distorted
+speaker audio. `voice_chat_echo_filter: "auto"` (default; `true` means the same)
+turns it off when Windows reports the output device as headphones or a headset,
+and keeps it on for speakers or an unknown device (wired headphones on a shared
+jack may show as speakers). `"on"` and `"off"` (or `false`) force it. Every nonempty final transcription is
 logged in `app.log` and added immediately to the usual transcription history,
 including queued, interrupted, cancelled, failed and echo-filtered entries with
 status labels. History retains its usual last 20 entries; logs retain older text
@@ -369,8 +379,10 @@ loaded until the app exits, so switching back is instant.
 {
   "voice_chat": true,
   "voice_chat_incomplete_silence_seconds": 2.0,
-  "voice_chat_echo_filter": true,
+  "voice_chat_echo_filter": "auto",
   "voice_chat_barge_in": true,
+  "voice_chat_pause_on_speech": true,
+  "voice_chat_pause_timeout": 3.0,
   "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
   "llm_device": "GPU",
   "llm_prompt": null,
