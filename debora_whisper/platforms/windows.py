@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 
 from debora_whisper.platforms.base import Platform
-from debora_whisper.platforms import windows_text
+from debora_whisper.platforms import windows_text, windows_uia
 
 _RENDER = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
 _DESCRIPTION = "{a45c254e-df1c-4efd-8020-67d146a850e0},2"  # "Headphones"
@@ -88,6 +88,9 @@ class WindowsPlatform(Platform):
 
     def input_target(self):
         return windows_text.input_target()
+
+    def text_before_caret(self, count: int) -> str | None:
+        return windows_uia.text_before_caret(count)
 
     def same_input_target(self, a, b) -> bool:
         return windows_text.same_input_target(a, b)

@@ -70,6 +70,13 @@ def _dictation_by_default(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_uia(monkeypatch):
+    """Block UIA for every provider instance; UIA unit tests inject a fake API."""
+    from debora_whisper.platforms import windows_uia
+    monkeypatch.setattr(windows_uia, "comtypes", None)
+
+
+@pytest.fixture(autouse=True)
 def _unknown_audio_output(monkeypatch):
     """The developer's headphones must not switch the echo filter off."""
     from debora_whisper import platforms
@@ -77,3 +84,5 @@ def _unknown_audio_output(monkeypatch):
     provider = platforms.current()
     monkeypatch.setattr(provider, "default_output_name", lambda: None)
     monkeypatch.setattr(provider, "output_is_headphones", lambda name=None: None)
+    # Engine tests must not inspect the developer's focused text box.
+    monkeypatch.setattr(provider, "text_before_caret", lambda count: None)

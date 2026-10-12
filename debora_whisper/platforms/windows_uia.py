@@ -1,0 +1,117 @@
+"""Best-effort caret verification; no COM objects leave the UIA thread."""
+import ctypes
+import queue
+import threading
+
+try:
+    # Import before starting our worker: comtypes initializes its importing
+    # thread's apartment. Our process-lifetime worker explicitly uses MTA.
+    import comtypes.client
+except Exception:
+    comtypes = None
+
+
+_TIMEOUT = 0.150
+_query_lock = threading.Lock()
+_worker = None
+
+
+def text_before_caret(count: int) -> str | None:
+    """Wait at most 150 ms, including type-library generation on first use.
+
+    A hung provider holds the single slot; later calls return unknown rather
+    than accumulate requests. Late results are discarded, never reused.
+    """
+    global _worker
+    if comtypes is None or count < 0 or not _query_lock.acquire(blocking=False):
+        return None
+    done = threading.Event()
+    result = [None]
+
+    try:
+        if _worker is None:
+            requests = queue.SimpleQueue()
+            thread = threading.Thread(target=_serve, args=(comtypes, requests),
+                                      name="uia-caret", daemon=True)
+            thread.start()
+            _worker = requests, thread
+        _worker[0].put((count, result, done))
+    except Exception:
+        _query_lock.release()
+        return None
+    return result[0] if done.wait(_TIMEOUT) else None
+
+
+def _serve(api, requests):
+    # Keep this apartment alive until process exit, including when idle or a
+    # provider fails. GetModule's internal ctypes/type-library cycles can live
+    # beyond a query; CoUninitialize here would invalidate their COM pointers.
+    initialized = False
+    while (request := requests.get()) is not None:
+        count, result, done = request
+        try:
+            if not initialized:
+                api.CoInitializeEx(api.COINIT_MULTITHREADED)
+                initialized = True
+            result[0] = _read_text_before_caret(count, api)
+        except Exception:
+            pass
+        finally:
+            _query_lock.release()
+            done.set()
+
+
+def _release(pointer):
+    """Release our reference now, and prevent comtypes from releasing it twice."""
+    if pointer:
+        try:
+            pointer.Release()
+        finally:
+            # comtypes overrides .value with a read-only property. Clear the
+            # underlying c_void_p so its __del__ is harmless even if a ctypes
+            # cycle is collected later, on a different thread.
+            ctypes.c_void_p.value.__set__(pointer, None)
+
+
+def _read_text_before_caret(count: int, api) -> str | None:
+    owned = []
+
+    def own(pointer):
+        owned.append(pointer)
+        return pointer
+
+    try:
+        uia = api.client.GetModule("UIAutomationCore.dll")
+        automation = own(api.client.CreateObject(uia.CUIAutomation, interface=uia.IUIAutomation))
+        element = own(automation.GetFocusedElement())
+        raw_pattern = own(element.GetCurrentPattern(uia.UIA_TextPattern2Id))
+        pattern = own(raw_pattern.QueryInterface(uia.IUIAutomationTextPattern2))
+        active, caret = pattern.GetCaretRange()
+        own(caret)
+        if not active or not caret:
+            return None
+        selection = own(pattern.GetSelection())
+        if selection.Length != 1:
+            return None
+        selected = own(selection.GetElement(0))
+        if selected.CompareEndpoints(uia.TextPatternRangeEndpoint_Start,
+                                     selected, uia.TextPatternRangeEndpoint_End) != 0:
+            return None
+        before = own(caret.Clone())
+        before.MoveEndpointByUnit(uia.TextPatternRangeEndpoint_Start,
+                                  uia.TextUnit_Character, -count)
+        text = before.GetText(-1)
+        return str(text) if isinstance(text, str) else None
+    except Exception:
+        # Exceptions and their tracebacks must also stay on the worker.
+        return None
+    finally:
+        # Include the intermediate IUnknown from GetCurrentPattern. Assigning
+        # None alone cannot release pointers retained by ctypes/traceback cycles.
+        for pointer in reversed(owned):
+            try:
+                _release(pointer)
+            except Exception:
+                # A failed provider must not prevent releasing other pointers.
+                pass
+        owned.clear()

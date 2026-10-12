@@ -34,6 +34,7 @@ dependencies = [
     "numpy>=1.24,<3.0",
     "keyboard>=0.13.5,<0.14.0",
     "pyperclip>=1.8.2,<1.9.0",
+    "comtypes>=1.4,<2; sys_platform == 'win32'",
     "psutil",
     "pystray>=0.19,<0.20",
     "customtkinter>=5.2,<6.0",

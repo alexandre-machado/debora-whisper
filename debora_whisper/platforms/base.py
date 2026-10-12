@@ -42,6 +42,10 @@ class Platform:
         """Where keys land is unknown on unsupported systems."""
         return None
 
+    def text_before_caret(self, count: int) -> str | None:
+        """Text immediately before an active, unselected caret, or unknown."""
+        return None
+
     def same_input_target(self, a, b) -> bool:
         """Unknown targets cannot be verified."""
         return False

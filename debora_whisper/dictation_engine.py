@@ -59,10 +59,9 @@ DEFAULT_CONFIG = {
     "voice_chat_hotkey": "right alt",  # Tapped alone, switches voice chat; "" disables
     "auto_enter": False,       # Press Enter after pasting (useful for Claude Code)
     # Continuous drafts: shown in the overlay only, or also typed into the
-    # target and rewritten with Shift+Left. Rewriting assumes the editor
-    # leaves text and caret alone, which autocomplete, auto-closing pairs,
-    # autocorrect and slow targets (browsers, Word, IDEs) do not.
+    # target and rewritten with Shift+Left, verified when the OS supports it.
     "inline_drafts": False,
+    "inline_drafts_require_verification": False,  # Unknown target: leave draft
     "beep_on_start": True,     # Audio feedback when recording starts/stops
     "max_record_seconds": 60,  # Max recording length
     "sample_rate": 16000,      # Whisper expects 16kHz
@@ -344,6 +343,9 @@ def set_voice_chat_config(config: dict, enabled: bool):
 
 def validate_config(config: dict):
     """Validate config values. Raises ValueError on invalid values."""
+    for key in ("inline_drafts", "inline_drafts_require_verification"):
+        if not isinstance(config.get(key, False), bool):
+            raise ValueError(f"{key} must be a bool")
     width = config.get("balloon_width")
     if width is not None and (isinstance(width, bool) or not isinstance(width, (int, float))
                               or not 200 <= width < float("inf")):
@@ -2555,6 +2557,7 @@ class DictationApp:
         # Live draft already typed into the target, guarded by _output_lock.
         self._draft_typed_text = ""
         self._draft_target = None
+        self._inline_drafts_abandoned = False
         self.voice_chat = VoiceChat(config, log=log, tts_log_path=TTS_SERVER_LOG,
                                     llm_log_path=LLM_SERVER_LOG)
         self.recorder.on_voice = self._voice_activity
@@ -2952,16 +2955,30 @@ class DictationApp:
             self._hotword_terms = terms
         return {"hotwords": ", ".join(terms)} if terms else {}
 
+    def _verify_draft_locked(self):
+        """Caller holds _output_lock. A changed target ends inline output."""
+        observed = platforms.current().text_before_caret(len(self._draft_typed_text))
+        if (observed == self._draft_typed_text or
+                (observed is None and not self.config.get("inline_drafts_require_verification"))):
+            return True
+        self._inline_drafts_abandoned = True
+        self._draft_typed_text = ""
+        self._draft_target = None
+        log("Inline draft: target changed; leaving the draft and typing the final")
+        return False
+
     def _forget_draft_locked(self, erase: bool):
         """Stop tracking the typed draft, first erasing it if asked and keys
         still land where it was typed. Caller holds _output_lock."""
         if erase and self._draft_typed_text:
             if same_input_target(get_input_target(), self._draft_target):
-                delete_text(len(self._draft_typed_text))
+                if self._verify_draft_locked():
+                    delete_text(len(self._draft_typed_text))
             else:
                 log("Input focus changed; leaving the draft where it was typed.")
         self._draft_typed_text = ""
         self._draft_target = None
+        self._inline_drafts_abandoned = False
 
     def _finish_recording(self, generation=None, audio=None, is_final=True,
                           segment_id=None, audio_end=None, captured_at=None):
@@ -3082,9 +3099,10 @@ class DictationApp:
                         text_to_type = text
                         if self._draft_typed_text:
                             if same_input_target(target, self._draft_target):
-                                common = os.path.commonprefix([self._draft_typed_text, text])
-                                delete_text(len(self._draft_typed_text) - len(common))
-                                text_to_type = text[len(common):]
+                                if self._verify_draft_locked():
+                                    common = os.path.commonprefix([self._draft_typed_text, text])
+                                    delete_text(len(self._draft_typed_text) - len(common))
+                                    text_to_type = text[len(common):]
                             else:
                                 log("Input focus changed; leaving the draft where it was typed.")
 
@@ -3096,6 +3114,7 @@ class DictationApp:
                                 platforms.current().press_enter()
                             self._draft_typed_text = ""
                             self._draft_target = None
+                            self._inline_drafts_abandoned = False
                             log(f"Final transcription: {text.strip()}")
 
                             self._history.append({
@@ -3105,7 +3124,7 @@ class DictationApp:
                             })
                             if len(self._history) > self.MAX_HISTORY:
                                 self._history = self._history[-self.MAX_HISTORY:]
-                        elif self.config.get("inline_drafts"):
+                        elif self.config.get("inline_drafts") and not self._inline_drafts_abandoned:
                             # It's a draft. Type it so the user sees it real-time.
                             type_draft_text(text_to_type)
                             self._draft_typed_text = text

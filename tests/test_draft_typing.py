@@ -91,6 +91,76 @@ def test_drafts_stay_in_overlay_by_default(screen):
     assert screen.text == "Olá, tudo bem? "
 
 
+@pytest.mark.parametrize("verified", [True, False])
+def test_verified_or_unknown_draft_keeps_legacy_rewrite(screen, monkeypatch, verified):
+    seen = []
+
+    def read(count):
+        seen.append(count)
+        return screen.text[-count:] if verified else None
+
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    app = _app()
+    _say(app, "Olá tudo", is_final=False)
+    _say(app, "Olá tudo bem", is_final=False)
+    _say(app, "Olá, tudo bem?", is_final=True)
+    assert seen == [len("Olá tudo... "), len("Olá tudo bem... ")]
+    assert screen.text == "Olá, tudo bem? "
+    assert screen.pasted == [", tudo bem? "]
+
+
+@pytest.mark.parametrize("observed,strict", [("changed", False), ("", False), (None, True)])
+@pytest.mark.parametrize("next_is_final", [False, True])
+def test_changed_draft_abandons_segment(screen, monkeypatch, capsys, observed, strict, next_is_final):
+    read = MagicMock(return_value=observed)
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    app = _app(inline_drafts_require_verification=strict)
+    app.is_recording = True
+    states = []
+    app.add_callback(lambda state, data: states.append(data))
+    _say(app, "Olá tudo", is_final=False)
+    screen.text += "user edit"
+    kept = screen.text
+    if not next_is_final:
+        _say(app, "Olá tudo bem", is_final=False)
+        _say(app, "Olá tudo bem hoje", is_final=False)
+        assert screen.text == kept
+        assert app._inline_drafts_abandoned
+        assert states[-1]["draft_text"] == "Olá tudo bem hoje... "
+    _say(app, "Olá, tudo bem?", is_final=True)
+    assert screen.text == kept + "Olá, tudo bem? "
+    assert screen.drafted == ["Olá tudo... "]
+    assert screen.pasted == ["Olá, tudo bem? "]
+    read.assert_called_once_with(len("Olá tudo... "))
+    assert capsys.readouterr().out.count(
+        "Inline draft: target changed; leaving the draft and typing the final") == 1
+    assert not app._inline_drafts_abandoned
+    _say(app, "Nova frase", is_final=False)
+    assert screen.drafted[-1] == "Nova frase... "
+
+
+@pytest.mark.parametrize("final", ["", RuntimeError("failed final")])
+def test_abandoned_draft_resets_after_empty_or_failed_final(screen, monkeypatch, final):
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", lambda count: "changed")
+    app = _app()
+    _say(app, "Olá tudo", is_final=False)
+    _say(app, "Olá tudo bem", is_final=False)
+    _say(app, final, is_final=True)
+    assert screen.text == "Olá tudo... "
+    assert not app._inline_drafts_abandoned
+    _say(app, "Nova frase", is_final=False)
+    assert screen.drafted[-1] == "Nova frase... "
+
+
+def test_empty_final_verifies_before_erasing(screen, monkeypatch):
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", lambda count: "changed")
+    app = _app()
+    _say(app, "Olá tudo", is_final=False)
+    _say(app, "", is_final=True)
+    assert screen.text == "Olá tudo... "
+    assert app._draft_typed_text == ""
+
+
 def test_final_equal_to_draft_still_presses_auto_enter(screen):
     app = _app(auto_enter=True)
     _say(app, "Pronto.", is_final=False)

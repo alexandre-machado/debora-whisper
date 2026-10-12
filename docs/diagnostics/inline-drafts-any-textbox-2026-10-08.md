@@ -219,6 +219,26 @@ accessibility trees (Monaco exposes only nearby lines). A race also remains
 between the check and the keys. This option is useful as a guard for the
 legacy `keys` mode, not as a path to "any text box".
 
+**Implemented (2026-10-12):** `WindowsPlatform.text_before_caret` uses
+`comtypes` and the UIAutomationCore type library to check an active
+TextPattern2 caret and a single empty selection. The entire previous draft
+must match exactly before rewriting even its differing tail. A mismatch
+leaves the draft, abandons inline output for that segment, and pastes the
+final in full. Unknown reads preserve legacy behavior unless
+`inline_drafts_require_verification: true` (default false).
+The caller waits at most 150 ms on a single daemon MTA worker, including
+first-use type-library generation. Only one query may run at a time: a hung
+provider makes subsequent reads unknown without accumulating workers; late
+results are discarded. UIA pointers are explicitly released and cleared on
+the worker, including intermediate interfaces and failure paths, so later
+cyclic garbage collection cannot release them again on another thread.
+The worker keeps COM initialized for the process lifetime; it never calls
+`CoUninitialize`, which could invalidate comtypes' internal type-library
+cycles. Tests block real UIA at the module boundary and inject fake APIs.
+Missing `comtypes` is also unknown. This follows
+[Microsoft's UIA threading guidance](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading)
+and leaves the check-to-keys race described above.
+
 ## Spike plan
 
 1. Minimal TIP (x64) using SampleIME/Mozc as reference: one profile for

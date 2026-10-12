@@ -8,6 +8,18 @@ from debora_whisper.dictation_engine import validate_config, DEFAULT_CONFIG
 
 
 class TestConfigValidation:
+    @pytest.mark.parametrize("key", ["inline_drafts", "inline_drafts_require_verification"])
+    @pytest.mark.parametrize("value", [None, "true", 0, 1])
+    def test_invalid_inline_drafts_flag(self, key, value):
+        with pytest.raises(ValueError, match=key):
+            validate_config({**DEFAULT_CONFIG, key: value})
+
+    def test_inline_verification_defaults_to_legacy(self):
+        assert DEFAULT_CONFIG["inline_drafts_require_verification"] is False
+        config = {key: value for key, value in DEFAULT_CONFIG.items() if not key.startswith("inline_drafts")}
+        validate_config(config)
+        validate_config({**DEFAULT_CONFIG, "inline_drafts_require_verification": True})
+
     @pytest.mark.parametrize("name", ["", "   ", None, 42, "a" * 81,
                                      *[f"Debora{c}test" for c in '&|<>^%"\r\n\t!'],
                                      "Debora\n", "\nDebora"])

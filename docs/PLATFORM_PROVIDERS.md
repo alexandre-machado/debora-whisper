@@ -17,7 +17,7 @@ sem esse recurso.
 | Tipo do dispositivo de saída (fone ou alto-falante), usado pelo filtro de eco `"auto"` | Form factor do endpoint no registro (`MMDevices\Audio\Render`) | Tipo da porta no PipeWire/PulseAudio (`pactl`, `headphones`/`headset`) |
 | Processos: janela oculta e encerramento da árvore | `CREATE_NO_WINDOW` + `taskkill /T` | `process.kill` / `killpg` em um grupo de processos |
 | Ferramentas de GPU: caminho absoluto do `nvidia-smi` e carga das DLLs NVIDIA | `System32\nvidia-smi.exe` + `PATH` e `os.add_dll_directory` | `nvidia-smi` no `PATH` + `LD_LIBRARY_PATH`/preload via `ctypes` |
-| Escrita no aplicativo em foco: digitar, apagar e rascunhos em tempo real | `platforms/windows_text.py`: clipboard + `keyboard`, fallback SendInput e comparação de HWNDs | Caminho portátil de clipboard + `keyboard`; alvo e fallback nativo desconhecidos. X11/Wayland precisam de estudo próprio |
+| Escrita no aplicativo em foco: digitar, apagar e rascunhos em tempo real | `platforms/windows_text.py`: clipboard + `keyboard`, fallback SendInput e comparação de HWNDs; `windows_uia.py`: verificação do rascunho antes do cursor via UI Automation (`text_before_caret`, limite de 150 ms) | Caminho portátil de clipboard + `keyboard`; alvo, texto antes do cursor e fallback nativo desconhecidos. X11/Wayland precisam de estudo próprio |
 
 ## Migração, em PRs pequenos e sem mudar comportamento
 
