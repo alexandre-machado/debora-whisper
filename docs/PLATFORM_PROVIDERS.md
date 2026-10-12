@@ -17,17 +17,17 @@ sem esse recurso.
 | Tipo do dispositivo de saída (fone ou alto-falante), usado pelo filtro de eco `"auto"` | Form factor do endpoint no registro (`MMDevices\Audio\Render`) | Tipo da porta no PipeWire/PulseAudio (`pactl`, `headphones`/`headset`) |
 | Processos: janela oculta e encerramento da árvore | `CREATE_NO_WINDOW` + `taskkill /T` | `process.kill` / `killpg` em um grupo de processos |
 | Ferramentas de GPU: caminho absoluto do `nvidia-smi` e carga das DLLs NVIDIA | `System32\nvidia-smi.exe` + `PATH` e `os.add_dll_directory` | `nvidia-smi` no `PATH` + `LD_LIBRARY_PATH`/preload via `ctypes` |
+| Escrita no aplicativo em foco: digitar, apagar e rascunhos em tempo real | `platforms/windows_text.py`: clipboard + `keyboard`, fallback SendInput e comparação de HWNDs | Caminho portátil de clipboard + `keyboard`; alvo e fallback nativo desconhecidos. X11/Wayland precisam de estudo próprio |
 
 ## Migração, em PRs pequenos e sem mudar comportamento
 
 | Ordem | Recurso | Onde está hoje |
 |---|---|---|
-| 1 | Escrita no aplicativo em foco: digitar, apagar e rascunhos em tempo real dentro das caixas de texto (SendInput, `keyboard`, UI Automation) | `type_text`, `_type_text_ctypes`, `delete_text`, `type_draft_text` em `dictation_engine.py`; estudos em `docs/diagnostics/windows-text-insertion-2026-10-08.md` e `inline-drafts-any-textbox-2026-10-08.md` |
-| 2 | Atalhos globais e tecla isolada (Right Alt/AltGr), incluindo a exigência de administrador | `dictation_engine.py` (`import keyboard`), `solo_key.py` |
-| 3 | Janela do overlay: DPI, sempre no topo, sem foco, fora da barra de tarefas | `ui/overlay.py` (`GetDpiForWindow`, `WS_EX_*`) |
-| 4 | Instalação: atalhos do Menu Iniciar e início automático | `shortcuts.py` (`.lnk` via PowerShell) |
-| 5 | Hora do boot, usada para saber se a NPU caiu nesta sessão | `_boot_time` em `dictation_engine.py` |
-| 6 | Pastas de usuário e variáveis de ambiente persistentes | `paths.py` (`user_env`) |
+| 1 | Atalhos globais e tecla isolada (Right Alt/AltGr), incluindo a exigência de administrador | `dictation_engine.py` (`import keyboard`), `solo_key.py` |
+| 2 | Janela do overlay: DPI, sempre no topo, sem foco, fora da barra de tarefas | `ui/overlay.py` (`GetDpiForWindow`, `WS_EX_*`) |
+| 3 | Instalação: atalhos do Menu Iniciar e início automático | `shortcuts.py` (`.lnk` via PowerShell) |
+| 4 | Hora do boot, usada para saber se a NPU caiu nesta sessão | `_boot_time` em `dictation_engine.py` |
+| 5 | Pastas de usuário e variáveis de ambiente persistentes | `paths.py` (`user_env`) |
 
 Cada etapa move o código para `WindowsPlatform`, deixa em `Platform` o
 comportamento atual para outros sistemas (ou `None`) e mantém os testes

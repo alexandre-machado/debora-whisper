@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 from debora_whisper.platforms.base import Platform
+from debora_whisper.platforms import windows_text
 
 _RENDER = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
 _DESCRIPTION = "{a45c254e-df1c-4efd-8020-67d146a850e0},2"  # "Headphones"
@@ -69,6 +70,27 @@ def is_headphones(name, endpoints):
 
 class WindowsPlatform(Platform):
     name = "windows"
+
+    def type_text(self, text: str, auto_enter: bool = False):
+        return windows_text.type_text(text, auto_enter)
+
+    def _type_text_ctypes(self, text: str):
+        return windows_text._type_text_ctypes(text)
+
+    def type_draft(self, text: str):
+        return windows_text.type_draft(text)
+
+    def delete_text(self, count: int):
+        return windows_text.delete_text(count)
+
+    def _delete_text_ctypes(self, count: int):
+        return windows_text._delete_text_ctypes(count)
+
+    def input_target(self):
+        return windows_text.input_target()
+
+    def same_input_target(self, a, b) -> bool:
+        return windows_text.same_input_target(a, b)
 
     def nvidia_smi(self):
         system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe"
