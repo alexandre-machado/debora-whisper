@@ -3,7 +3,9 @@
 Each playback endpoint's form factor is in the registry, so telling
 headphones from speakers needs no extra package.
 """
+import os
 import subprocess
+from pathlib import Path
 
 from debora_whisper.platforms.base import Platform
 
@@ -67,6 +69,17 @@ def is_headphones(name, endpoints):
 
 class WindowsPlatform(Platform):
     name = "windows"
+
+    def nvidia_smi(self):
+        system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe"
+        if system.is_absolute() and system.is_file():
+            return str(system)
+        return super().nvidia_smi()
+
+    def add_library_dir(self, path):
+        os.environ["PATH"] = str(path) + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(str(path))
 
     @property
     def no_window(self):

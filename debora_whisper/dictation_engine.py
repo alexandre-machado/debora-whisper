@@ -20,7 +20,7 @@ from enum import Enum
 from pathlib import Path
 from datetime import datetime
 
-from debora_whisper import paths, processes
+from debora_whisper import paths, platforms, processes
 from debora_whisper.harness import MemoryHotwords, ProjectHotwords, bounded_hotwords
 from debora_whisper.solo_key import SoloKeyTap
 from debora_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
@@ -868,20 +868,17 @@ class FasterWhisperCUDA:
         # On Windows, CTranslate2 needs to find the CUDA runtime DLLs (cublas, cudnn).
         # If installed via pip (nvidia-cublas-cu12, nvidia-cudnn-cu12), we must explicitly
         # add them to the DLL search path.
-        if sys.platform == "win32":
-            try:
-                import site
-                for site_pkg in site.getsitepackages():
-                    nvidia_base = Path(site_pkg) / "nvidia"
-                    if nvidia_base.exists():
-                        for lib_dir in nvidia_base.iterdir():
-                            bin_path = lib_dir / "bin"
-                            if bin_path.exists():
-                                os.environ["PATH"] = str(bin_path) + os.pathsep + os.environ.get("PATH", "")
-                                if hasattr(os, "add_dll_directory"):
-                                    os.add_dll_directory(str(bin_path))
-            except Exception as e:
-                log(f"Warning: Failed to inject NVIDIA DLL paths: {e}")
+        try:
+            import site
+            for site_pkg in site.getsitepackages():
+                nvidia_base = Path(site_pkg) / "nvidia"
+                if nvidia_base.exists():
+                    for lib_dir in nvidia_base.iterdir():
+                        bin_path = lib_dir / "bin"
+                        if bin_path.exists():
+                            platforms.current().add_library_dir(bin_path)
+        except Exception as e:
+            log(f"Warning: Failed to inject NVIDIA DLL paths: {e}")
 
         WhisperModel = import_faster_whisper()
 
@@ -2745,8 +2742,12 @@ class DictationApp:
         try:
             if device == "CUDA":
                 import subprocess
+                from debora_whisper.device_queries import nvidia_smi
+                executable = nvidia_smi()
+                if executable is None:
+                    return ""
                 output = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,nounits,noheader"],
+                    [executable, "--query-gpu=memory.used,memory.total", "--format=csv,nounits,noheader"],
                     creationflags=processes.NO_WINDOW
                 ).decode("utf-8").strip()
                 used, total = (int(v) / 1024 for v in output.split(", "))
