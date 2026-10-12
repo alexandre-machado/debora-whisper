@@ -12,6 +12,40 @@ class Platform:
     name = "generic"
     no_window = 0
 
+    def type_text(self, text: str, auto_enter: bool = False):
+        """Keep the portable clipboard/keyboard path; native support is unknown."""
+        from debora_whisper.platforms import windows_text
+        return windows_text.type_text(text, auto_enter, fallback=self._type_text_ctypes)
+
+    def _type_text_ctypes(self, text: str):
+        """Native insertion is unknown: no-op."""
+        pass
+
+    def type_draft(self, text: str):
+        """Drafts share the final text's serialized clipboard transaction."""
+        return self.type_text(text)
+
+    def delete_text(self, count: int):
+        """Keep keyboard selection/deletion; native support is unknown."""
+        from debora_whisper.platforms import windows_text
+        return windows_text.delete_text(count, fallback=self._delete_text_ctypes)
+
+    def _delete_text_ctypes(self, count: int):
+        """Native deletion is unknown: no-op."""
+        pass
+
+    def press_enter(self):
+        from debora_whisper.platforms import windows_text
+        return windows_text.press_enter()
+
+    def input_target(self):
+        """Where keys land is unknown on unsupported systems."""
+        return None
+
+    def same_input_target(self, a, b) -> bool:
+        """Unknown targets cannot be verified."""
+        return False
+
     def nvidia_smi(self):
         """Absolute executable from PATH, never from the current folder."""
         found = shutil.which("nvidia-smi")
