@@ -159,6 +159,7 @@ Stored at `~/.debora/config.json`:
   "tap_action": "continuous",
   "auto_enter": false,
   "inline_drafts": false,
+  "inline_drafts_require_verification": false,
   "beep_on_start": true,
   "max_record_seconds": 60,
   "sample_rate": 16000
@@ -209,10 +210,14 @@ limit still apply; push-to-talk and voice chat keep their existing behavior.
 
 In continuous dictation, drafts appear in the overlay and each finished
 sentence is pasted once. `inline_drafts: true` also types drafts into the
-target window and rewrites them in place with Shift+Left and Backspace. That
-only works where the editor leaves the typed text and caret alone; editors
-with autocomplete, auto-closing brackets, autocorrect or slow input handling
-(browsers, Word, IDEs) can garble the result.
+target window and rewrites them in place with Shift+Left and Backspace. On
+Windows, UI Automation checks the previous draft before rewriting. If the
+text changed, the draft stays, further drafts use only the overlay, and the
+final is pasted in full. Unsupported controls or reads exceeding 150 ms keep
+the legacy rewrite behavior. Set `inline_drafts_require_verification: true`
+to leave the draft and use only the overlay until the final in those cases
+too. This guard still has a race between reading the caret and sending keys;
+overlay-only drafts remain the default.
 
 ### Voice chat with Claude Code
 

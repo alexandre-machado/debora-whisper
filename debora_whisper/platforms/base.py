@@ -5,7 +5,12 @@ tell. A provider per OS (windows.py today) overrides what it knows, so the
 rest of the app never checks sys.platform itself.
 """
 import shutil
+from enum import Enum
 from pathlib import Path
+
+
+class CaretReadStatus(Enum):
+    UNSAFE = "unsafe"
 
 
 class Platform:
@@ -40,6 +45,10 @@ class Platform:
 
     def input_target(self):
         """Where keys land is unknown on unsupported systems."""
+        return None
+
+    def text_before_caret(self, count: int) -> str | CaretReadStatus | None:
+        """Text before the caret, UNSAFE for selections, or None if unavailable."""
         return None
 
     def same_input_target(self, a, b) -> bool:
