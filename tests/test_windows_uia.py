@@ -11,9 +11,21 @@ from unittest.mock import Mock
 
 import pytest
 
-from debora_whisper.platforms.base import Platform
+from debora_whisper.platforms.base import CaretReadStatus, Platform
 from debora_whisper.platforms.windows import WindowsPlatform
 from debora_whisper.platforms import windows_uia as uia
+
+
+@pytest.fixture(autouse=True)
+def system_directory(monkeypatch):
+    def get_directory(buffer, size):
+        buffer.value = r"C:\Windows\System32"
+        return len(buffer.value)
+
+    kernel32 = Mock()
+    kernel32.GetSystemDirectoryW.side_effect = get_directory
+    monkeypatch.setattr(ctypes, "WinDLL", Mock(return_value=kernel32), raising=False)
+    return kernel32.GetSystemDirectoryW
 
 
 @pytest.fixture
@@ -69,7 +81,7 @@ def test_windows_reads_actual_text(com, observed):
     assert threads != [threading.get_ident()]
     com.api.CoInitializeEx.assert_called_once_with(0)
     com.api.CoUninitialize.assert_not_called()
-    com.api.client.GetModule.assert_called_once_with("UIAutomationCore.dll")
+    com.api.client.GetModule.assert_called_once_with(r"C:\Windows\System32\UIAutomationCore.dll")
     com.element.GetCurrentPattern.assert_called_once_with(10024)
     com.element.GetCurrentPattern.return_value.QueryInterface.assert_called_once_with(
         com.constants.IUIAutomationTextPattern2)
@@ -80,15 +92,85 @@ def test_windows_reads_actual_text(com, observed):
     com.caret.MoveEndpointByUnit.assert_not_called()
 
 
-@pytest.mark.parametrize("condition", ["inactive", "selected", "multiple", "no_selection",
+def test_type_library_ignores_working_directory(com, monkeypatch, tmp_path):
+    planted = tmp_path / "UIAutomationCore.dll"
+    planted.write_bytes(b"untrusted type library")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SystemRoot", str(tmp_path))
+    monkeypatch.setenv("WINDIR", str(tmp_path))
+
+    assert WindowsPlatform().text_before_caret(5) == "draft"
+    com.api.client.GetModule.assert_called_once_with(r"C:\Windows\System32\UIAutomationCore.dll")
+    ctypes.WinDLL.assert_called_once_with("kernel32.dll", winmode=0x00000800)
+
+
+@pytest.mark.parametrize("length", [0, 32768, 40000])
+def test_system_directory_failure_does_not_load_type_library(com, system_directory, length):
+    system_directory.side_effect = None
+    system_directory.return_value = length
+    assert WindowsPlatform().text_before_caret(5) is None
+    com.api.client.GetModule.assert_not_called()
+
+
+@pytest.mark.parametrize("multiple", [False, True])
+def test_detected_selection_is_unsafe(com, multiple):
+    com.selection.Length = 2 if multiple else 1
+    com.selection.GetElement.return_value.CompareEndpoints.return_value = -1
+    assert WindowsPlatform().text_before_caret(5) is CaretReadStatus.UNSAFE
+    com.caret.Clone.assert_not_called()
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("next_text,next_is_final", [("draft update", False),
+                                                       ("final text", True), ("", True)])
+def test_engine_selection_prevents_draft_deletion(com, monkeypatch, strict,
+                                                 next_text, next_is_final):
+    import numpy as np
+    from unittest.mock import MagicMock
+    from debora_whisper import dictation_engine as de
+
+    app = de.DictationApp({**de.DEFAULT_CONFIG, "beep_on_start": False,
+                          "continuous_listening": True, "inline_drafts": True})
+    assert app.config["inline_drafts_require_verification"] is False
+    if strict:
+        app.config["inline_drafts_require_verification"] = True
+    app.recorder = MagicMock()
+    app.whisper = MagicMock()
+    app._model_ready.set()
+    draft, delete, final = Mock(), Mock(), Mock()
+    monkeypatch.setattr(de, "type_draft_text", draft)
+    monkeypatch.setattr(de, "delete_text", delete)
+    monkeypatch.setattr(de, "type_text", final)
+    monkeypatch.setattr(de, "get_input_target", lambda: (1, 2))
+    monkeypatch.setattr(de, "same_input_target", lambda a, b: a == b)
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", uia.text_before_caret)
+    audio = np.zeros(16000, dtype=np.float32)
+    app.whisper.transcribe.return_value = "draft"
+    app._finish_recording(audio=audio, is_final=False)
+    draft.assert_called_once_with("draft... ")
+
+    # The user selects existing text after the first draft appears.
+    com.selection.GetElement.return_value.CompareEndpoints.return_value = -1
+    app.whisper.transcribe.return_value = next_text
+    app._finish_recording(audio=audio, is_final=next_is_final)
+    delete.assert_not_called()
+    draft.assert_called_once_with("draft... ")
+    assert app._draft_typed_text == ""
+    if not next_is_final:
+        assert app._inline_drafts_abandoned
+        final.assert_not_called()
+        app._finish_recording(audio=audio, is_final=False)
+        draft.assert_called_once_with("draft... ")
+        delete.assert_not_called()
+
+
+@pytest.mark.parametrize("condition", ["inactive", "no_selection",
                                         "missing_pattern", "exception", "init_failure"])
 def test_windows_unknown(com, condition):
     if condition == "inactive":
         com.pattern.GetCaretRange.return_value = (False, com.caret)
-    elif condition == "selected":
-        com.selection.GetElement.return_value.CompareEndpoints.return_value = -1
-    elif condition in ("multiple", "no_selection"):
-        com.selection.Length = 2 if condition == "multiple" else 0
+    elif condition == "no_selection":
+        com.selection.Length = 0
     elif condition == "missing_pattern":
         com.element.GetCurrentPattern.return_value = None
     elif condition == "exception":
@@ -219,7 +301,9 @@ def test_cyclic_pointers_released_on_worker_even_after_error(monkeypatch, isolat
     api.client.CreateObject.side_effect = lambda *a, **kw: Pointer("automation")
     monkeypatch.setattr(uia, "comtypes", api)
 
-    assert uia.text_before_caret(5) == ("draft" if failure in (None, "release") else None)
+    expected = ("draft" if failure in (None, "release") else
+                CaretReadStatus.UNSAFE if failure in ("selected", "multiple") else None)
+    assert uia.text_before_caret(5) == expected
     assert initialized != [threading.get_ident()]
     assert released == list(reversed(created))
     assert all(not pointer for pointer in pointers)

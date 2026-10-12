@@ -7,7 +7,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from debora_whisper.platforms.base import Platform
+from debora_whisper.platforms.base import CaretReadStatus, Platform
 from debora_whisper.platforms import windows_text, windows_uia
 
 _RENDER = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
@@ -89,7 +89,7 @@ class WindowsPlatform(Platform):
     def input_target(self):
         return windows_text.input_target()
 
-    def text_before_caret(self, count: int) -> str | None:
+    def text_before_caret(self, count: int) -> str | CaretReadStatus | None:
         return windows_uia.text_before_caret(count)
 
     def same_input_target(self, a, b) -> bool:

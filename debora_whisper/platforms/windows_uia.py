@@ -1,7 +1,10 @@
 """Best-effort caret verification; no COM objects leave the UIA thread."""
 import ctypes
+import ntpath
 import queue
 import threading
+
+from debora_whisper.platforms.base import CaretReadStatus
 
 try:
     # Import before starting our worker: comtypes initializes its importing
@@ -16,7 +19,7 @@ _query_lock = threading.Lock()
 _worker = None
 
 
-def text_before_caret(count: int) -> str | None:
+def text_before_caret(count: int) -> str | CaretReadStatus | None:
     """Wait at most 150 ms, including type-library generation on first use.
 
     A hung provider holds the single slot; later calls return unknown rather
@@ -73,7 +76,20 @@ def _release(pointer):
             ctypes.c_void_p.value.__set__(pointer, None)
 
 
-def _read_text_before_caret(count: int, api) -> str | None:
+def _system_uia_path() -> str:
+    # Never let comtypes search the working directory for a type library.
+    kernel32 = ctypes.WinDLL("kernel32.dll", winmode=0x00000800)
+    get_system_directory = kernel32.GetSystemDirectoryW
+    get_system_directory.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+    get_system_directory.restype = ctypes.c_uint
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_system_directory(buffer, len(buffer))
+    if not 0 < length < len(buffer) or not ntpath.isabs(buffer.value):
+        raise OSError("Windows system directory unavailable")
+    return ntpath.join(buffer.value, "UIAutomationCore.dll")
+
+
+def _read_text_before_caret(count: int, api) -> str | CaretReadStatus | None:
     owned = []
 
     def own(pointer):
@@ -81,7 +97,7 @@ def _read_text_before_caret(count: int, api) -> str | None:
         return pointer
 
     try:
-        uia = api.client.GetModule("UIAutomationCore.dll")
+        uia = api.client.GetModule(_system_uia_path())
         automation = own(api.client.CreateObject(uia.CUIAutomation, interface=uia.IUIAutomation))
         element = own(automation.GetFocusedElement())
         raw_pattern = own(element.GetCurrentPattern(uia.UIA_TextPattern2Id))
@@ -91,12 +107,14 @@ def _read_text_before_caret(count: int, api) -> str | None:
         if not active or not caret:
             return None
         selection = own(pattern.GetSelection())
-        if selection.Length != 1:
+        if selection.Length > 1:
+            return CaretReadStatus.UNSAFE
+        if selection.Length == 0:
             return None
         selected = own(selection.GetElement(0))
         if selected.CompareEndpoints(uia.TextPatternRangeEndpoint_Start,
                                      selected, uia.TextPatternRangeEndpoint_End) != 0:
-            return None
+            return CaretReadStatus.UNSAFE
         before = own(caret.Clone())
         before.MoveEndpointByUnit(uia.TextPatternRangeEndpoint_Start,
                                   uia.TextUnit_Character, -count)
