@@ -5,6 +5,7 @@ keyboard path with no-op native fallbacks when support is unknown.
 """
 import threading
 import time
+import unicodedata
 
 
 def input_target():
@@ -58,6 +59,40 @@ def same_input_target(a, b) -> bool:
 def type_draft(text: str):
     """Paste live drafts through the same serialized path as final text."""
     type_text(text)
+
+
+def can_backspace_draft(text: str) -> bool:
+    """Only allow characters with unambiguous single-Backspace deletion.
+
+    Reject non-BMP/surrogates, marks, controls (including joiners), and Hangul
+    Jamo sequences. Terminals disagree on code-unit versus grapheme deletion.
+    Precomposed accents such as é remain supported.
+    """
+    return all(ord(c) <= 0xFFFF and unicodedata.category(c)[0] not in "MC"
+               and not (0x1100 <= ord(c) <= 0x11FF
+                        or 0xA960 <= ord(c) <= 0xA97F
+                        or 0xD7B0 <= ord(c) <= 0xD7FF) for c in text)
+
+
+def backspace_text(count: int, *, fallback=None):
+    """Trim a terminal tail without Shift or cursor movement."""
+    if count <= 0:
+        return
+    try:
+        import keyboard
+        for _ in range(count):
+            keyboard.send("backspace")
+            time.sleep(0.001)
+    except ImportError:
+        (fallback or _backspace_text_ctypes)(count)
+
+
+def _backspace_text_ctypes(count: int):
+    import ctypes
+    for _ in range(count):
+        ctypes.windll.user32.keybd_event(0x08, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0x08, 0, 0x0002, 0)
+        time.sleep(0.001)
 
 
 def delete_text(count: int, *, fallback=None):

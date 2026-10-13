@@ -119,6 +119,7 @@ def _read_text_before_caret(count: int, api) -> str | CaretReadStatus | None:
         before.MoveEndpointByUnit(uia.TextPatternRangeEndpoint_Start,
                                   uia.TextUnit_Character, -count)
         text = before.GetText(-1)
+        # A readable empty field / count-zero probe returns "", not unknown.
         return str(text) if isinstance(text, str) else None
     except Exception:
         # Exceptions and their tracebacks must also stay on the worker.

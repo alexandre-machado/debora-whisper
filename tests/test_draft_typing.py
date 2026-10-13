@@ -1,11 +1,12 @@
 """Live drafts typed into the target window and corrected in place."""
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pytest
 
 from debora_whisper import dictation_engine as de
 from debora_whisper.dictation_engine import AppState, DictationApp, DEFAULT_CONFIG
+from debora_whisper.platforms.base import CaretReadStatus
 
 AUDIO = np.zeros(16000, dtype=np.float32)
 
@@ -43,6 +44,8 @@ def screen():
             patch.object(de, "type_draft_text", side_effect=s.type_draft), \
             patch.object(de, "delete_text", side_effect=s.delete), \
             patch.object(de, "get_input_target", side_effect=lambda: s.target), \
+            patch.object(de.platforms.current(), "text_before_caret",
+                         side_effect=lambda count: s.text[-count:] if count else ""), \
             patch("keyboard.press_and_release") as key:
         key.side_effect = lambda k: setattr(s, "enters", s.enters + 1)
         yield s
@@ -91,28 +94,206 @@ def test_drafts_stay_in_overlay_by_default(screen):
     assert screen.text == "Olá, tudo bem? "
 
 
-@pytest.mark.parametrize("verified", [True, False])
-def test_verified_or_unknown_draft_keeps_legacy_rewrite(screen, monkeypatch, verified):
+@pytest.fixture
+def terminal(screen, monkeypatch):
+    """A TUI where Shift+Left moves the caret without selecting anything."""
+    from debora_whisper.platforms import windows_text
+    import keyboard
+
+    screen.caret = 0
+    screen.keys = []
+
+    def insert(text, auto_enter=False):
+        screen.text = screen.text[:screen.caret] + text + screen.text[screen.caret:]
+        screen.caret += len(text)
+        screen.enters += bool(auto_enter)
+
+    def key(name):
+        screen.keys.append(name)
+        if name == "left":
+            screen.caret = max(0, screen.caret - 1)
+        elif name == "backspace" and screen.caret:
+            screen.text = screen.text[:screen.caret - 1] + screen.text[screen.caret:]
+            screen.caret -= 1
+
+    def draft(text):
+        screen.drafted.append(text)
+        insert(text)
+
+    def final(text, auto_enter=False):
+        screen.pasted.append(text)
+        insert(text, auto_enter)
+
+    monkeypatch.setattr(de.type_text, "side_effect", final)
+    monkeypatch.setattr(de.delete_text, "side_effect", AssertionError("blind selection"))
+    monkeypatch.setattr(de.type_draft_text, "side_effect", AssertionError("draft paste"))
+    monkeypatch.setattr(windows_text, "_type_text_ctypes", draft)
+    monkeypatch.setattr(windows_text.time, "sleep", lambda seconds: None)
+    for name in ("send", "press", "release"):
+        monkeypatch.setattr(keyboard, name, key)
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", MagicMock(return_value=None))
+    return screen
+
+
+def test_unreadable_target_trims_only_tail_with_backspaces(terminal, capsys):
+    app = _app()
+    _say(app, "Olá tudo", is_final=False)
+    _say(app, "Olá tudo bem", is_final=False)
+    assert terminal.keys == ["backspace"] * len("... ")
+    assert terminal.drafted == ["Olá tudo... ", " bem... "]
+    _say(app, "Olá, tudo bem?", is_final=True)
+    assert terminal.keys == ["backspace"] * (len("... ") + len(" tudo bem... "))
+    assert terminal.pasted == [", tudo bem? "]
+    assert terminal.text == "Olá, tudo bem? "
+    de.platforms.current().text_before_caret.assert_called_once_with(0)
+    assert capsys.readouterr().out.count("Inline draft: target unreadable; trimming with Backspace") == 1
+
+
+def test_claude_code_growing_drafts_leave_only_final_text(terminal):
+    app = _app()
+    for draft in ("Inline drafts ligado", "Inline drafts ligado. Este texto aqui",
+                  "Inline drafts ligado. Este texto aqui já é usando",
+                  "Inline drafts ligado. Este texto aqui já é usando ele"):
+        _say(app, draft, is_final=False)
+    final = "Inline drafts ligado. Este texto aqui já é usando ele."
+    _say(app, final, is_final=True)
+    assert terminal.text == final + " "
+    assert set(terminal.keys) == {"backspace"}
+    assert len(terminal.drafted) == 4
+    assert len(terminal.pasted) == 1
+
+
+@pytest.mark.parametrize("final", ["", RuntimeError("failed final")])
+def test_terminal_empty_or_failed_final_resets_strategy(terminal, final):
+    app = _app()
+    _say(app, "Olá tudo", is_final=False)
+    _say(app, final, is_final=True)
+    assert terminal.text == ("Olá tudo... " if isinstance(final, Exception) else "")
+    assert app._draft_strategy is None
+    _say(app, "Nova frase", is_final=False)
+    assert de.platforms.current().text_before_caret.call_args_list == [call(0), call(0)]
+
+
+@pytest.mark.parametrize("complex_text", ["emoji 👍", "cafe\u0301", "mark \ufe0f", "join\u200der",
+                                         "hangul \u1100\u1161", "surrogate \ud83d"])
+@pytest.mark.parametrize("previous", [False, True])
+def test_terminal_complex_unicode_uses_overlay(terminal, complex_text, previous):
+    app = _app()
+    if previous:
+        _say(app, "Olá tudo", is_final=False)
+    _say(app, complex_text, is_final=False)
+    assert terminal.text == ""
+    assert app._inline_drafts_abandoned
+    _say(app, "Olá, tudo bem?", is_final=True)
+    assert terminal.text == "Olá, tudo bem? "
+    assert terminal.pasted == ["Olá, tudo bem? "]
+
+
+def test_terminal_focus_change_leaves_draft_and_abandons_segment(terminal):
+    app = _app()
+    _say(app, "Olá tudo", is_final=False)
+    terminal.target = ("other window", "field")
+    terminal.text, terminal.caret = "user text: ", len("user text: ")
+    _say(app, "Olá tudo bem", is_final=False)
+    _say(app, "Olá, tudo bem?", is_final=True)
+    assert terminal.text == "user text: Olá, tudo bem? "
+    assert terminal.keys == []
+
+
+def test_terminal_can_paste_complex_unicode_in_final(terminal):
+    app = _app()
+    _say(app, "Olá tudo", is_final=False)
+    _say(app, "Olá 👍 cafe\u0301", is_final=True)
+    assert terminal.text == "Olá 👍 cafe\u0301 "
+
+
+def test_native_backspace_fallback_sends_only_backspace(monkeypatch):
+    import ctypes
+    import sys
+    from debora_whisper.platforms import windows_text
+
+    monkeypatch.setitem(sys.modules, "keyboard", None)
+    monkeypatch.setattr(ctypes, "windll", MagicMock())
+    monkeypatch.setattr(windows_text.time, "sleep", lambda seconds: None)
+    de.platforms.current().backspace_text(3)
+    assert ctypes.windll.user32.keybd_event.call_args_list == [
+        call(0x08, 0, 0, 0), call(0x08, 0, 0x0002, 0)] * 3
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_readable_draft_keeps_verified_rewrite(screen, monkeypatch, strict):
     seen = []
 
     def read(count):
         seen.append(count)
-        return screen.text[-count:] if verified else None
+        return screen.text[-count:] if count else ""
 
     monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
-    app = _app()
+    app = _app(inline_drafts_require_verification=strict)
     _say(app, "Olá tudo", is_final=False)
     _say(app, "Olá tudo bem", is_final=False)
     _say(app, "Olá, tudo bem?", is_final=True)
-    assert seen == [len("Olá tudo... "), len("Olá tudo bem... ")]
+    assert seen == [0, len("Olá tudo... "), len("Olá tudo bem... ")]
     assert screen.text == "Olá, tudo bem? "
+    assert screen.drafted == ["Olá tudo... ", " bem... "]
     assert screen.pasted == [", tudo bem? "]
 
 
-@pytest.mark.parametrize("observed,strict", [("changed", False), ("", False), (None, True)])
+@pytest.mark.parametrize("observed,strict", [(None, True), (CaretReadStatus.UNSAFE, True),
+                                           (CaretReadStatus.UNSAFE, False)])
+def test_unreadable_target_keeps_drafts_in_overlay(screen, monkeypatch, capsys, observed, strict):
+    read = MagicMock(return_value=observed)
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    app = _app(inline_drafts_require_verification=strict)
+    app.is_recording = True
+    states = []
+    app.add_callback(lambda state, data: states.append(data))
+    message = "Inline draft: target text is unreadable; drafts stay in the overlay"
+
+    for _ in range(2):
+        read.reset_mock()
+        _say(app, "Olá tudo", is_final=False)
+        _say(app, "Olá tudo bem", is_final=False)
+        assert app._inline_drafts_abandoned
+        assert app._draft_typed_text == ""
+        assert app._draft_target is None
+        assert states[-1]["draft_text"] == "Olá tudo bem... "
+        assert app.last_draft_text == "Olá tudo bem... "
+        assert screen.drafted == []
+        _say(app, "Olá, tudo bem?", is_final=True)
+        # The final needs no additional caret read, including after a timeout.
+        read.assert_called_once_with(0)
+        assert not app._inline_drafts_abandoned
+        assert capsys.readouterr().out.count(message) == 1
+
+    assert screen.pasted == ["Olá, tudo bem? "] * 2
+    assert screen.text == "Olá, tudo bem? " * 2
+    assert message in de.LOG_FILE.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("existing", ["", "Existing text. "])
+def test_readable_target_allows_first_draft(screen, existing):
+    screen.text = existing
+    app = _app()
+    _say(app, "Olá tudo", is_final=False)
+    assert screen.drafted == ["Olá tudo... "]
+    assert screen.text == existing + "Olá tudo... "
+    assert not app._inline_drafts_abandoned
+    de.platforms.current().text_before_caret.assert_called_once_with(0)
+
+
+def test_final_without_drafts_does_not_probe(screen):
+    app = _app()
+    _say(app, "Olá tudo", is_final=True)
+    assert screen.pasted == ["Olá tudo "]
+    de.platforms.current().text_before_caret.assert_not_called()
+
+
+@pytest.mark.parametrize("observed,strict", [("changed", False), ("", False),
+                                           (None, True), (None, False)])
 @pytest.mark.parametrize("next_is_final", [False, True])
 def test_changed_draft_abandons_segment(screen, monkeypatch, capsys, observed, strict, next_is_final):
-    read = MagicMock(return_value=observed)
+    read = MagicMock(side_effect=lambda count: observed if count else "")
     monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
     app = _app(inline_drafts_require_verification=strict)
     app.is_recording = True
@@ -131,7 +312,7 @@ def test_changed_draft_abandons_segment(screen, monkeypatch, capsys, observed, s
     assert screen.text == kept + "Olá, tudo bem? "
     assert screen.drafted == ["Olá tudo... "]
     assert screen.pasted == ["Olá, tudo bem? "]
-    read.assert_called_once_with(len("Olá tudo... "))
+    assert read.call_args_list == [call(0), call(len("Olá tudo... "))]
     assert capsys.readouterr().out.count(
         "Inline draft: target changed; leaving the draft and typing the final") == 1
     assert not app._inline_drafts_abandoned

@@ -738,6 +738,10 @@ def typed():
     with patch.object(de, "type_text", side_effect=lambda t, auto_enter=False: out.append(t)), \
             patch.object(de, "type_draft_text", side_effect=lambda t: out.append(("draft", t))), \
             patch.object(de, "delete_text", side_effect=lambda n: out.append(("delete", n))), \
+            patch.object(de.platforms.current(), "type_draft_keys",
+                         side_effect=lambda t: out.append(("draft_keys", t))), \
+            patch.object(de.platforms.current(), "backspace_text",
+                         side_effect=lambda n: out.append(("backspace", n))), \
             patch.object(de, "get_input_target", return_value=("window", "field")):
         yield out
 
@@ -1483,15 +1487,24 @@ def test_switching_off_stops_the_reply_and_forgets_the_conversation():
     assert app.config["voice_chat"] is False
 
 
-def test_sentence_typed_as_dictation_goes_to_the_llm_after_the_switch(typed):
+@pytest.mark.parametrize("readable", [True, False], ids=["verified", "backspace"])
+def test_sentence_typed_as_dictation_goes_to_the_llm_after_the_switch(typed, monkeypatch, readable):
     app = _app(voice_chat=False, continuous_listening=True, inline_drafts=True)
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret",
+                        lambda count: app._draft_typed_text[-count:] if readable else None)
     app.is_recording = True
     _say(app, "ola tudo", is_final=False)  # typed as a dictation draft
+    draft_method, delete_method = ("draft", "delete") if readable else ("draft_keys", "backspace")
+    assert typed == [(draft_method, "ola tudo... ")]
     app.config["voice_chat"] = True
     with patch.object(app.voice_chat, "respond", return_value="Oi!") as respond:
         _say(app, "ola tudo bem")
     respond.assert_called_once()
-    assert typed == [("draft", "ola tudo... "), ("delete", len("ola tudo... "))]
+    assert respond.call_args.args[0] == "ola tudo bem"
+    assert typed == [(draft_method, "ola tudo... "), (delete_method, len("ola tudo... "))]
+    assert app._draft_typed_text == ""
+    assert app._draft_target is None
+    assert app._draft_strategy is None
 
 
 def _gui(**config):
