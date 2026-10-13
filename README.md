@@ -210,14 +210,27 @@ limit still apply; push-to-talk and voice chat keep their existing behavior.
 
 In continuous dictation, drafts appear in the overlay and each finished
 sentence is pasted once. `inline_drafts: true` also types drafts into the
-target window and rewrites them in place with Shift+Left and Backspace. On
-Windows, UI Automation checks the previous draft before rewriting. If the
-text changed, the draft stays, further drafts use only the overlay, and the
-final is pasted in full. Unsupported controls or reads exceeding 150 ms keep
-the legacy rewrite behavior. Set `inline_drafts_require_verification: true`
-to leave the draft and use only the overlay until the final in those cases
-too. This guard still has a race between reading the caret and sending keys;
-overlay-only drafts remain the default.
+target window. Before the first draft of each segment, Windows probes UI
+Automation with a 150 ms budget (an empty field counts as readable). Readable
+targets retain the verified Shift+Left/Backspace path: the entire previous
+draft must match before rewriting its differing tail. A mismatch or lost
+readability leaves the draft, keeps subsequent drafts in the overlay, and
+pastes the final in full.
+
+Unreadable targets, including terminal TUIs, keep the common prefix and erase
+only the differing tail with one Backspace per character. Draft tails use
+Unicode key packets; the final tail can use clipboard paste. This fallback
+never uses Shift+Left. Drafts with non-BMP characters (such as emoji), combining
+marks, joiners, controls, or Hangul Jamo stay in the overlay because terminal
+deletion counts differ; any preceding simple draft is erased first if focus
+still matches. Precomposed accents such as `é` work inline. Focus changes leave
+the old draft and stop inline output for the segment.
+
+Set `inline_drafts_require_verification: true` (default `false`) to keep all
+drafts in unreadable targets in the overlay and paste the final once. Strategy
+selection never probes for a final-only segment. The Backspace fallback cannot
+detect caret moves or edits within the same target; UIA verification also has
+a race between reading and sending keys. Overlay-only drafts remain the default.
 
 ### Voice chat with Claude Code
 

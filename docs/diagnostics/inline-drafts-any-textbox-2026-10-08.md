@@ -8,7 +8,7 @@ any editable control.
 
 ## Why the current inline mode cannot be made universal
 
-Inline mode types a draft, then rewrites it with Shift+Left × N and
+At the time of this study, inline mode typed a draft, then rewrote it with Shift+Left × N and
 Backspace. This is correct only if the N characters before the caret still
 match the typed draft. Nothing guarantees that:
 
@@ -224,14 +224,52 @@ legacy `keys` mode, not as a path to "any text box".
 TextPattern2 caret and a single empty selection. The entire previous draft
 must match exactly before rewriting even its differing tail. A mismatch
 leaves the draft, abandons inline output for that segment, and pastes the
-final in full. Unknown reads preserve legacy behavior unless
-`inline_drafts_require_verification: true` (default false).
+final in full. The initial implementation preserved blind rewriting for
+unknown reads; the terminal fallback below supersedes that behavior.
 The caller waits at most 150 ms on a single daemon MTA worker, including
 first-use type-library generation. Only one query may run at a time: a hung
 provider makes subsequent reads unknown without accumulating workers; late
 results are discarded. UIA pointers are explicitly released and cleared on
 the worker, including intermediate interfaces and failure paths, so later
 cyclic garbage collection cannot release them again on another thread.
+
+**Terminal fallback (2026-10-13):** The reported Claude Code TUI output
+(`InDrafts ligado. Este texto aqui já é usando ele. drafts ligado. Este texto
+aqui já é usando... ne Drafs liga. Este texto aqui.  este texto aqui. . ...`)
+had no "target changed" log. UIA returned `None`, so the old unknown-read path
+sent Shift+Left even though the TUI interpreted it as caret movement without
+selection. Each replacement spliced another draft into the buffer.
+
+The strategy is now selected once per segment, before its first inline draft,
+using the same bounded UIA worker. A string, including `""`, selects the existing
+exact-match verification path. If that target later becomes unreadable, inline
+output is abandoned; blind Shift+Left is never used. `None` selects the original
+`da84190`/`0218339` common-prefix algorithm: erase only the differing tail with
+one Backspace per character and type the new draft tail as Unicode key packets,
+without a clipboard transaction. The final tail still supports clipboard paste.
+This reverses the terminal-incompatible deletion introduced in `2d0afd6` and
+avoids the draft paste path introduced in `03d4939` for unreadable targets.
+The segment logs once: `Inline draft: target unreadable; trimming with Backspace`.
+
+With `inline_drafts_require_verification: true` (default `false`), an unreadable
+target receives no inline drafts; the final is typed once. The segment logs once:
+`Inline draft: target text is unreadable; drafts stay in the overlay`. Unsafe
+selections also keep drafts in the overlay. Final-only segments never probe;
+fallback finals do not repeat the probe or wait for a timed-out UIA worker.
+
+The fallback allows only simple BMP characters: non-BMP characters/surrogates,
+combining marks, controls/joiners, and Hangul Jamo disable inline drafts for
+the rest of the segment. A preceding simple draft is erased if focus matches,
+then the final is typed once. This avoids guessing whether a terminal deletes
+code units, code points, or grapheme clusters. Precomposed Portuguese accents
+remain supported. The same-input-target check applies before every deletion;
+a focus change leaves the old draft and abandons inline output for the segment.
+Caret movement and user edits within an unreadable target remain undetectable.
+
+Regression tests simulate a terminal where Shift+Left moves without selecting,
+including successive growing Portuguese drafts followed by a final. They check
+exact tail Backspace counts, Unicode draft insertion, no leftover text, strict
+overlay mode, empty readable fields, and unchanged readable-target verification.
 The worker keeps COM initialized for the process lifetime; it never calls
 `CoUninitialize`, which could invalidate comtypes' internal type-library
 cycles. Tests block real UIA at the module boundary and inject fake APIs.

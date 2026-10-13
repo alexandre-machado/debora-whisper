@@ -277,11 +277,16 @@ def test_stop_waits_for_paste_in_progress(genai, isolate_desktop):
     app.ensure_model()
     app._model_ready.set()
     events, entered, release = [], threading.Event(), threading.Event()
+    paste_timed_out = threading.Event()
 
     def paste(text, auto_enter=False):
+        assert app._output_lock.locked(), "paste ran outside _output_lock"
         events.append("paste_start")
         entered.set()
-        assert release.wait(5)
+        released = release.wait(5)
+        if not released:
+            paste_timed_out.set()
+        assert released, "paste timed out waiting for the test to release it"
         events.append("paste_end")
 
     isolate_desktop.side_effect = paste
@@ -295,11 +300,18 @@ def test_stop_waits_for_paste_in_progress(genai, isolate_desktop):
 
     stop_thread = threading.Thread(target=stopper, daemon=True)
     stop_thread.start()
-    stop_thread.join(0.3)
-    assert stop_thread.is_alive(), "stop() returned while a paste was in progress"
-    release.set()
-    stop_thread.join(5)
-    worker.join(5)
+    try:
+        stop_thread.join(0.3)
+        assert not paste_timed_out.is_set(), (
+            "test thread resumed after the paste timed out; "
+            "this does not demonstrate stop() bypassing _output_lock"
+        )
+        assert app._output_lock.locked(), "paste released _output_lock too early"
+        assert stop_thread.is_alive(), "stop() returned while a paste was in progress"
+    finally:
+        release.set()
+        stop_thread.join(5)
+        worker.join(5)
     assert events == ["paste_start", "paste_end", "stop_returned"]
     assert len(app.history) == 1
 

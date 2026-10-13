@@ -59,9 +59,9 @@ DEFAULT_CONFIG = {
     "voice_chat_hotkey": "right alt",  # Tapped alone, switches voice chat; "" disables
     "auto_enter": False,       # Press Enter after pasting (useful for Claude Code)
     # Continuous drafts: shown in the overlay only, or also typed into the
-    # target and rewritten with Shift+Left, verified when the OS supports it.
+    # target with verified selection or an unreadable target's Backspace tails.
     "inline_drafts": False,
-    "inline_drafts_require_verification": False,  # Unknown target: leave draft
+    "inline_drafts_require_verification": False,  # Unknown target: Backspace tails
     "beep_on_start": True,     # Audio feedback when recording starts/stops
     "max_record_seconds": 60,  # Max recording length
     "sample_rate": 16000,      # Whisper expects 16kHz
@@ -2558,6 +2558,7 @@ class DictationApp:
         self._draft_typed_text = ""
         self._draft_target = None
         self._inline_drafts_abandoned = False
+        self._draft_strategy = None
         self.voice_chat = VoiceChat(config, log=log, tts_log_path=TTS_SERVER_LOG,
                                     llm_log_path=LLM_SERVER_LOG)
         self.recorder.on_voice = self._voice_activity
@@ -2957,9 +2958,10 @@ class DictationApp:
 
     def _verify_draft_locked(self):
         """Caller holds _output_lock. A changed target ends inline output."""
+        if self._draft_strategy == "backspace":
+            return True
         observed = platforms.current().text_before_caret(len(self._draft_typed_text))
-        if (observed == self._draft_typed_text or
-                (observed is None and not self.config.get("inline_drafts_require_verification"))):
+        if observed == self._draft_typed_text:
             return True
         self._inline_drafts_abandoned = True
         self._draft_typed_text = ""
@@ -2967,18 +2969,38 @@ class DictationApp:
         log("Inline draft: target changed; leaving the draft and typing the final")
         return False
 
+    def _choose_draft_strategy_locked(self):
+        """Probe once per segment, only before a draft, on the bounded worker."""
+        observed = platforms.current().text_before_caret(0)
+        if isinstance(observed, str):
+            self._draft_strategy = "verified"
+        elif observed is None and not self.config.get("inline_drafts_require_verification", False):
+            self._draft_strategy = "backspace"
+            log("Inline draft: target unreadable; trimming with Backspace")
+        else:
+            self._draft_strategy = "overlay"
+            self._inline_drafts_abandoned = True
+            log("Inline draft: target text is unreadable; drafts stay in the overlay")
+
+    def _delete_draft_tail_locked(self, count):
+        if self._draft_strategy == "backspace":
+            platforms.current().backspace_text(count)
+        else:
+            delete_text(count)
+
     def _forget_draft_locked(self, erase: bool):
         """Stop tracking the typed draft, first erasing it if asked and keys
         still land where it was typed. Caller holds _output_lock."""
         if erase and self._draft_typed_text:
             if same_input_target(get_input_target(), self._draft_target):
                 if self._verify_draft_locked():
-                    delete_text(len(self._draft_typed_text))
+                    self._delete_draft_tail_locked(len(self._draft_typed_text))
             else:
                 log("Input focus changed; leaving the draft where it was typed.")
         self._draft_typed_text = ""
         self._draft_target = None
         self._inline_drafts_abandoned = False
+        self._draft_strategy = None
 
     def _finish_recording(self, generation=None, audio=None, is_final=True,
                           segment_id=None, audio_end=None, captured_at=None):
@@ -3097,14 +3119,29 @@ class DictationApp:
                         # typed, if keys still land where it was typed.
                         target = get_input_target()
                         text_to_type = text
+                        if (not is_final and self.config.get("inline_drafts")
+                                and not self._inline_drafts_abandoned):
+                            if self._draft_strategy is None:
+                                self._choose_draft_strategy_locked()
+                            if (self._draft_strategy == "backspace"
+                                    and not platforms.current().can_backspace_draft(text)):
+                                # Remove only the previous, simple-character draft.
+                                # Never inline text whose deletion count is ambiguous.
+                                self._forget_draft_locked(erase=True)
+                                self._draft_strategy = "overlay"
+                                self._inline_drafts_abandoned = True
+                                log("Inline draft: complex Unicode; drafts stay in the overlay")
                         if self._draft_typed_text:
                             if same_input_target(target, self._draft_target):
                                 if self._verify_draft_locked():
                                     common = os.path.commonprefix([self._draft_typed_text, text])
-                                    delete_text(len(self._draft_typed_text) - len(common))
+                                    self._delete_draft_tail_locked(len(self._draft_typed_text) - len(common))
                                     text_to_type = text[len(common):]
                             else:
                                 log("Input focus changed; leaving the draft where it was typed.")
+                                self._draft_typed_text = ""
+                                self._draft_target = None
+                                self._inline_drafts_abandoned = True
 
                         if is_final:
                             if text_to_type:
@@ -3115,6 +3152,7 @@ class DictationApp:
                             self._draft_typed_text = ""
                             self._draft_target = None
                             self._inline_drafts_abandoned = False
+                            self._draft_strategy = None
                             log(f"Final transcription: {text.strip()}")
 
                             self._history.append({
@@ -3125,8 +3163,10 @@ class DictationApp:
                             if len(self._history) > self.MAX_HISTORY:
                                 self._history = self._history[-self.MAX_HISTORY:]
                         elif self.config.get("inline_drafts") and not self._inline_drafts_abandoned:
-                            # It's a draft. Type it so the user sees it real-time.
-                            type_draft_text(text_to_type)
+                            if self._draft_strategy == "backspace":
+                                platforms.current().type_draft_keys(text_to_type)
+                            else:
+                                type_draft_text(text_to_type)
                             self._draft_typed_text = text
                             self._draft_target = target
 

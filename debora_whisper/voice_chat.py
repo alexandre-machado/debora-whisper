@@ -743,6 +743,7 @@ def stop_tts_server():
         process.wait(5)
     except subprocess.TimeoutExpired:
         process.kill()
+        process.wait(5)
 
 
 # ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match=key):
             validate_config({**DEFAULT_CONFIG, key: value})
 
-    def test_inline_verification_defaults_to_legacy(self):
+    def test_inline_verification_defaults_to_backspace(self):
         assert DEFAULT_CONFIG["inline_drafts_require_verification"] is False
         config = {key: value for key, value in DEFAULT_CONFIG.items() if not key.startswith("inline_drafts")}
         validate_config(config)

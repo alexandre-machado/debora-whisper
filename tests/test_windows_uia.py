@@ -62,13 +62,15 @@ def com(monkeypatch, isolated_worker):
                            pattern=pattern, caret=caret, selection=selection)
 
 
-def test_generic_caret_is_unknown():
-    assert Platform().text_before_caret(5) is None
+@pytest.mark.parametrize("count", [0, 5])
+def test_generic_caret_is_unknown(count):
+    assert Platform().text_before_caret(count) is None
 
 
-def test_new_windows_provider_cannot_reach_real_uia():
+@pytest.mark.parametrize("count", [0, 5])
+def test_new_windows_provider_cannot_reach_real_uia(count):
     assert uia.comtypes is None
-    assert WindowsPlatform().text_before_caret(5) is None
+    assert WindowsPlatform().text_before_caret(count) is None
     assert uia._worker is None
 
 
@@ -104,6 +106,15 @@ def test_type_library_ignores_working_directory(com, monkeypatch, tmp_path):
     ctypes.WinDLL.assert_called_once_with("kernel32.dll", winmode=0x00000800)
 
 
+@pytest.mark.parametrize("count", [0, 5])
+@pytest.mark.parametrize("observed", ["", None])
+def test_empty_readable_field_is_distinct_from_unknown(com, count, observed):
+    com.caret.Clone.return_value.GetText.return_value = observed
+    assert WindowsPlatform().text_before_caret(count) == observed
+    com.caret.Clone.return_value.MoveEndpointByUnit.assert_called_once_with(0, 0, -count)
+    com.caret.Clone.return_value.GetText.assert_called_once_with(-1)
+
+
 @pytest.mark.parametrize("length", [0, 32768, 40000])
 def test_system_directory_failure_does_not_load_type_library(com, system_directory, length):
     system_directory.side_effect = None
@@ -130,10 +141,9 @@ def test_engine_selection_prevents_draft_deletion(com, monkeypatch, strict,
     from debora_whisper import dictation_engine as de
 
     app = de.DictationApp({**de.DEFAULT_CONFIG, "beep_on_start": False,
-                          "continuous_listening": True, "inline_drafts": True})
-    assert app.config["inline_drafts_require_verification"] is False
-    if strict:
-        app.config["inline_drafts_require_verification"] = True
+                          "continuous_listening": True, "inline_drafts": True,
+                          "inline_drafts_require_verification": strict})
+    com.caret.Clone.return_value.GetText.return_value = ""
     app.recorder = MagicMock()
     app.whisper = MagicMock()
     app._model_ready.set()
@@ -181,7 +191,8 @@ def test_windows_unknown(com, condition):
     com.api.CoUninitialize.assert_not_called()
 
 
-def test_timeout_discards_late_result_and_bounds_workers(com):
+@pytest.mark.parametrize("count", [0, 5])
+def test_timeout_discards_late_result_and_bounds_workers(com, count):
     release = threading.Event()
     entered = threading.Event()
 
@@ -193,10 +204,10 @@ def test_timeout_discards_late_result_and_bounds_workers(com):
     com.pattern.GetCaretRange.side_effect = blocked
     try:
         start = time.monotonic()
-        assert WindowsPlatform().text_before_caret(5) is None
+        assert WindowsPlatform().text_before_caret(count) is None
         assert time.monotonic() - start < 0.75
         assert entered.is_set()
-        assert WindowsPlatform().text_before_caret(5) is None
+        assert WindowsPlatform().text_before_caret(count) is None
         com.api.CoInitializeEx.assert_called_once()
     finally:
         release.set()

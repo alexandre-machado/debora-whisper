@@ -86,6 +86,9 @@ class WindowsPlatform(Platform):
     def _delete_text_ctypes(self, count: int):
         return windows_text._delete_text_ctypes(count)
 
+    def _backspace_text_ctypes(self, count: int):
+        return windows_text._backspace_text_ctypes(count)
+
     def input_target(self):
         return windows_text.input_target()
 

@@ -30,6 +30,23 @@ class Platform:
         """Drafts share the final text's serialized clipboard transaction."""
         return self.type_text(text)
 
+    def type_draft_keys(self, text: str):
+        """Insert an unreadable target's draft without touching the clipboard."""
+        return self._type_text_ctypes(text)
+
+    def backspace_text(self, count: int):
+        """Erase a simple-character tail with individual Backspace keys."""
+        from debora_whisper.platforms import windows_text
+        return windows_text.backspace_text(count, fallback=self._backspace_text_ctypes)
+
+    def _backspace_text_ctypes(self, count: int):
+        """Native Backspace is unknown: no-op."""
+        pass
+
+    def can_backspace_draft(self, text: str) -> bool:
+        from debora_whisper.platforms import windows_text
+        return windows_text.can_backspace_draft(text)
+
     def delete_text(self, count: int):
         """Keep keyboard selection/deletion; native support is unknown."""
         from debora_whisper.platforms import windows_text
@@ -48,7 +65,11 @@ class Platform:
         return None
 
     def text_before_caret(self, count: int) -> str | CaretReadStatus | None:
-        """Text before the caret, UNSAFE for selections, or None if unavailable."""
+        """Text before the caret, UNSAFE for selections, or None if unavailable.
+
+        Count zero probes readability: return "" for a readable caret, even
+        in an empty field; never treat unavailable text as an empty string.
+        """
         return None
 
     def same_input_target(self, a, b) -> bool:
