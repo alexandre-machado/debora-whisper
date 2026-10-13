@@ -289,6 +289,39 @@ def test_final_without_drafts_does_not_probe(screen):
     de.platforms.current().text_before_caret.assert_not_called()
 
 
+@pytest.mark.parametrize("readable", [True, False])
+def test_draft_probe_rewrite_and_final_hold_output_lock(screen, monkeypatch, readable):
+    app = _app()
+    provider = de.platforms.current()
+    calls = []
+
+    def guarded(name, action):
+        def run(*args, **kwargs):
+            assert app._output_lock.locked(), f"{name} ran outside _output_lock"
+            calls.append(name)
+            return action(*args, **kwargs)
+        return run
+
+    monkeypatch.setattr(provider, "text_before_caret", guarded(
+        "probe", lambda count: (screen.text[-count:] if count else "") if readable else None))
+    monkeypatch.setattr(de.type_text, "side_effect", guarded("final", screen.paste))
+    if readable:
+        monkeypatch.setattr(de.type_draft_text, "side_effect", guarded("draft", screen.type_draft))
+        monkeypatch.setattr(de.delete_text, "side_effect", guarded("delete", screen.delete))
+    else:
+        monkeypatch.setattr(provider, "type_draft_keys", guarded("draft", screen.type_draft))
+        monkeypatch.setattr(provider, "backspace_text", guarded("delete", screen.delete))
+
+    _say(app, "hello", is_final=False)
+    _say(app, "hello world", is_final=False)
+    _say(app, "hello world!", is_final=True)
+
+    assert calls == (["probe", "draft", "probe", "delete", "draft", "probe", "delete", "final"]
+                     if readable else ["probe", "draft", "delete", "draft", "delete", "final"])
+    assert screen.text == "hello world! "
+    assert not app._output_lock.locked()
+
+
 @pytest.mark.parametrize("observed,strict", [("changed", False), ("", False),
                                            (None, True), (None, False)])
 @pytest.mark.parametrize("next_is_final", [False, True])
