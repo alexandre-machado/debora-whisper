@@ -31,9 +31,9 @@ Campos legíveis continuam usando verificação exata do rascunho antes de
 `delete_text` (Shift+Left e Backspace) e `type_draft` (clipboard). Divergência
 ou perda de legibilidade abandona os rascunhos inline até o final do segmento.
 Campos ilegíveis usam `backspace_text` (uma tecla Backspace por caractere da
-cauda diferente) e `type_draft_keys` (pacotes Unicode via SendInput), preservando
+cauda diferente) e `type_draft` (clipboard serializado), preservando
 o prefixo comum. Nenhuma seleção cega com Shift+Left ocorre nesse caminho.
-O texto final pode usar clipboard. As teclas ficam em `windows_text.py`,
+O texto final usa o mesmo caminho de clipboard. As teclas ficam em `windows_text.py`,
 expostas por `base.py`/`windows.py`; o motor apenas escolhe a estratégia.
 
 `can_backspace_draft` rejeita caracteres fora do BMP, surrogates, marcas

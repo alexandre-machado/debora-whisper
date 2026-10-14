@@ -1494,7 +1494,7 @@ def test_sentence_typed_as_dictation_goes_to_the_llm_after_the_switch(typed, mon
                         lambda count: app._draft_typed_text[-count:] if readable else None)
     app.is_recording = True
     _say(app, "ola tudo", is_final=False)  # typed as a dictation draft
-    draft_method, delete_method = ("draft", "delete") if readable else ("draft_keys", "backspace")
+    draft_method, delete_method = ("draft", "delete") if readable else ("draft", "backspace")
     assert typed == [(draft_method, "ola tudo... ")]
     app.config["voice_chat"] = True
     with patch.object(app.voice_chat, "respond", return_value="Oi!") as respond:

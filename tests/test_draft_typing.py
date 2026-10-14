@@ -126,8 +126,9 @@ def terminal(screen, monkeypatch):
 
     monkeypatch.setattr(de.type_text, "side_effect", final)
     monkeypatch.setattr(de.delete_text, "side_effect", AssertionError("blind selection"))
-    monkeypatch.setattr(de.type_draft_text, "side_effect", AssertionError("draft paste"))
-    monkeypatch.setattr(windows_text, "_type_text_ctypes", draft)
+    monkeypatch.setattr(de.type_draft_text, "side_effect", draft)
+    monkeypatch.setattr(windows_text, "_type_text_ctypes",
+                        MagicMock(side_effect=AssertionError("Unicode draft packets")))
     monkeypatch.setattr(windows_text.time, "sleep", lambda seconds: None)
     for name in ("send", "press", "release"):
         monkeypatch.setattr(keyboard, name, key)
@@ -161,6 +162,93 @@ def test_claude_code_growing_drafts_leave_only_final_text(terminal):
     assert set(terminal.keys) == {"backspace"}
     assert len(terminal.drafted) == 4
     assert len(terminal.pasted) == 1
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["clipboard-fix", "pr45-replay"])
+@pytest.mark.parametrize("second, tail, deletes, final_tail", [
+    ("Oi Débora, tudo bem", "tudo bem... ", 4, "? "),
+    ("Oi Débora, tudo bem?", "tudo bem? ", 0, ""),
+])
+def test_notepad_report_output_sequence(screen, monkeypatch, legacy, second,
+                                       tail, deletes, final_tail):
+    """Draft 2 was not logged: cover both punctuation outcomes, down to INPUT.
+
+    The legacy branch reconstructs PR #45's emission, not Notepad's handling.
+    The fixed branch exercises real provider paste/restore and deletion code.
+    """
+    import ctypes
+    import keyboard
+    import pyperclip
+    from debora_whisper.platforms import windows_text
+
+    events = []
+    clipboard = ["original clipboard"]
+    pending = [False]
+
+    def copy(text):
+        events.append(("copy", text))
+        clipboard[0] = text
+
+    def paste_key(name):
+        assert name == "ctrl+v"
+        assert not pending[0]
+        events.append(("key", name))
+        pending[0] = True
+
+    def wait(seconds):
+        # The target reads after Ctrl+V, before the serialized restoration.
+        if pending[0]:
+            screen.text += clipboard[0]
+            events.append(("paste", clipboard[0]))
+            pending[0] = False
+
+    def backspace(name):
+        assert not pending[0]
+        assert name == "backspace"
+        events.append(("key", name))
+        screen.delete(1)
+
+    def send_input(count, ref, size):
+        assert count == 2
+        assert size == (40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28)
+        pair = [(p.type, p._input.ki.wVk, p._input.ki.wScan,
+                 p._input.ki.dwFlags, p._input.ki.time,
+                 bool(p._input.ki.dwExtraInfo)) for p in ref._obj]
+        events.append(("SendInput", pair))
+        screen.text += chr(pair[0][2])
+        return count
+
+    monkeypatch.setattr(ctypes, "windll", MagicMock(), raising=False)
+    ctypes.windll.user32.SendInput.side_effect = send_input
+    monkeypatch.setattr(pyperclip, "copy", copy)
+    monkeypatch.setattr(pyperclip, "paste", lambda: clipboard[0])
+    monkeypatch.setattr(keyboard, "press_and_release", paste_key)
+    monkeypatch.setattr(keyboard, "send", backspace)
+    monkeypatch.setattr(windows_text.time, "sleep", wait)
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", lambda count: None)
+    monkeypatch.setattr(de.type_text, "side_effect", windows_text.type_text)
+    monkeypatch.setattr(de.type_draft_text, "side_effect",
+                        windows_text._type_text_ctypes if legacy else windows_text.type_draft)
+
+    def insertion(text, unicode=False):
+        if not text:
+            return []
+        if unicode:
+            return [("SendInput", [(1, 0, ord(c), 4, 0, False),
+                                    (1, 0, ord(c), 6, 0, False)]) for c in text]
+        return [("copy", text), ("key", "ctrl+v"), ("paste", text),
+                ("copy", "original clipboard")]
+
+    app = _app()
+    _say(app, "Oi Débora,", is_final=False)
+    _say(app, second, is_final=False)
+    _say(app, "Oi Débora, tudo bem?", is_final=True)
+    assert events == (insertion("Oi Débora, ", legacy) + insertion(tail, legacy)
+                      + [("key", "backspace")] * deletes + insertion(final_tail))
+    assert screen.text == "Oi Débora, tudo bem? "
+    assert clipboard[0] == "original clipboard"
+    assert not pending[0]
+    assert app._draft_typed_text == ""
 
 
 @pytest.mark.parametrize("final", ["", RuntimeError("failed final")])
@@ -305,11 +393,10 @@ def test_draft_probe_rewrite_and_final_hold_output_lock(screen, monkeypatch, rea
     monkeypatch.setattr(provider, "text_before_caret", guarded(
         "probe", lambda count: (screen.text[-count:] if count else "") if readable else None))
     monkeypatch.setattr(de.type_text, "side_effect", guarded("final", screen.paste))
+    monkeypatch.setattr(de.type_draft_text, "side_effect", guarded("draft", screen.type_draft))
     if readable:
-        monkeypatch.setattr(de.type_draft_text, "side_effect", guarded("draft", screen.type_draft))
         monkeypatch.setattr(de.delete_text, "side_effect", guarded("delete", screen.delete))
     else:
-        monkeypatch.setattr(provider, "type_draft_keys", guarded("draft", screen.type_draft))
         monkeypatch.setattr(provider, "backspace_text", guarded("delete", screen.delete))
 
     _say(app, "hello", is_final=False)
@@ -557,22 +644,32 @@ def test_push_to_talk_final_still_shows_transcribing_and_done(screen):
     assert states == [AppState.PROCESSING, AppState.READY]
 
 
-def test_unicode_typing_sends_utf16_units(monkeypatch):
+@pytest.mark.parametrize("text", ["é👍", "Oi Débora, ", "tudo bem... ", "tudo bem? "])
+def test_unicode_typing_sends_utf16_units(monkeypatch, text):
     import ctypes
-    units = []
+    packets = []
 
     def send_input(count, inputs_ref, size):
-        key_down = inputs_ref._obj[0]
-        units.append(key_down._input.ki.wScan)
+        inputs = inputs_ref._obj
+        assert count == 2
+        assert size == ctypes.sizeof(inputs[0])
+        # Windows INPUT includes the mouse union and pointer-sized extra info.
+        assert size == (40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28)
+        packets.append([(p.type, p._input.ki.wVk, p._input.ki.wScan,
+                         p._input.ki.dwFlags, p._input.ki.time,
+                         bool(p._input.ki.dwExtraInfo)) for p in inputs])
         return count
 
     monkeypatch.setattr(ctypes, "windll", MagicMock())
     ctypes.windll.user32.SendInput.side_effect = send_input
     monkeypatch.setattr(de.time, "sleep", lambda s: None)
 
-    de._type_text_ctypes("é👍")
+    de._type_text_ctypes(text)
 
-    assert units == [0xE9, 0xD83D, 0xDC4D]
+    data = text.encode("utf-16-le")
+    units = [int.from_bytes(data[i:i + 2], "little") for i in range(0, len(data), 2)]
+    assert packets == [[(1, 0, unit, 4, 0, False), (1, 0, unit, 6, 0, False)]
+                       for unit in units]
 
 
 @pytest.fixture

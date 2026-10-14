@@ -10,13 +10,33 @@ try:
     # Import before starting our worker: comtypes initializes its importing
     # thread's apartment. Our process-lifetime worker explicitly uses MTA.
     import comtypes.client
-except Exception:
+except Exception as exc:
     comtypes = None
+    _import_failure = ("comtypes missing" if isinstance(exc, ModuleNotFoundError)
+                       and exc.name in ("comtypes", "comtypes.client")
+                       else f"comtypes import failed: {type(exc).__name__}")
+else:
+    _import_failure = "comtypes unavailable"
 
 
 _TIMEOUT = 0.150
 _query_lock = threading.Lock()
 _worker = None
+_warning_lock = threading.Lock()
+_warned_unavailable = False
+
+
+def _warn_unavailable(reason):
+    """Report a broken UIA installation once, separately from target failures."""
+    global _warned_unavailable
+    with _warning_lock:
+        if _warned_unavailable:
+            return
+        _warned_unavailable = True
+    from debora_whisper.dictation_engine import log
+    log(f"WARNING: Inline drafts: UI Automation unavailable ({reason}); "
+        "reinstall with `uv tool install --editable . --force` "
+        "(keep your installed extras, e.g. .[cuda]), then restart")
 
 
 def text_before_caret(count: int) -> str | CaretReadStatus | None:
@@ -26,7 +46,12 @@ def text_before_caret(count: int) -> str | CaretReadStatus | None:
     than accumulate requests. Late results are discarded, never reused.
     """
     global _worker
-    if comtypes is None or count < 0 or not _query_lock.acquire(blocking=False):
+    if count < 0:
+        return None
+    if comtypes is None:
+        _warn_unavailable(_import_failure)
+        return None
+    if not _query_lock.acquire(blocking=False):
         return None
     done = threading.Event()
     result = [None]
@@ -39,8 +64,9 @@ def text_before_caret(count: int) -> str | CaretReadStatus | None:
             thread.start()
             _worker = requests, thread
         _worker[0].put((count, result, done))
-    except Exception:
+    except Exception as exc:
         _query_lock.release()
+        _warn_unavailable(f"worker start failed: {type(exc).__name__}")
         return None
     return result[0] if done.wait(_TIMEOUT) else None
 
@@ -57,8 +83,8 @@ def _serve(api, requests):
                 api.CoInitializeEx(api.COINIT_MULTITHREADED)
                 initialized = True
             result[0] = _read_text_before_caret(count, api)
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn_unavailable(f"UIA initialization failed: {type(exc).__name__}")
         finally:
             _query_lock.release()
             done.set()
@@ -97,8 +123,12 @@ def _read_text_before_caret(count: int, api) -> str | CaretReadStatus | None:
         return pointer
 
     try:
-        uia = api.client.GetModule(_system_uia_path())
-        automation = own(api.client.CreateObject(uia.CUIAutomation, interface=uia.IUIAutomation))
+        try:
+            uia = api.client.GetModule(_system_uia_path())
+            automation = own(api.client.CreateObject(uia.CUIAutomation, interface=uia.IUIAutomation))
+        except Exception as exc:
+            _warn_unavailable(f"UIA initialization failed: {type(exc).__name__}")
+            return None
         element = own(automation.GetFocusedElement())
         raw_pattern = own(element.GetCurrentPattern(uia.UIA_TextPattern2Id))
         pattern = own(raw_pattern.QueryInterface(uia.IUIAutomationTextPattern2))

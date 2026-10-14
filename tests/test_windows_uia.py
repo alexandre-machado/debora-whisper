@@ -18,6 +18,7 @@ from debora_whisper.platforms import windows_uia as uia
 
 @pytest.fixture(autouse=True)
 def system_directory(monkeypatch):
+    monkeypatch.setattr(uia, "_warned_unavailable", False)
     def get_directory(buffer, size):
         buffer.value = r"C:\Windows\System32"
         return len(buffer.value)
@@ -353,3 +354,66 @@ def test_comtypes_import_failure_is_optional(monkeypatch, failure):
     monkeypatch.setattr(builtins, "__import__", importing)
     module = runpy.run_path(uia.__file__)
     assert module["text_before_caret"](5) is None
+
+
+@pytest.fixture
+def uia_warning_log(monkeypatch):
+    """Count UIA warnings independently of other tests' telemetry threads."""
+    from debora_whisper import dictation_engine as de
+
+    log = Mock()
+
+    def capture(message):
+        if message.startswith("WARNING: Inline drafts: UI Automation unavailable ("):
+            log(message)
+
+    monkeypatch.setattr(de, "log", capture)
+    return log
+
+
+def test_missing_comtypes_warns_once_on_first_use(monkeypatch, uia_warning_log):
+    real_import = builtins.__import__
+
+    def importing(name, *args, **kwargs):
+        if name == "comtypes.client":
+            raise ModuleNotFoundError("No module named 'comtypes'", name="comtypes")
+        return real_import(name, *args, **kwargs)
+
+    log = uia_warning_log
+    monkeypatch.setattr(builtins, "__import__", importing)
+    module = runpy.run_path(uia.__file__)
+    log.assert_not_called()
+    for count in (0, 5, 0):
+        assert module["text_before_caret"](count) is None
+    log.assert_called_once()
+    message = log.call_args.args[0]
+    assert "WARNING: Inline drafts: UI Automation unavailable (comtypes missing)" in message
+    assert "uv tool install --editable . --force" in message
+
+
+@pytest.mark.parametrize("phase", ["apartment", "library", "automation"])
+def test_uia_initialization_warns_once_and_can_recover(com, uia_warning_log, phase):
+    from debora_whisper import dictation_engine as de
+    log = uia_warning_log
+    method = {"apartment": com.api.CoInitializeEx,
+              "library": com.api.client.GetModule,
+              "automation": com.api.client.CreateObject}[phase]
+    method.side_effect = OSError("initialization failed")
+    for _ in range(2):
+        assert uia.text_before_caret(0) is None
+    # Deterministically reproduce unrelated logging from a surviving monitor.
+    telemetry = threading.Thread(target=de.log, args=("[Telemetry] ready CPU 0%",))
+    telemetry.start()
+    telemetry.join(timeout=3)
+    assert not telemetry.is_alive()
+    log.assert_called_once()
+    assert "UI Automation unavailable (UIA initialization failed: OSError)" in log.call_args.args[0]
+    method.side_effect = None
+    assert uia.text_before_caret(5) == "draft"
+    log.assert_called_once()
+
+
+def test_unsupported_target_does_not_warn_about_uia_installation(com, uia_warning_log):
+    com.element.GetCurrentPattern.side_effect = OSError("unsupported target")
+    assert uia.text_before_caret(0) is None
+    uia_warning_log.assert_not_called()
