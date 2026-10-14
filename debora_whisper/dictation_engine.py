@@ -564,6 +564,9 @@ class RestartRequiredError(RuntimeError):
 
 _device_failure_lock = threading.Lock()
 _device_failure: dict | None = None
+# Failed pipelines must outlive their engine, including its telemetry thread.
+# Their destructors can call into a lost driver and crash the process.
+_quarantined_models: list = []
 
 # Held by a transcription and by the LLM's compile (in its own process, on
 # the Arc iGPU): both times that compile overlapped an NPU inference, the
@@ -2648,8 +2651,9 @@ class DictationApp:
         try:
             import psutil
             process = psutil.Process()
-            while True:
-                cpu = psutil.cpu_percent(interval=5.0)
+            psutil.cpu_percent(interval=None)  # Prime the per-thread sample.
+            while not self._stopping.wait(5.0):
+                cpu = psutil.cpu_percent(interval=None)
                 mem = process.memory_info().rss / (1024 * 1024)
                 sys_mem = psutil.virtual_memory().percent
                 
@@ -2726,6 +2730,7 @@ class DictationApp:
             self._lost_device = self.config["device"]
             if self.whisper is not None:
                 self._quarantined_models.append(self.whisper)
+                _quarantined_models.append(self.whisper)
                 self.whisper = None
                 log(f"Quarantined model on lost {self._lost_device}: it will not "
                     f"be called or released again in this process.")
@@ -2746,6 +2751,7 @@ class DictationApp:
             return {"error": str(exc)}
         cause = f"{type(exc).__name__}: {exc}"
         if kind == "LATCHED":
+            self._quarantine_lost_model()
             failure = device_failure()
             self._load_error = failure["message"]
             self._model_ready.set()
@@ -3864,6 +3870,16 @@ class DictationApp:
                 return reason
             self._stopping.set()
         self.stop()
+        # No work can start after the idle reservation above. Release the
+        # healthy pipeline before Settings constructs/loads its replacement;
+        # the old engine may still be referenced by callbacks or history.
+        # A failed driver must never be entered, even by a destructor.
+        if not device_failure():
+            with self._model_lock:
+                self.whisper = None
+                self._model_ready.clear()
+            import gc
+            gc.collect()
         return None
 
     def stop(self):

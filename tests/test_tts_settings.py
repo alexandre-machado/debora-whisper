@@ -1,6 +1,7 @@
 """Settings and managed TTS switching, without a display, servers or models."""
 import threading
 import time
+import weakref
 from unittest.mock import MagicMock
 
 import pytest
@@ -203,7 +204,6 @@ def settings_gui(monkeypatch, engine_startup):
 
     monkeypatch.setattr(de, "AudioRecorder", MagicMock())
     monkeypatch.setattr(de, "ChimePlayer", MagicMock())
-    monkeypatch.setattr(de.DictationApp, "_monitor_resources", lambda self: None)
     monkeypatch.setattr(de.DictationApp, "start_background", MagicMock())
     monkeypatch.setattr(de.DictationApp, "_warm_up_voice_chat", MagicMock())
     monkeypatch.setattr(vc.VoiceChat, "interrupt", MagicMock())
@@ -215,7 +215,63 @@ def settings_gui(monkeypatch, engine_startup):
     gui._engine = de.DictationApp(gui._config)
     gui._overlay, gui._tray = MagicMock(), MagicMock()
     gui._settings_status, gui._settings_set_apply = MagicMock(), MagicMock()
-    return gui
+    yield gui
+    gui._engine.stop()
+    gui._engine._resource_thread.join(2)
+    assert not gui._engine._resource_thread.is_alive()
+
+
+def test_repeated_tts_changes_dispose_models_before_replacement(settings_gui, monkeypatch):
+    """Exercise Apply with the real telemetry thread and idle shutdown path."""
+    gui = settings_gui
+    models, retired = [], []
+
+    class Model:
+        def __init__(self):
+            # Model wrappers can contain cycles: dropping whisper alone is
+            # insufficient to reclaim their accelerator allocation promptly.
+            self.cycle = self
+
+    def load(engine, **kwargs):
+        assert all(model() is None for model in models)
+        engine.whisper = Model()
+        models.append(weakref.ref(engine.whisper))
+
+    monkeypatch.setattr(de.DictationApp, "start_background", load)
+    load(gui._engine)
+    try:
+        for change in ({"tts_voice": "isabel"}, {"tts_backend": "kokoro"},
+                       {"tts_voice": "debora"}, {"tts_backend": "chatterbox"}):
+            previous = gui._engine
+            retired.append(previous)  # Keep engines alive like pending callbacks.
+            assert previous._resource_thread.is_alive()
+            gui._on_settings_apply({**gui._config, **change})
+            assert gui._engine is not previous
+            assert previous.whisper is None
+            previous._resource_thread.join(2)
+            assert not previous._resource_thread.is_alive()
+            assert sum(model() is not None for model in models) == 1
+    finally:
+        gui._engine.stop_if_idle()
+        for engine in retired:
+            engine.stop()
+            engine._resource_thread.join(2)
+    assert all(model() is None for model in models)
+
+
+def test_idle_shutdown_releases_fallback_but_keeps_failed_model(settings_gui, monkeypatch):
+    gui = settings_gui
+    quarantine = []
+    monkeypatch.setattr(de, "_quarantined_models", quarantine)
+    failed = MagicMock()
+    gui._engine.whisper = failed
+    gui._engine._quarantine_lost_model()
+    gui._engine.whisper = MagicMock()  # Healthy fallback on another device.
+    fallback = weakref.ref(gui._engine.whisper)
+    assert gui._engine.stop_if_idle() is None
+    assert fallback() is None
+    assert quarantine == [failed]
+    assert gui._engine._quarantined_models == [failed]
 
 
 @pytest.mark.parametrize("warm_voice_chat", [False, True])
@@ -264,6 +320,10 @@ def test_apply_reconciles_managed_tts_in_dictation(
             assert gui._engine is previous
             onboarding.call_args.kwargs["on_done"]()
     finally:
+        # The replacement's telemetry lives until fixture teardown; only
+        # startup/reconciliation workers should have finished at this point.
+        workers = [worker for worker in workers
+                   if worker is not gui._engine._resource_thread]
         for worker in workers:
             worker.join(5)
     assert all(not worker.is_alive() for worker in workers)
