@@ -3163,10 +3163,10 @@ class DictationApp:
                             if len(self._history) > self.MAX_HISTORY:
                                 self._history = self._history[-self.MAX_HISTORY:]
                         elif self.config.get("inline_drafts") and not self._inline_drafts_abandoned:
-                            if self._draft_strategy == "backspace":
-                                platforms.current().type_draft_keys(text_to_type)
-                            else:
-                                type_draft_text(text_to_type)
+                            # Readability selects how to erase, not how to insert.
+                            # Avoid the Unicode-packet path implicated in the
+                            # Notepad report; serialize draft and final pastes.
+                            type_draft_text(text_to_type)
                             self._draft_typed_text = text
                             self._draft_target = target
 

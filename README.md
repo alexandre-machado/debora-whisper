@@ -218,8 +218,9 @@ readability leaves the draft, keeps subsequent drafts in the overlay, and
 pastes the final in full.
 
 Unreadable targets, including terminal TUIs, keep the common prefix and erase
-only the differing tail with one Backspace per character. Draft tails use
-Unicode key packets; the final tail can use clipboard paste. This fallback
+only the differing tail with one Backspace per character. Draft and final tails
+use serialized clipboard pastes, including when UI Automation is unavailable.
+This bypasses the Unicode-packet path implicated in the Notepad report. This fallback
 never uses Shift+Left. Drafts with non-BMP characters (such as emoji), combining
 marks, joiners, controls, or Hangul Jamo stay in the overlay because terminal
 deletion counts differ; any preceding simple draft is erased first if focus
@@ -231,6 +232,9 @@ drafts in unreadable targets in the overlay and paste the final once. Strategy
 selection never probes for a final-only segment. The Backspace fallback cannot
 detect caret moves or edits within the same target; UIA verification also has
 a race between reading and sending keys. Overlay-only drafts remain the default.
+
+Missing `comtypes` or failed UI Automation initialization produces one warning
+with reinstall instructions, separate from the per-target unreadable message.
 
 ### Voice chat with Claude Code
 
@@ -665,8 +669,10 @@ uv tool install --editable .
 ### Editable install with the NVIDIA backend
 
 The `cuda` extra adds faster-whisper and the CUDA runtime DLLs (~2 GB from
-PyPI). An editable install picks up code changes on restart, but changing
-extras needs a reinstall:
+PyPI). An editable install picks up code changes on restart, but dependency
+changes in `pyproject.toml` (including newly added dependencies such as `comtypes`)
+and changes to extras require a reinstall. After pulling such changes, reinstall
+from the checkout, keeping the extras you use, and restart the app:
 
 ```powershell
 uv tool install --editable ".[cuda]" --reinstall
