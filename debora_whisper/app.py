@@ -123,6 +123,7 @@ class GUIApp:
         previous = getattr(self, "_engine", None)
         if previous is not None:
             engine.restore_history(previous)
+            engine.warm_voice_chat = previous.warm_voice_chat
         engine.add_callback(self._on_state_change)
         engine.on_voice_chat_toggle = self._toggle_voice_chat
         return engine
@@ -423,6 +424,10 @@ class GUIApp:
         model_changed = new_config["model_size"] != self._config["model_size"]
         voice_chat = new_config.get("voice_chat", self._config.get("voice_chat"))
         voice_chat_changed = bool(voice_chat) != bool(self._config.get("voice_chat"))
+        tts_changed = any(
+            new_config.get(key, self._config.get(key)) != self._config.get(key)
+            for key in ("tts_backend", "tts_voice")
+        )
         harness_changed = any(
             new_config.get(key, self._config.get(key)) != self._config.get(key)
             for key in ("voice_chat_backend", "harness_cwd", "harness_model",
@@ -503,12 +508,12 @@ class GUIApp:
                 def _on_download_done():
                     self._settings_status("Loading model...", "#FF9F0A")
                     self._engine = self._new_engine()
-                    self._engine.start_background()
+                    self._engine.start_background(reconcile_tts=tts_changed)
                 onboarding = OnboardingWindow(self._root, self._config, on_done=_on_download_done)
                 onboarding.show()
             else:
                 self._engine = self._new_engine()
-                self._engine.start_background()
+                self._engine.start_background(reconcile_tts=tts_changed)
         else:
             self._settings_status("Settings saved.", "#30D158")
 

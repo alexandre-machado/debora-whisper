@@ -192,7 +192,12 @@ def test_restore_history_carries_dictation_and_conversation():
 
 
 @pytest.fixture
-def settings_gui(monkeypatch):
+def engine_startup():
+    return de.DictationApp.start_background, de.DictationApp._warm_up_voice_chat
+
+
+@pytest.fixture
+def settings_gui(monkeypatch, engine_startup):
     """Use real engine lifecycle and history, with hardware and GUI stubbed."""
     from debora_whisper.app import GUIApp
 
@@ -211,6 +216,78 @@ def settings_gui(monkeypatch):
     gui._overlay, gui._tray = MagicMock(), MagicMock()
     gui._settings_status, gui._settings_set_apply = MagicMock(), MagicMock()
     return gui
+
+
+@pytest.mark.parametrize("warm_voice_chat", [False, True])
+@pytest.mark.parametrize("download", [False, True])
+@pytest.mark.parametrize("change", ["backend", "voice"])
+def test_apply_reconciles_managed_tts_in_dictation(
+        settings_gui, managed_tts, engine_startup, monkeypatch,
+        warm_voice_chat, download, change):
+    gui = settings_gui
+    popen, kill, processes = managed_tts
+    gui._config.update(voice_chat=False, voice_chat_backend="claude",
+                       tts_backend="qwen3", tts_voice="debora")
+    previous = gui._engine
+    previous.warm_voice_chat = warm_voice_chat
+    vc.ensure_tts_server(gui._config)
+    changed = {**gui._config}
+    changed.update({"tts_backend": "kokoro"} if change == "backend"
+                   else {"tts_voice": "isabel"})
+    if download:
+        changed["model_size"] = next(
+            key for key in de.MODEL_REGISTRY if key != gui._config["model_size"])
+    onboarding = MagicMock()
+    gui._root = MagicMock()
+    monkeypatch.setitem(gui._on_settings_apply.__globals__, "is_model_downloaded", lambda _: False)
+    monkeypatch.setitem(gui._on_settings_apply.__globals__, "OnboardingWindow", onboarding)
+    for name, method in zip(("start_background", "_warm_up_voice_chat"), engine_startup):
+        monkeypatch.setattr(de.DictationApp, name, method)
+    for name in ("_start_loader", "_start_segment_consumer", "_register_voice_chat_hotkey"):
+        monkeypatch.setattr(de.DictationApp, name, MagicMock())
+    monkeypatch.setattr("keyboard.add_hotkey", MagicMock())
+    monkeypatch.setattr(vc.VoiceChat, "warm_tts", MagicMock())
+    # Run the real background paths and join them before restoring fixtures.
+    thread_class = threading.Thread
+    workers, stop_threads = [], []
+
+    def thread_factory(*args, **kwargs):
+        worker = thread_class(*args, **kwargs)
+        workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(de.threading, "Thread", thread_factory)
+    kill.side_effect = lambda _: stop_threads.append(threading.get_ident())
+    try:
+        gui._on_settings_apply(changed)
+        if download:
+            assert gui._engine is previous
+            onboarding.call_args.kwargs["on_done"]()
+    finally:
+        for worker in workers:
+            worker.join(5)
+    assert all(not worker.is_alive() for worker in workers)
+    assert gui._engine is not previous
+    assert gui._engine.warm_voice_chat is warm_voice_chat
+    assert gui._config["voice_chat"] is False
+    kill.assert_called_once_with(processes[0])
+    assert len(stop_threads) == 1 and stop_threads[0] != threading.get_ident()
+    assert popen.call_count == 2
+    assert vc._tts_process is processes[1]
+    command = popen.call_args.args[0]
+    assert str(vc.TTS_SERVER_SCRIPTS[changed["tts_backend"]]) in command
+    if change == "voice":
+        assert command[command.index("--voice") + 1].endswith("isabel.wav")
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_managed_only_reconciliation_does_not_start_or_probe_unmanaged_tts(managed_tts, external):
+    popen, kill, _ = managed_tts
+    vc.tts_server_up.return_value = external
+    vc.ensure_tts_server({**de.DEFAULT_CONFIG, "tts_backend": "kokoro"}, managed_only=True)
+    vc.tts_server_up.assert_not_called()
+    popen.assert_not_called()
+    kill.assert_not_called()
 
 
 @pytest.mark.parametrize("interrupted", [False, True])

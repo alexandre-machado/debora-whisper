@@ -718,13 +718,16 @@ def tts_server_up(config: dict) -> bool:
     return False
 
 
-def ensure_tts_server(config: dict, log=print, log_path=None):
+def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=False):
     """Start the TTS server (tts_command) if nothing answers at tts_url.
-    Called by the background engine loader; reuse only matching servers."""
+    Called by the background engine loader; reuse only matching servers.
+    With managed_only, reconcile settings only if we already own a server."""
     global _tts_process, _tts_server_key
     if not is_http_url(config.get("tts_url")):
         return
     with _tts_lock:
+        if managed_only and _tts_process is None:
+            return
         command = tts_command(config, log)
         key = (config.get("tts_backend", "chatterbox"), tuple(command) if command else None)
         if _tts_process is not None and _tts_server_key != key:

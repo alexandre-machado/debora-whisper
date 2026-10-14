@@ -3646,7 +3646,7 @@ class DictationApp:
 
     # -- Lifecycle -------------------------------------------------------
 
-    def start_background(self):
+    def start_background(self, *, reconcile_tts: bool = False):
         """Register hotkey and start model loading without blocking.
 
         Use this from GUI mode instead of ``run()`` — does NOT call
@@ -3663,6 +3663,14 @@ class DictationApp:
         self._start_loader()
         if self.config.get("voice_chat") or self.warm_voice_chat:
             self._warm_up_voice_chat()
+        elif reconcile_tts:
+            # Apply must switch a previously started TTS server even while
+            # dictating. Shutdown may wait on the process; keep it off Tk.
+            threading.Thread(
+                target=ensure_tts_server,
+                args=(self.config, log, TTS_SERVER_LOG),
+                kwargs={"managed_only": True}, daemon=True,
+            ).start()
         self._start_segment_consumer()
 
     def _register_voice_chat_hotkey(self, keyboard):
