@@ -28,10 +28,12 @@ def read_bounded(response, limit, deadline):
     """Read at most limit + 1 bytes, including from a continuously sending peer."""
     sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
     timer = None
+    aborted = threading.Event()
     if sock is not None:
         # Chunked HTTP framing may read multiple times inside read1(). Abort
         # the socket at the deadline even if those reads keep receiving data.
         def abort():
+            aborted.set()
             try:
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -43,7 +45,9 @@ def read_bounded(response, limit, deadline):
     try:
         return _read_chunks(response, limit, deadline)
     except (OSError, http.client.HTTPException) as exc:
-        if time.monotonic() >= deadline:
+        # Either way the deadline ended the read: the clock can read just short
+        # of it when the socket timeout or the abort timer fires (coarse on Windows).
+        if aborted.is_set() or isinstance(exc, TimeoutError) or time.monotonic() >= deadline:
             raise TimeoutError("Response read deadline exceeded") from exc
         raise
     finally:

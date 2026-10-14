@@ -20,11 +20,11 @@ import sys
 import threading
 import time
 import unicodedata
-import urllib.error
 import urllib.parse
-import urllib.request
 import wave
 from dataclasses import dataclass
+# Bound at import: tests replace threading.Timer to drive reply feedback.
+from threading import Timer as _DeadlineTimer
 from pathlib import Path
 
 from debora_whisper import paths
@@ -105,6 +105,9 @@ TTS_MAX_RESPONSE_BYTES = 50_000_000
 # How long the first reply waits for a TTS server this process started
 # (Chatterbox loads in ~15 s; uv builds its environment on the very first run).
 TTS_STARTUP_SECONDS = 180
+# One health check, start to finish: a peer trickling bytes cannot stretch it.
+TTS_HEALTH_SECONDS = 1.0
+TTS_HEALTH_MAX_BYTES = 64_000
 TTS_SERVER_SCRIPT = Path(__file__).with_name("tts_server.py")
 TTS_SERVER_SCRIPTS = {
     "chatterbox": TTS_SERVER_SCRIPT,
@@ -126,12 +129,6 @@ _EMOJI = re.compile(f"[{_EMOJI_CHAR}](?:[️⃣\U000E0020-\U000E007F]"
 
 def is_http_url(url) -> bool:
     return isinstance(url, str) and re.match(r"https?://", url, re.IGNORECASE) is not None
-
-
-def _opener():
-    # No proxies: the reply goes straight to the local TTS server, never
-    # through HTTP(S)_PROXY from the environment.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def speakable(text: str) -> str:
@@ -678,26 +675,46 @@ class TTSStartupError(RuntimeError):
     """The server is reachable, but its backend cannot finish startup."""
 
 
-def tts_server_up(config: dict) -> bool:
+def _shutdown_socket(sock):
     try:
-        url = config["tts_url"].rstrip("/") + "/health"
-        with _opener().open(url, timeout=1) as response:
-            return response.status == 200
-    except urllib.error.HTTPError as exc:
-        with exc:
-            if exc.code != 503:
-                return False
-            try:
-                raw = exc.read(64_001)
-                health = json.loads(raw) if len(raw) <= 64_000 else None
-            except (OSError, ValueError):
-                return False
-        if (isinstance(health, dict) and health.get("ok") is False
-                and isinstance(health.get("error"), str) and health["error"]):
-            raise TTSStartupError(health["error"])
-        return False
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def tts_server_up(config: dict) -> bool:
+    """True if /health answers 200; TTSStartupError if the server reports
+    a terminal startup error (503 with {"ok": false, "error": ...})."""
+    connection = timer = None
+    try:
+        target = urllib.parse.urlsplit(config["tts_url"].rstrip("/") + "/health")
+        connection_type = (http.client.HTTPSConnection if target.scheme == "https"
+                           else http.client.HTTPConnection)
+        connection = connection_type(target.hostname, target.port, timeout=TTS_HEALTH_SECONDS)
+        connection.connect()
+        # The socket timeout restarts with every byte, so a peer trickling its
+        # answer could hold this check (and _tts_lock) indefinitely. Closing
+        # the socket at an absolute deadline ends any read still blocked.
+        timer = _DeadlineTimer(TTS_HEALTH_SECONDS, _shutdown_socket, (connection.sock,))
+        timer.daemon = True
+        timer.start()
+        connection.request("GET", urllib.parse.urlunsplit(("", "", target.path, target.query, "")))
+        with connection.getresponse() as response:
+            if response.status != 503:
+                return response.status == 200
+            raw = response.read(TTS_HEALTH_MAX_BYTES + 1)
+        health = json.loads(raw) if len(raw) <= TTS_HEALTH_MAX_BYTES else None
     except Exception:
         return False
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if connection is not None:
+            connection.close()
+    if (isinstance(health, dict) and health.get("ok") is False
+            and isinstance(health.get("error"), str) and health["error"]):
+        raise TTSStartupError(health["error"])
+    return False
 
 
 def ensure_tts_server(config: dict, log=print, log_path=None):

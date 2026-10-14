@@ -4,6 +4,7 @@ import io
 import json
 import re
 import sys
+import socket
 import threading
 import time
 import urllib.error
@@ -1028,6 +1029,44 @@ def test_tts_server_up_needs_a_healthy_answer(server):
     assert vc.tts_server_up(config)
     server.health_status = 500
     assert not vc.tts_server_up(config)
+
+
+@pytest.mark.parametrize("status", [200, 503])
+def test_trickling_health_answer_cannot_stall_the_check(status):
+    # Each byte arrives before the socket timeout, so only an absolute
+    # deadline ends the check (it runs under _tts_lock at startup).
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    done = threading.Event()
+
+    def trickle():
+        conn, _ = listener.accept()
+        with conn:
+            conn.recv(4096)
+            head = (f"HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n"
+                    if status == 503 else "HTTP/1.1 200 OK\r\nX-Slow: ")
+            try:
+                if status == 503:
+                    conn.sendall(f"{head}Content-Length: 100000\r\n\r\n".encode())
+                for _ in range(100):
+                    if done.is_set():
+                        return
+                    conn.sendall(b"a")
+                    time.sleep(0.2)
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=trickle, daemon=True)
+    thread.start()
+    config = {**DEFAULT_CONFIG, "tts_url": f"http://127.0.0.1:{listener.getsockname()[1]}"}
+    started = time.monotonic()
+    try:
+        assert not vc.tts_server_up(config)
+    finally:
+        done.set()
+        listener.close()
+    assert time.monotonic() - started < vc.TTS_HEALTH_SECONDS + 1.5
 
 
 @pytest.mark.parametrize("error", [
