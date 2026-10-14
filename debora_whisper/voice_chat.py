@@ -1,5 +1,5 @@
 """Voice chat: each final transcription goes to a local LLM or Claude Code,
-and its reply is spoken aloud by the Chatterbox TTS server
+and its reply is spoken aloud by the configured TTS server
 (debora_whisper/tts_server.py, in its own uv environment).
 
 The reply is streamed and spoken sentence by sentence: the first sentence
@@ -106,6 +106,11 @@ TTS_MAX_RESPONSE_BYTES = 50_000_000
 # (Chatterbox loads in ~15 s; uv builds its environment on the very first run).
 TTS_STARTUP_SECONDS = 180
 TTS_SERVER_SCRIPT = Path(__file__).with_name("tts_server.py")
+TTS_SERVER_SCRIPTS = {
+    "chatterbox": TTS_SERVER_SCRIPT,
+    "qwen3": TTS_SERVER_SCRIPT.with_name("tts_server_qwen3.py"),
+    "kokoro": TTS_SERVER_SCRIPT.with_name("tts_server_kokoro.py"),
+}
 # Shorter sentences wait for the next one: "Opa!" alone sounds clipped, and
 # Chatterbox cannot speak a bare "OK" at all.
 TTS_MIN_CHARS = 16
@@ -639,23 +644,25 @@ def list_voices() -> list[str]:
 
 
 def tts_command(config: dict, log=print) -> list[str] | None:
-    """tts_server_command, or uv running tts_server.py on tts_url's port
+    """tts_server_command, or uv running the selected backend on tts_url's port
     with tts_voice (None if tts_url is not local or uv is missing)."""
     if config.get("tts_server_command"):
         return config["tts_server_command"]
     url = urllib.parse.urlparse(config.get("tts_url") or "")
     if url.hostname not in ("127.0.0.1", "localhost"):
         return None
+    backend = config.get("tts_backend", "chatterbox")
+    script = TTS_SERVER_SCRIPTS[backend]
     uv = shutil.which("uv")
     if not uv:
         log("Voice chat: uv not found on PATH; start the TTS server yourself "
-            f"(uv run --script {TTS_SERVER_SCRIPT}).")
+            f"(uv run --script {script}).")
         return None
-    command = [uv, "run", "--script", str(TTS_SERVER_SCRIPT), "--port", str(url.port or 80)]
+    command = [uv, "run", "--script", str(script), "--port", str(url.port or 80)]
     voice = resolve_voice(config.get("tts_voice"))
-    if voice is not None and voice.is_file():
+    if voice is not None and backend != "kokoro" and (voice.is_file() or backend == "qwen3"):
         command += ["--voice", str(voice)]
-    elif voice is not None:
+    elif voice is not None and backend == "chatterbox":
         log(f"Voice chat: voice {voice} not found; using Chatterbox's own voice.")
     if config.get("language") and config["language"] != "auto":
         command += ["--language", config["language"]]
@@ -868,7 +875,8 @@ class VoiceChat:
 
     def _select_tts_cache(self, config):
         """Called under the cache lock; settings changes discard the old voice."""
-        key = (config.get("tts_voice"), config.get("language"), config.get("tts_url"))
+        key = (config.get("tts_backend", "chatterbox"), config.get("tts_voice"),
+               config.get("language"), config.get("tts_url"))
         if key != self._tts_cache_key:
             self._tts_cache_key = key
             self._waiting_clip = None

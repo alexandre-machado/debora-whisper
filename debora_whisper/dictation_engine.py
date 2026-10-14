@@ -114,11 +114,12 @@ DEFAULT_CONFIG = {
     # file path, or a name looked up as <name>.wav in the voices folder
     # (paths.VOICES_DIR), then among the bundled voices (carol, debora,
     # debora_v2, isabel, mari). null: Chatterbox's own voice.
+    "tts_backend": "chatterbox",   # chatterbox, qwen3 (clone), kokoro (pf_dora)
     "tts_voice": "debora_v2",
     "tts_url": "http://127.0.0.1:8765",
     "tts_timeout_seconds": 60,
     # Command that starts the TTS server when nothing answers at tts_url.
-    # null: uv runs debora_whisper/tts_server.py with tts_voice.
+    # null: uv runs the script selected by tts_backend with tts_voice.
     "tts_server_command": None,
     # Diagnostics: keep the audio of the last transcription in
     # last_recording.wav (overwritten each time) to reproduce a bad result.
@@ -424,6 +425,8 @@ def validate_config(config: dict):
     if not isinstance(rules, list) or any(
             not isinstance(rule, str) or not rule.strip() for rule in rules):
         raise ValueError("harness_extra_allowed_tools must be a list of non-empty permission rules")
+    if config.get("tts_backend", "chatterbox") not in ("chatterbox", "qwen3", "kokoro"):
+        raise ValueError("tts_backend must be chatterbox, qwen3 or kokoro")
     voice = config.get("tts_voice")
     if voice is not None and (not isinstance(voice, str) or not voice.strip()):
         raise ValueError(f"tts_voice must be null or a file path or name, got {voice!r}")

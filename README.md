@@ -418,6 +418,7 @@ loaded until the app exits, so switching back is instant.
   "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
   "llm_device": "GPU",
   "llm_prompt": null,
+  "tts_backend": "chatterbox",
   "tts_voice": "debora_v2",
   "tts_url": "http://127.0.0.1:8765",
   "tts_timeout_seconds": 60,
@@ -446,16 +447,41 @@ neither shown nor spoken, and dates, times, percentages and numbers
 are spelled out (with `num2words`) before they reach Chatterbox, which reads
 digits badly; the overlay keeps the digits.
 
-The TTS is Chatterbox Multilingual on an NVIDIA GPU, served by
-`debora_whisper/tts_server.py`. It needs torch 2.6 with CUDA, so it never runs in
-the app's environment: the script declares its own dependencies and the app
+`tts_backend` selects `chatterbox` (the unchanged default), `qwen3` or `kokoro`.
+Each has its own server script (`tts_server.py`, `tts_server_qwen3.py` or
+`tts_server_kokoro.py`) and isolated uv environment with pinned dependencies;
+none runs in the app's environment. The app
 starts it with `uv run --script` (uv builds that environment on the first run,
 a few GB, and caches it). It is started only when nothing answers at
 `tts_url`, stopped when the app exits, and logs to
 `~/.debora/logs/tts_server.log`. `tts_server_command` replaces that
 command line (a list of arguments).
 
-`tts_voice` clones a voice from ~10 s of clean speech: a WAV path, or a name
+Set `tts_backend` in `~/.debora/config.json`, then restart the app and stop any
+manually started server at `tts_url` to switch backends. An already running
+server or `tts_server_command` takes precedence over script selection.
+All backends keep the same loopback HTTP API, Origin checks, disconnect
+cancellation and complete WAV responses; this stage does not add streaming.
+
+`qwen3` uses **Qwen3-TTS 0.6B Base** (`Qwen/Qwen3-TTS-12Hz-0.6B-Base`, Apache-2.0)
+to clone `tts_voice`. It requires a UTF-8 transcript at `<voice>.txt` beside the
+WAV. The confirmed transcript `debora_whisper/voices/debora_v2.txt` ships with
+the default voice. Other voices need their own exact transcript; a user WAV
+that overrides the bundled voice also needs its own sidecar. Missing or empty
+transcripts produce an actionable `/health` error; they are never guessed.
+`tts_voice: null` is unsupported by Qwen. It uses SDPA without FlashAttention.
+
+`kokoro` uses **Kokoro-82M** (Apache-2.0), voice **pf_dora**, language **p**
+(pt-BR). It has **no voice cloning** and ignores `tts_voice`. Install **espeak-ng**
+with pt-BR data; on Windows its 64-bit DLL may need `PHONEMIZER_ESPEAK_LIBRARY`.
+If unavailable, `/health` reports how to fix it. Both new backends accept
+`--device cpu` or `--device cuda` when launched manually (default CUDA, CPU
+fallback when unavailable).
+
+Stage 2 is implemented and **pending benchmark**: speed, VRAM and pt-BR quality
+have not been measured. See [exact server and benchmark commands](docs/benchmarks/tts-bench/README.md).
+
+For Chatterbox and Qwen, `tts_voice` clones a voice from clean speech: a WAV path, or a name
 looked up as `<name>.wav` in the voices folder (see File Paths), then among
 the voices that ship with the app: `carol`, `debora`, `debora_v2` (the
 default), `isabel` and `mari`. A file of the same name in the voices folder wins. `null` uses
