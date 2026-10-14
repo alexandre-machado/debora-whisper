@@ -277,6 +277,92 @@ Missing `comtypes` is also unknown. This follows
 [Microsoft's UIA threading guidance](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading)
 and leaves the check-to-keys race described above.
 
+## Word duplication after PR #47 (2026-10-14)
+
+The user reports correct Notepad output but a duplicated full sentence in Word,
+with `Inline draft: target changed; leaving the draft and typing the final`.
+This establishes that the initial readability probe succeeded. It does **not**
+establish what Word returned during verification: the old message covered
+different strings, a later timeout/unknown read, and unsafe selections alike.
+No captured Word UIA strings are available, so the exact representation that
+triggered the report remains unconfirmed; the following regressions use fake
+UIA reads, not a live Word reproduction.
+
+The confirmed code defect was exact string equality followed by forgetting the
+draft and typing the full final. Even a harmless representation difference
+therefore left both versions in the document. The earlier exact-match and
+paste-final policies described above are superseded by this fix.
+
+Evidence checked against Microsoft documentation:
+
+| Candidate | Evidence and treatment |
+| --- | --- |
+| Paragraph/line/cell marks (`\r`, `\v`, `\x07`) or paragraph end in the read | Word's [template example](https://learn.microsoft.com/en-us/office/vba/api/word.template.openasdocument) identifies a paragraph mark as `Chr(13)`. This describes Word's object model, not a guarantee about UIA. [GetCaretRange](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationtextpattern2-getcaretrange) supplies the caret range; our code clones it and moves only Start backward. It does not expand to a paragraph or move End forward. Extra terminal marks are a simulated provider difference, not a proven Word UIA behavior. |
+| NBSP, narrow/thin and other Unicode spaces | These failed exact equality. Unicode `Zs` characters now compare as spaces, one for one. Interior whitespace runs are not collapsed. |
+| Smart quotes/apostrophes | [Microsoft documents Word's automatic straight-to-smart quote replacement](https://support.microsoft.com/en-au/word/smart-quotes-in-word-and-powerpoint). Curly single/double quotes now compare to their straight equivalents. |
+| Auto-capitalization, double hyphens, ellipsis, other AutoCorrect | Word documents [sentence capitalization](https://learn.microsoft.com/en-us/office/vba/api/word.autocorrect.correctsentencecaps) and [double-hyphen conversion](https://learn.microsoft.com/en-us/office/vba/api/word.options.autoformatasyoutypereplacesymbols). These are not evidence that either occurred in this report. We do not case-fold, expand symbols, or accept arbitrary spelling changes as proof of ownership. |
+| Hidden field/bookmark text | [GetText includes hidden as well as visible text](https://learn.microsoft.com/en-us/dotnet/api/system.windows.automation.text.textpatternrange.gettext). Unknown controls, field delimiters and zero-width characters are not stripped. We have no evidence of a bookmark character in this Word read. |
+| Stale UIA read after paste/SendInput | Possible but unconfirmed. Retry once after 40 ms, unless the selection is explicitly unsafe or focus changed. |
+| Partial result from the 150 ms budget | The worker returns a completed string or `None`; a timeout cannot return a partly filled string. `GetText(-1)` does not request truncation. [MoveEndpointByUnit](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationtextrange-moveendpointbyunit) can move fewer units at a document boundary or substitute a larger supported unit, so returned string length is not necessarily the requested Python length. Late worker results remain discarded. |
+
+Comparison now recognizes normalized suffixes: CR/LF/CRLF, vertical tab and
+Unicode line/paragraph separators compare as line breaks; Unicode spaces and
+smart quotes compare as above. Terminal whitespace and cell marks can explain
+equivalence, but equivalence alone does not authorize deletion. A retry requests
+eight additional characters of context so terminal marks do not hide the
+beginning of the expected draft. Each read retains the existing 150 ms bound;
+two slow reads plus the delay cost at most about 340 ms of waiting. A still-busy
+worker immediately returns unknown and does not queue another request.
+
+**Deletion rule:** only a suffix whose normalized text matches with one-for-one
+character counts uses the existing common-prefix/tail rewrite. Focus is checked
+before and after each read, including after the retry delay. A persistent
+trimmed trailing space, extra terminal paragraph/cell mark, or CRLF expansion
+does not prove how many key presses select our text. For example, UIA may hide
+the final space, or the editor may actually have removed it. Guessing the old
+length in the latter case can delete preceding user text. These ambiguous
+cases keep the draft, even when their normalized content matches. Thus this fix
+prevents duplication for these cases but does not promise a corrected final in
+Word when the editable range is still ambiguous.
+
+**Unreconciled segment policy:** retain the existing draft; stop inline updates
+and suppress the final paste and automatic Enter for the remainder of the
+segment. This also applies after focus changes. Keep the full final in history
+and the normal final-transcription log for recovery. Reset the suppression for
+the next segment, including after an empty or failed final. There is no downgrade
+from verified rewriting to blind Backspace based on HWND/runtime ID: identity
+alone cannot establish caret position or draft length. The existing unreadable
+terminal strategy remains selected only by the initial probe. A check-to-keys
+race still exists; normalization is not an owned TSF composition range.
+
+The first non-exact verification per segment logs `expected_len`, `read_len`,
+`expected_tail` and `read_tail` (Python repr, last 40 characters), plus
+`equivalent` and `safe_count`. This includes a stale read that later recovers.
+Persistent failures additionally log that the draft was retained and the final
+paste suppressed. These diagnostics are needed to identify the actual Word
+representation on the next run.
+
+Regression tests cover successful one-for-one rich-editor rewrites, trailing
+paragraph/cell marks and space trimming without duplication or over-deletion,
+stale-then-fresh reads, changed text/hidden delimiters, focus changes during a
+read or retry, once-per-segment diagnostics, and final/empty/error resets.
+
+Validation in this worktree (2026-10-14):
+
+- Focused: `test_draft_typing.py`, `test_windows_uia.py`,
+  `test_draft_coalescing.py`, `test_app_shutdown.py`: **198 passed, 1 skipped**.
+- Full suite: **1518 passed, 1 skipped, 2 failed**. Both failures are in
+  `test_llm_process.py` (`test_hung_load_is_killed` and
+  `test_crashed_process_is_started_again`), timing out while waiting for a
+  subprocess to exit. Both reproduce with the committed `HEAD` engine loaded
+  instead of the modified engine.
+- Used the requested virtualenv. The direct pytest command hit Windows sandbox
+  ACL errors in temporary directories. Successful runs used a process-local
+  runner that preserves inherited ACLs for newly created test directories in
+  the worktree; no test or application permissions code was changed.
+- No live Word verification was performed. The mismatch diagnostic is still
+  needed to confirm which representation Word returned in the reported case.
+
 ## Spike plan
 
 1. Minimal TIP (x64) using SampleIME/Mozc as reference: one profile for
