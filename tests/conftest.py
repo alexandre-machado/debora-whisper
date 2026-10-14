@@ -46,6 +46,17 @@ def _private_last_recording(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_allocation_reporter():
+    from debora_whisper.hardware_allocation import allocation
+    with allocation.lock:
+        allocation.rows = {}
+        allocation.config = allocation.log = allocation.last = None
+    yield
+    with allocation.lock:
+        allocation.config = allocation.log = None
+
+
+@pytest.fixture(autouse=True)
 def _reset_device_failure_latch():
     """The fatal device latch is process-wide; isolate it per test."""
     from debora_whisper import dictation_engine

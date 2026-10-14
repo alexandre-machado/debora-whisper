@@ -19,6 +19,7 @@ On stdin:
 The process exits when stdin closes, so it never outlives the app.
 """
 import json
+import os
 import queue
 import random
 import sys
@@ -42,7 +43,15 @@ def load(model_dir: str, device: str, cache_dir: str, say):
             errors.append(f"{candidate}: {_first_line(e)}")
             say({"log": f"cannot load the LLM on {errors[-1]}"})
             continue
-        say({"ready": candidate, "seconds": round(time.time() - start, 1)})
+        from debora_whisper.hardware_allocation import ov_target
+        try:
+            from debora_whisper.device_queries import openvino_core
+            target = ov_target(openvino_core(), candidate)
+        except Exception:
+            target = f"OV:{candidate} (hardware identity unreported)"
+        say({"ready": candidate, "seconds": round(time.time() - start, 1),
+             "allocation": {"target": target, "pid": os.getpid(),
+                            "planned": device, "fallbacks": errors}})
         return pipe
     say({"failed": "; ".join(errors)})
     return None

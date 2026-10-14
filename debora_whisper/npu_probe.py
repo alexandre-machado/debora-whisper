@@ -11,6 +11,7 @@ Exit code 0: the model loaded on the NPU and transcribed half a second of
 silence. Otherwise the last line of output says why.
 """
 import subprocess
+import json
 import sys
 from pathlib import Path
 
@@ -23,6 +24,8 @@ def run(model_path: str, backend: str, model_size: str, language: str, sample_ra
     from debora_whisper.dictation_engine import create_model
     try:
         model = create_model(Path(model_path), device="NPU", backend=backend, model_size=model_size)
+        from debora_whisper.hardware_allocation import model_description
+        print("@allocation " + json.dumps(model_description(model, model_size, "NPU")), flush=True)
         # Loaders fall back silently on benign errors, so loading is not
         # proof the NPU works.
         if model.device != "NPU":
@@ -58,6 +61,12 @@ def probe_npu(config: dict, model_path, timeout=NPU_PROBE_TIMEOUT, command=None)
         kill_tree(process)
         raise RuntimeError(f"no answer in {timeout}s (the NPU driver is probably "
                            f"hung); probe process {process.pid} killed") from None
+    from debora_whisper.dictation_engine import log
+    for line in output.decode("utf-8", "replace").splitlines():
+        if line.startswith("@allocation "):
+            log("Hardware allocation (mode=npu_probe):\n  STT probe  "
+                + json.loads(line.removeprefix("@allocation "))
+                + "; temporary worker now exited")
     if process.returncode != 0:
         lines = output.decode("utf-8", "replace").strip().splitlines()
         raise RuntimeError(lines[-1] if lines else f"exit code {process.returncode}")

@@ -245,6 +245,9 @@ def capability_matrix(observed):
 def cache_key(observed):
     """Free memory/presence are refreshed; only stable facts key validation."""
     stable = json.loads(json.dumps(observed))
+    for report in stable.values():
+        report.pop("worker_pid", None)
+    stable.get("tts", {}).pop("pid", None)
     for source in ("system", "nvidia", "openvino"):
         for device in stable.get(source, {}).get("devices", []):
             device.pop("memory_free", None)
@@ -348,7 +351,7 @@ def _query_process(source, request, deadline, events):
                     if len(line) <= MAX_CACHE_BYTES:
                         packet = json.loads(line)
                         if isinstance(packet, dict) and time.monotonic() < deadline:
-                            events.put((source, packet))
+                            events.put((source, {**packet, "worker_pid": getattr(process, "pid", None)}))
             except (OSError, ValueError):
                 pass
             finally:
