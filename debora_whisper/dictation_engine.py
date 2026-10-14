@@ -2693,6 +2693,11 @@ class DictationApp:
     def restore_history(self, previous: "DictationApp"):
         """Carry session history from a stopped engine into its replacement."""
         self._history = previous.history
+        # Disabling local voice chat resets the conversation, including when
+        # the same Apply replaces the engine instead of calling set_voice_chat.
+        if (not self.config.get("voice_chat")
+                and self.config.get("voice_chat_backend", "local") == "local"):
+            return
         self.voice_chat._history = list(previous.voice_chat._history)
         # The next turn uses this timestamp to expire idle conversations.
         self.voice_chat._last_turn = previous.voice_chat._last_turn
@@ -3816,8 +3821,8 @@ class DictationApp:
         threading.Thread(target=_continuous_consumer, daemon=True).start()
 
     def busy_reason(self) -> str | None:
-        """What accelerator/microphone work is in flight, or None if idle."""
-        with self._audio_lifecycle_lock:
+        """What recording, model or reply work is in flight, or None if idle."""
+        with self._audio_lifecycle_lock, self._voice_lock:
             return self._busy_reason_locked()
 
     def _busy_reason_locked(self) -> str | None:
@@ -3827,21 +3832,25 @@ class DictationApp:
             return "transcription"
         if self._loading:
             return "model loading"
+        if self._voice_worker is not None:
+            return "voice reply"
         return None
 
     def stop_if_idle(self) -> str | None:
-        """Stop this engine only if no recording, transcription or model load
+        """Stop only if no recording, transcription, model load or voice reply
         is in flight. Returns the busy reason (engine left running) or None
         (engine stopped).
 
-        The idle check and the stop flag are set under the same lock every
-        start path (hotkey start, timer/user stop, loader spawn) takes, so no
+        The idle check and the stop flag are set under the locks every
+        start path (recording, loader or reply worker) takes, so no
         new work can begin between the check and the stop. Used before a
         Settings rebuild so a new pipeline is never compiled while the old
         one may still be running on the same device. Never blocks on
         in-flight inference, which may be hung in a driver.
+        Reply workers must finish updating history before it can be copied
+        into the replacement, even after playback has been interrupted.
         """
-        with self._audio_lifecycle_lock:
+        with self._audio_lifecycle_lock, self._voice_lock:
             reason = self._busy_reason_locked()
             if reason is not None:
                 return reason

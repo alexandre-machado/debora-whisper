@@ -1,5 +1,6 @@
 """Settings and managed TTS switching, without a display, servers or models."""
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -177,6 +178,7 @@ def test_restore_history_carries_dictation_and_conversation():
     previous._history = [{"text": "ditado antigo"}]
     previous.voice_chat = MagicMock(_history=[{"role": "user", "content": "oi"}], _last_turn=123.0)
     engine = de.DictationApp.__new__(de.DictationApp)
+    engine.config = {**de.DEFAULT_CONFIG, "voice_chat": True}
     engine._history = []
     engine.voice_chat = MagicMock(_history=[], _last_turn=0.0)
     engine.restore_history(previous)
@@ -187,3 +189,99 @@ def test_restore_history_carries_dictation_and_conversation():
     previous._history.append({"text": "x"})
     previous.voice_chat._history.append({"role": "user", "content": "y"})
     assert len(engine.history) == 1 and len(engine.voice_chat._history) == 1
+
+
+@pytest.fixture
+def settings_gui(monkeypatch):
+    """Use real engine lifecycle and history, with hardware and GUI stubbed."""
+    from debora_whisper.app import GUIApp
+
+    monkeypatch.setattr(de, "AudioRecorder", MagicMock())
+    monkeypatch.setattr(de, "ChimePlayer", MagicMock())
+    monkeypatch.setattr(de.DictationApp, "_monitor_resources", lambda self: None)
+    monkeypatch.setattr(de.DictationApp, "start_background", MagicMock())
+    monkeypatch.setattr(de.DictationApp, "_warm_up_voice_chat", MagicMock())
+    monkeypatch.setattr(vc.VoiceChat, "interrupt", MagicMock())
+    monkeypatch.setattr("keyboard.unhook_all", MagicMock())
+    monkeypatch.setitem(GUIApp._on_settings_apply.__globals__, "save_config", MagicMock())
+    gui = GUIApp.__new__(GUIApp)
+    gui._config = {**de.DEFAULT_CONFIG, "voice_chat": True,
+                   "voice_chat_backend": "local", "voice_chat_echo_filter": "off"}
+    gui._engine = de.DictationApp(gui._config)
+    gui._overlay, gui._tray = MagicMock(), MagicMock()
+    gui._settings_status, gui._settings_set_apply = MagicMock(), MagicMock()
+    return gui
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_apply_waits_for_reply_finalization_before_rebuilding(settings_gui, monkeypatch, interrupted):
+    gui = settings_gui
+    previous = gui._engine
+    spoken, finalize = threading.Event(), threading.Event()
+    answer = {"role": "assistant", "content": "Tudo bem!"}
+
+    def respond(text, on_reply, stop):
+        previous.voice_chat._history.append({"role": "user", "content": text})
+        on_reply(answer["content"])
+        spoken.set()
+        # Simulate playback/cancellation finishing before respond saves the answer.
+        assert finalize.wait(5)
+        previous.voice_chat._history.append(answer)
+        previous.voice_chat._last_turn = time.time()
+        return answer["content"]
+
+    monkeypatch.setattr(previous.voice_chat, "respond", respond)
+    previous._voice_chat_turn("oi", [], True)
+    worker = previous._voice_worker
+    changed = {**gui._config, "tts_backend": "kokoro"}
+    original = dict(gui._config)
+    try:
+        assert spoken.wait(5)
+        if interrupted:
+            previous._interrupt_voice_reply()
+        assert previous.busy_reason() == "voice reply"
+        gui._on_settings_apply(changed)
+        assert gui._engine is previous
+        assert gui._config == original
+        assert not previous._stopping.is_set()
+        assert "voice reply in progress" in gui._settings_status.call_args.args[0]
+        previous.start_background.assert_not_called()
+    finally:
+        finalize.set()
+        worker.join(5)
+    assert not worker.is_alive()
+
+    gui._on_settings_apply(changed)
+    assert gui._engine is not previous
+    assert previous._stopping.is_set()
+    assert gui._config["tts_backend"] == "kokoro"
+    gui._engine.start_background.assert_called_once()
+    assert gui._engine.history[-1]["text"] == "oi\n→ Tudo bem!"
+    assert answer in gui._engine.voice_chat._messages("e você?")
+    assert gui._engine.voice_chat._last_turn == previous.voice_chat._last_turn
+
+
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_disabling_local_chat_forgets_conversation_with_tts_change(settings_gui, rebuild):
+    gui = settings_gui
+    previous = gui._engine
+    previous._history = [{"text": "ditado antigo"}]
+    previous.voice_chat._history = [
+        {"role": "user", "content": "oi"},
+        {"role": "assistant", "content": "Tudo bem!"},
+    ]
+    previous.voice_chat._last_turn = time.time()
+    changed = {**gui._config, "voice_chat": False}
+    if rebuild:
+        changed["tts_backend"] = "kokoro"
+    gui._on_settings_apply(changed)
+    assert (gui._engine is not previous) is rebuild
+    assert gui._engine.history == [{"text": "ditado antigo"}]
+    assert gui._engine.voice_chat._history == []
+
+    # Re-enabling immediately must not resume the conversation before timeout.
+    gui._on_settings_apply({**gui._config, "voice_chat": True})
+    messages = gui._engine.voice_chat._messages("nova conversa")
+    assert [m for m in messages if m["role"] != "system"] == [
+        {"role": "user", "content": "nova conversa"},
+    ]
