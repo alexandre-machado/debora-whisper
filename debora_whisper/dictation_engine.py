@@ -3190,10 +3190,13 @@ class DictationApp:
                                 and not self._inline_drafts_abandoned):
                             if self._draft_strategy is None:
                                 self._choose_draft_strategy_locked()
-                            if (self._draft_strategy == "backspace"
-                                    and not platforms.current().can_backspace_draft(text)):
+                            if ((self._draft_strategy == "backspace"
+                                    and not platforms.current().can_backspace_draft(text))
+                                    or (self._draft_strategy == "verified"
+                                        and not _draft_read_matches(text, text)[1])):
                                 # Remove only the previous, simple-character draft.
                                 # Never inline text whose deletion count is ambiguous.
+                                # Even an exact read must authorize its later removal.
                                 retained = self._forget_draft_locked(erase=True)
                                 self._draft_strategy = "overlay"
                                 self._inline_drafts_abandoned = True

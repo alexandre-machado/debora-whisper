@@ -335,12 +335,18 @@ alone cannot establish caret position or draft length. The existing unreadable
 terminal strategy remains selected only by the initial probe. A check-to-keys
 race still exists; normalization is not an owned TSF composition range.
 
-The first non-exact verification per segment logs `expected_len`, `read_len`,
-`expected_tail` and `read_tail` (Python repr, last 40 characters), plus
-`equivalent` and `safe_count`. This includes a stale read that later recovers.
-Persistent failures additionally log that the draft was retained and the final
-paste suppressed. These diagnostics are needed to identify the actual Word
-representation on the next run.
+The first non-exact or unsafe verification per segment logs metadata only:
+`expected_len`, `read_len` (`None` when no text was returned), `read_status`
+(`text`, `unsafe`, or `unavailable`), `representation_changed` (whether
+normalizing the observed text changes it), `equivalent` (normalized suffix
+equivalence), and `safe_count` (whether the read authorizes the deletion count).
+This includes a stale read that later recovers. Persistent failures additionally
+log that the draft was retained and the final paste suppressed. Neither
+`expected_tail` nor `read_tail` is logged, and no editor text is included in
+these diagnostics. The metadata distinguishes missing reads, representation
+changes, and unsafe counts, but cannot identify the exact characters Word
+returned or which substitution caused a mismatch. That requires a controlled
+reproduction with non-sensitive sample text and inspection of the caret read.
 
 Regression tests cover successful one-for-one rich-editor rewrites, trailing
 paragraph/cell marks and space trimming without duplication or over-deletion,

@@ -277,6 +277,72 @@ def test_terminal_complex_unicode_uses_overlay(terminal, complex_text, previous)
     assert terminal.pasted == ["Olá, tudo bem? "]
 
 
+@pytest.mark.parametrize("complex_text", ["emoji 👍", "cafe\u0301", "mark \ufe0f", "join\u200der",
+                                         "hangul \u1100\u1161", "surrogate \ud83d",
+                                         "control\x07text", "two\r\nlines"])
+@pytest.mark.parametrize("previous", [False, True])
+def test_readable_complex_unicode_switches_to_overlay(screen, complex_text, previous):
+    app = _app(auto_enter=True)
+    prefix = "Existing user text: "
+    screen.text = prefix
+    if previous:
+        _say(app, "Olá tudo", is_final=False)
+    _say(app, complex_text, is_final=False)
+
+    assert screen.text == prefix
+    assert screen.drafted == (["Olá tudo... "] if previous else [])
+    assert app.last_draft_text == complex_text + "... "
+    assert app._draft_strategy == "overlay"
+    assert app._inline_drafts_abandoned
+    assert not app._draft_final_suppressed
+    assert app._draft_typed_text == ""
+    if previous:
+        de.delete_text.assert_called_once_with(len("Olá tudo... "))
+    else:
+        de.delete_text.assert_not_called()
+
+    _say(app, "Simple update", is_final=False)
+    assert screen.text == prefix
+    assert app.last_draft_text == "Simple update... "
+    final = complex_text + " completo! "
+    _say(app, final, is_final=True)
+    assert screen.text == prefix + final
+    assert screen.pasted == [final]
+    assert screen.enters == 1
+    assert app._history[-1]["text"] == final
+    assert app._draft_strategy is None
+    assert not app._inline_drafts_abandoned
+    _say(app, "Next segment", is_final=False)
+    assert screen.text == prefix + final + "Next segment... "
+    assert app._draft_strategy == "verified"
+
+
+@pytest.mark.parametrize("obstacle", ["focus", "mismatch", "unsafe"])
+def test_readable_complex_transition_keeps_unremovable_draft(screen, monkeypatch, obstacle):
+    app = _app(auto_enter=True)
+    _say(app, "Olá tudo", is_final=False)
+    if obstacle == "focus":
+        screen.target = ("other window", "field")
+        screen.text = "Other user text"
+    elif obstacle == "mismatch":
+        screen.text += "user edit"
+    else:
+        monkeypatch.setattr(de.platforms.current(), "text_before_caret",
+                            lambda count: CaretReadStatus.UNSAFE)
+    kept = screen.text
+    _say(app, "cafe\u0301", is_final=False)
+    assert app._draft_strategy == "overlay"
+    assert app._draft_final_suppressed
+    _say(app, "cafe\u0301 completo!", is_final=True)
+
+    assert screen.text == kept
+    de.delete_text.assert_not_called()
+    assert screen.drafted == ["Olá tudo... "]
+    assert screen.pasted == []
+    assert screen.enters == 0
+    assert app._history[-1]["text"] == "cafe\u0301 completo! "
+
+
 def test_terminal_focus_change_leaves_draft_and_abandons_segment(terminal):
     app = _app()
     _say(app, "Olá tudo", is_final=False)
@@ -579,7 +645,12 @@ def test_retry_with_context_and_smart_quotes_can_replace_entire_draft(screen, mo
 def test_grapheme_movement_never_deletes_preceding_user_text(screen, monkeypatch, cluster, update_first):
     app = _app(auto_enter=True)
     screen.text = "X"
-    _say(app, cluster, is_final=False)
+    # Seed a pre-existing guarded draft to test the verifier's defense even
+    # though the insertion path now prevents this state.
+    app._draft_strategy = "verified"
+    app._draft_target = screen.target
+    app._draft_typed_text = cluster + "... "
+    screen.type_draft(app._draft_typed_text)
     kept = screen.text
     # This editor moves one grapheme per key, including for UIA reads.
     # In particular, six movements read/delete all of "Xe\u0301... ".
