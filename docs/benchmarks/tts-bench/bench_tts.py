@@ -5,14 +5,86 @@
 """Benchmark a running /tts server using only the Python standard library."""
 import argparse
 import csv
+import http.client
 import io
 import json
+import math
 from pathlib import Path
+import socket
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 import wave
+
+MAX_AUDIO_BYTES = 50_000_000
+MAX_HEALTH_BYTES = 64_000
+MAX_ERROR_BYTES = 8_000
+READ_CHUNK_BYTES = 64 * 1024
+
+
+def read_bounded(response, limit, deadline):
+    """Read at most limit + 1 bytes, including from a continuously sending peer."""
+    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    timer = None
+    if sock is not None:
+        # Chunked HTTP framing may read multiple times inside read1(). Abort
+        # the socket at the deadline even if those reads keep receiving data.
+        def abort():
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        timer = threading.Timer(max(0, deadline - time.monotonic()), abort)
+        timer.daemon = True
+        timer.start()
+    try:
+        return _read_chunks(response, limit, deadline)
+    except (OSError, http.client.HTTPException) as exc:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Response read deadline exceeded") from exc
+        raise
+    finally:
+        if timer is not None:
+            timer.cancel()
+
+
+def _read_chunks(response, limit, deadline):
+    data = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Response read deadline exceeded")
+        # urllib's HTTPResponse wraps a buffered socket. Tighten each blocking
+        # read to the remaining budget; read1 returns after one raw read, so a
+        # trickling peer cannot keep a large read() alive indefinitely.
+        sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            sock.settimeout(remaining)
+        chunk = response.read1(min(READ_CHUNK_BYTES, limit + 1 - len(data)))
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Response read deadline exceeded")
+        data.extend(chunk)
+        if len(data) > limit:
+            raise ValueError(f"Response exceeds {limit} bytes")
+        if not chunk:
+            return bytes(data)
+
+
+def fetch(opener, request, timeout, limit):
+    deadline = time.monotonic() + timeout
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return read_bounded(response, limit, deadline)
+    except urllib.error.HTTPError as exc:
+        with exc:
+            try:
+                detail = read_bounded(exc.fp, MAX_ERROR_BYTES, deadline).decode("utf-8", errors="replace")
+            except (OSError, ValueError) as error:
+                detail = str(error)
+        raise ValueError(f"HTTP {exc.code}: {detail}") from exc
 
 
 def percentile(values, fraction):
@@ -42,8 +114,7 @@ def synthesize(opener, url, text, voice, timeout):
                                      data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
     start = time.perf_counter()
-    with opener.open(request, timeout=timeout) as response:
-        wav = response.read()
+    wav = fetch(opener, request, timeout, MAX_AUDIO_BYTES)
     elapsed = time.perf_counter() - start
     with wave.open(io.BytesIO(wav), "rb") as audio:
         seconds = audio.getnframes() / audio.getframerate()
@@ -65,13 +136,13 @@ def main(argv=None):
                  if line.strip() and not line.startswith("#")]
     if not sentences or any(len(text) > 1000 for text in sentences):
         parser.error("Provide non-empty sentences of at most 1000 characters each")
-    if args.warmup < 0 or args.timeout <= 0:
-        parser.error("--warmup must be non-negative and --timeout positive")
+    if args.warmup < 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--warmup must be non-negative and --timeout finite and positive")
     try:
         out = output_dir(args.out)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(args.url.rstrip("/") + "/health", timeout=args.timeout) as response:
-            health = json.load(response)
+        health = json.loads(fetch(opener, args.url.rstrip("/") + "/health",
+                                  args.timeout, MAX_HEALTH_BYTES))
         if not health.get("ok"):
             raise ValueError(f"Server not ready: {health}")
         for _ in range(args.warmup):
@@ -97,9 +168,7 @@ def main(argv=None):
             writer.writerows(rows)
         (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Output: {out}")
-    except urllib.error.HTTPError as exc:
-        parser.exit(1, f"HTTP {exc.code}: {exc.read().decode('utf-8', errors='replace')}\n")
-    except (OSError, ValueError, wave.Error) as exc:
+    except (OSError, ValueError, wave.Error, http.client.HTTPException) as exc:
         parser.exit(1, f"Benchmark failed: {exc}\n")
 
 

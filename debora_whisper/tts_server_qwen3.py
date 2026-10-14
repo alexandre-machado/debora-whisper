@@ -22,6 +22,9 @@ else:  # uv run --script: siblings are on sys.path, the app need not be installe
     import tts_server as server
 
 MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+# Bound file I/O separately from the model's reference-text workload.
+MAX_TRANSCRIPT_BYTES = 16_000
+MAX_TRANSCRIPT_CHARS = 4_000
 LANGUAGES = dict(zip(
     ("pt", "en", "zh", "ja", "ko", "de", "fr", "ru", "es", "it", "auto"),
     ("Portuguese", "English", "Chinese", "Japanese", "Korean", "German",
@@ -38,10 +41,16 @@ def reference(voice):
         raise ValueError("Qwen3 reference must be a WAV with a matching .txt transcript")
     sidecar = path.with_suffix(".txt")
     try:
-        text = sidecar.read_text(encoding="utf-8-sig").strip()
+        with sidecar.open("rb") as stream:
+            raw = stream.read(MAX_TRANSCRIPT_BYTES + 1)
+        if len(raw) > MAX_TRANSCRIPT_BYTES:
+            raise ValueError(f"Reference transcript {sidecar} exceeds {MAX_TRANSCRIPT_BYTES} bytes")
+        text = raw.decode("utf-8-sig").strip()
     except (OSError, UnicodeError) as exc:
         raise ValueError(f"Cannot read reference transcript {sidecar}. Create this UTF-8 file "
                          "with the exact words spoken in the WAV, then restart the TTS server.") from exc
+    if len(text) > MAX_TRANSCRIPT_CHARS:
+        raise ValueError(f"Reference transcript {sidecar} exceeds {MAX_TRANSCRIPT_CHARS} characters")
     if not text:
         raise ValueError(f"Empty reference transcript {sidecar}; write the exact words spoken "
                          "in the WAV, then restart the TTS server.")

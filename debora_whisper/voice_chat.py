@@ -674,11 +674,28 @@ _tts_process: subprocess.Popen | None = None
 _tts_stopping = threading.Event()
 
 
+class TTSStartupError(RuntimeError):
+    """The server is reachable, but its backend cannot finish startup."""
+
+
 def tts_server_up(config: dict) -> bool:
     try:
         url = config["tts_url"].rstrip("/") + "/health"
         with _opener().open(url, timeout=1) as response:
             return response.status == 200
+    except urllib.error.HTTPError as exc:
+        with exc:
+            if exc.code != 503:
+                return False
+            try:
+                raw = exc.read(64_001)
+                health = json.loads(raw) if len(raw) <= 64_000 else None
+            except (OSError, ValueError):
+                return False
+        if (isinstance(health, dict) and health.get("ok") is False
+                and isinstance(health.get("error"), str) and health["error"]):
+            raise TTSStartupError(health["error"])
+        return False
     except Exception:
         return False
 
@@ -699,8 +716,12 @@ def ensure_tts_server(config: dict, log=print, log_path=None):
                 log(f"Voice chat: the TTS server exited (code {_tts_process.returncode}); "
                     f"see {log_path or 'its output'}. Restart the app after fixing it.")
             return
-        if tts_server_up(config):
-            return  # started by hand, or left over from an earlier run
+        try:
+            if tts_server_up(config):
+                return  # started by hand, or left over from an earlier run
+        except TTSStartupError as exc:
+            log(f"Voice chat: TTS startup failed ({exc}); restart the server after fixing it.")
+            return
         command = tts_command(config, log)
         if not command:
             return
@@ -724,7 +745,7 @@ def ensure_tts_server(config: dict, log=print, log_path=None):
 
 def wait_tts_server(config: dict, timeout=TTS_STARTUP_SECONDS) -> bool:
     """True once the TTS server answers; waits only while a server this
-    process started is still loading."""
+    process started is still loading. Raise TTSStartupError on terminal failure."""
     deadline = time.time() + timeout
     while True:
         if tts_server_up(config):
@@ -916,6 +937,8 @@ class VoiceChat:
                     self._waiting_audio(config)
                     self._tts_warmed = True
                     self.log(f"Voice chat: TTS warmed in {time.perf_counter() - started:.1f}s")
+            except TTSStartupError as e:
+                self.log(f"Voice chat: TTS startup failed ({e}); restart the server after fixing it.")
             except Exception as e:
                 self.log(f"Voice chat: TTS warm-up failed ({e}); will try on the next reply.")
 
@@ -1283,9 +1306,14 @@ class VoiceChat:
                         continue  # an emoji or punctuation: nothing to say
                     audio = None
                     if tts_ok is None:
-                        tts_ok = wait_tts_server(self.config)
-                        if not tts_ok:
-                            self.log("Voice chat: TTS server not reachable; showing the reply only.")
+                        try:
+                            tts_ok = wait_tts_server(self.config)
+                        except TTSStartupError as e:
+                            tts_ok = False
+                            self.log(f"Voice chat: TTS startup failed ({e}); showing the reply only.")
+                        else:
+                            if not tts_ok:
+                                self.log("Voice chat: TTS server not reachable; showing the reply only.")
                     if tts_ok:
                         try:
                             config = dict(self.config)

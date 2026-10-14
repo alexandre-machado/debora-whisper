@@ -38,6 +38,10 @@ def server():
     """TTS stub (/tts, /health). Set .tts_status or .health_status."""
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            srv.health_requests += 1
+            if srv.health_error:
+                return self._send(json.dumps({"ok": False, "error": srv.health_error}).encode(),
+                                  "application/json", status=503)
             if self.path != "/health" or srv.health_status != 200:
                 return self.send_error(503)
             self._send(b'{"ok": true}', "application/json")
@@ -49,8 +53,8 @@ def server():
                 return self.send_error(srv.tts_status if self.path == "/tts" else 404)
             self._send(_wav(), "audio/wav")
 
-        def _send(self, payload, content_type):
-            self.send_response(200)
+        def _send(self, payload, content_type, status=200):
+            self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.end_headers()
             try:
@@ -63,6 +67,7 @@ def server():
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     srv.requests, srv.tts_status, srv.health_status = [], 200, 200
+    srv.health_error, srv.health_requests = None, 0
     srv.tts_url = f"http://127.0.0.1:{srv.server_port}"
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
@@ -1023,6 +1028,39 @@ def test_tts_server_up_needs_a_healthy_answer(server):
     assert vc.tts_server_up(config)
     server.health_status = 500
     assert not vc.tts_server_up(config)
+
+
+@pytest.mark.parametrize("error", [
+    "Cannot read reference transcript voice.txt. Create this UTF-8 file with the exact words.",
+    "Install espeak-ng and set PHONEMIZER_ESPEAK_LIBRARY.",
+])
+def test_live_failed_tts_does_not_wait_again_on_repeated_turns(server, monkeypatch, error):
+    server.health_error = error
+    process = MagicMock()
+    process.poll.return_value = None  # Startup failed, but the HTTP server is still alive.
+    monkeypatch.setattr(vc, "_tts_process", process)
+    logs, shown = [], []
+    chat, played = _chat(server, FakeLLM(["A resposta continua disponível."]))
+    chat.log = logs.append
+    with patch.object(vc.time, "sleep", side_effect=AssertionError("must not poll startup")):
+        for _ in range(2):
+            chat.respond("Olá", on_reply=shown.append)
+    assert server.health_requests == 2
+    assert shown == ["A resposta continua disponível."] * 2
+    assert played == [] and server.requests == []
+    assert sum("TTS startup failed" in line and error in line for line in logs) == 2
+    assert not any("not reachable" in line for line in logs)
+    process.kill.assert_not_called()
+
+
+def test_external_failed_tts_is_not_started_again(server, monkeypatch):
+    server.health_error = "Install espeak-ng"
+    monkeypatch.setattr(vc, "_tts_process", None)
+    logs = []
+    with patch("subprocess.Popen") as popen:
+        vc.ensure_tts_server(_cfg(server), log=logs.append)
+    popen.assert_not_called()
+    assert any(server.health_error in line for line in logs)
 
 
 def test_wait_gives_up_when_the_started_server_dies(no_tts_process):

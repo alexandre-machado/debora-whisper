@@ -1,11 +1,15 @@
 """Backend contracts: no model packages or weights are downloaded."""
 import importlib.util
+import http.client
 import io
 import json
 from pathlib import Path
 import runpy
 import socket
 import sys
+import threading
+import time
+import urllib.error
 from types import SimpleNamespace
 from unittest.mock import Mock
 import wave
@@ -198,6 +202,44 @@ def test_qwen_uses_exact_transcript_and_caches_prompt(qwen_model):
         backend.use("")
 
 
+@pytest.mark.parametrize("transcript,limit", [
+    (b"x" * (qwen.MAX_TRANSCRIPT_BYTES + 1), "bytes"),
+    (("á" * (qwen.MAX_TRANSCRIPT_CHARS + 1)).encode(), "characters"),
+])
+def test_qwen_rejects_oversized_transcripts_before_model_processing(qwen_model, monkeypatch,
+                                                                 transcript, limit):
+    backend, model, _, voice = qwen_model
+    model.reset_mock()
+    voice.with_suffix(".txt").write_bytes(transcript)
+    monkeypatch.setattr(server, "check_connection", lambda _: None)
+    handler = server.make_handler(backend, "pt", adapter=True)
+    code, body = response(handler, "/tts", {"text": "Olá", "voice": str(voice)})
+    assert code == 400 and limit in json.loads(body)["error"]
+    model.create_voice_clone_prompt.assert_not_called()
+    model.generate_voice_clone.assert_not_called()
+    # The rejected request releases the shared lock and leaves synthesis usable.
+    voice.with_suffix(".txt").write_text("Referência corrigida.", encoding="utf-8")
+    assert response(handler, "/tts", {"text": "Olá"})[0] == 200
+
+
+def test_qwen_transcript_read_is_bounded(qwen_model, monkeypatch):
+    _, _, _, voice = qwen_model
+    stream = io.BytesIO(b"x" * (qwen.MAX_TRANSCRIPT_BYTES + 100))
+    read = Mock(wraps=stream.read)
+    stream.read = read
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: stream)
+    with pytest.raises(ValueError, match="bytes"):
+        qwen.reference(str(voice))
+    read.assert_called_once_with(qwen.MAX_TRANSCRIPT_BYTES + 1)
+
+
+def test_qwen_transcript_limits_accept_utf8_bom_at_boundary(qwen_model):
+    _, _, _, voice = qwen_model
+    text = "á" * qwen.MAX_TRANSCRIPT_CHARS
+    voice.with_suffix(".txt").write_text(text, encoding="utf-8-sig")
+    assert qwen.reference(str(voice))[1] == text
+
+
 def test_kokoro_fixed_voice_and_complete_audio(monkeypatch, fake_torch):
     phonemizer = Mock(return_value=Mock(return_value=("ola", None)))
     monkeypatch.setitem(sys.modules, "misaki.espeak", SimpleNamespace(EspeakG2P=phonemizer))
@@ -288,10 +330,15 @@ def test_script_imports_sibling_http_code_without_app_install(monkeypatch, filen
     assert Path(namespace["server"].__file__).resolve() == ROOT / "debora_whisper/tts_server.py"
 
 
-def test_benchmark_response_metrics_and_repo_output_guard(monkeypatch):
+@pytest.fixture
+def bench():
     spec = importlib.util.spec_from_file_location("bench_tts", ROOT / "docs/benchmarks/tts-bench/bench_tts.py")
     bench = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bench)
+    return bench
+
+
+def test_benchmark_response_metrics_and_repo_output_guard(monkeypatch, bench):
     wav = server.to_wav(np.zeros(24000), 24000)
     opener = Mock()
     opener.open.return_value = io.BytesIO(wav)
@@ -305,3 +352,105 @@ def test_benchmark_response_metrics_and_repo_output_guard(monkeypatch):
     with pytest.raises(ValueError, match="outside a repository"):
         bench.output_dir(ROOT / "generated-audio")
     assert len((ROOT / "docs/benchmarks/tts-bench/frases_ptbr.txt").read_text(encoding="utf-8").splitlines()) == 20
+
+
+@pytest.mark.parametrize("kind", ["audio", "health", "error"])
+def test_benchmark_rejects_oversized_responses(bench, monkeypatch, tmp_path, capsys, kind):
+    limit = 32
+    for name in ("MAX_AUDIO_BYTES", "MAX_HEALTH_BYTES", "MAX_ERROR_BYTES"):
+        monkeypatch.setattr(bench, name, limit)
+    stream = io.BytesIO(b"x" * (limit + 100))
+    read = Mock(wraps=stream.read1)
+    stream.read1 = read
+    opener = Mock()
+    opener.open.return_value = stream
+    if kind == "error":
+        opener.open.side_effect = urllib.error.HTTPError("http://test/tts", 503, "Failed", {}, stream)
+    if kind == "health":
+        monkeypatch.setattr(bench, "output_dir", lambda _: tmp_path)
+        monkeypatch.setattr(bench.urllib.request, "build_opener", lambda *args: opener)
+        with pytest.raises(SystemExit) as exc:
+            bench.main([])
+        assert exc.value.code == 1
+        assert "exceeds 32 bytes" in capsys.readouterr().err
+    else:
+        with pytest.raises(ValueError, match="exceeds 32 bytes") as exc:
+            bench.synthesize(opener, "http://test", "Olá", None, 60)
+        if kind == "error":
+            assert "HTTP 503" in str(exc.value)
+    read.assert_called_once_with(limit + 1)
+    assert stream.closed
+
+
+@pytest.mark.parametrize("http_error", [False, True])
+def test_benchmark_deadline_stops_continuously_streaming_response(bench, monkeypatch, http_error):
+    clock = [0.0]
+    monkeypatch.setattr(bench.time, "monotonic", lambda: clock[0])
+    sock = Mock()
+
+    class Trickle(io.BytesIO):
+        fp = SimpleNamespace(raw=SimpleNamespace(_sock=sock))
+
+        def read1(self, size):
+            assert size > 0
+            clock[0] += 0.4
+            return b"x"  # Never reaches EOF, never hits the socket idle timeout.
+
+    stream = Trickle()
+    opener = Mock()
+    opener.open.return_value = stream
+    if http_error:
+        opener.open.side_effect = urllib.error.HTTPError("http://test", 503, "Failed", {}, stream)
+    with pytest.raises(ValueError if http_error else TimeoutError, match="deadline exceeded"):
+        bench.fetch(opener, "http://test", 1, 1000)
+    assert clock[0] == pytest.approx(1.2)
+    assert [call.args[0] for call in sock.settimeout.call_args_list] == pytest.approx([1, 0.6, 0.2])
+    assert stream.closed
+
+
+def test_benchmark_preserves_bounded_http_error_detail(bench):
+    stream = io.BytesIO(b"Install espeak-ng")
+    opener = Mock()
+    opener.open.side_effect = urllib.error.HTTPError("http://test", 503, "Failed", {}, stream)
+    with pytest.raises(ValueError, match="HTTP 503: Install espeak-ng"):
+        bench.fetch(opener, "http://test", 60, bench.MAX_HEALTH_BYTES)
+    assert stream.closed
+
+
+def test_benchmark_accepts_response_at_byte_limit(bench):
+    with io.BytesIO(b"exactly") as response:
+        assert bench.read_bounded(response, 7, bench.time.monotonic() + 10) == b"exactly"
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_benchmark_deadline_interrupts_real_socket_reads(bench, chunked):
+    client, peer = socket.socketpair()
+    stop = threading.Event()
+
+    def send():
+        try:
+            headers = b"Transfer-Encoding: chunked\r\n" if chunked else b""
+            peer.sendall(b"HTTP/1.1 200 OK\r\n" + headers + b"\r\n")
+            if chunked:
+                peer.sendall(b"1;")  # An unfinished chunk extension stalls read1's framing parser.
+            while not stop.is_set():
+                peer.sendall(b"x")
+                stop.wait(0.005)
+        except OSError:
+            pass
+
+    worker = threading.Thread(target=send, daemon=True)
+    worker.start()
+    try:
+        client.settimeout(2)
+        with http.client.HTTPResponse(client) as response:
+            response.begin()
+            start = time.monotonic()
+            with pytest.raises(TimeoutError, match="deadline exceeded"):
+                bench.read_bounded(response, bench.MAX_AUDIO_BYTES, start + 0.1)
+            assert time.monotonic() - start < 1
+    finally:
+        stop.set()
+        client.close()
+        peer.close()
+        worker.join(2)
