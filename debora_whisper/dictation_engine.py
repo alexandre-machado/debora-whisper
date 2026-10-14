@@ -27,6 +27,7 @@ from debora_whisper.harness import MemoryHotwords, ProjectHotwords, bounded_hotw
 from debora_whisper.solo_key import SoloKeyTap
 from debora_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
 from debora_whisper.vad_endpoint import AdaptiveEndpoint, VadSegment
+from debora_whisper.hardware_allocation import allocation, model_description, ov_target, cpu_target, cuda_target
 from debora_whisper.voice_chat import (VoiceChat, download_llm, ensure_tts_server, is_http_url,
                                     llm_loaded, load_llm)
 
@@ -271,7 +272,10 @@ def log(msg: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
     with _log_lock:
-        print(line)
+        try:
+            print(line, flush=True)
+        except (OSError, ValueError):
+            pass  # A detached/closed console must not suppress app.log.
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
             target_file = TELEMETRY_LOG if "[Telemetry]" in msg else LOG_FILE
@@ -668,6 +672,12 @@ def log_hardware_inventory(config: dict):
         try:
             inventory = probe_inventory(request, HARDWARE_INVENTORY)
             log(inventory_summary(inventory))
+            helpers = [f"{source} pid {report['worker_pid']}"
+                       for source, report in inventory.get("observed", {}).items()
+                       if report.get("worker_pid")]
+            if helpers:
+                allocation.update("HELPERS", "inventory queries -> CPU; " + ", ".join(helpers)
+                                  + "; temporary subprocesses, no model allocations")
         except Exception as e:
             log(f"Hardware inventory failed: {type(e).__name__}: {e}")
         try:
@@ -678,12 +688,12 @@ def log_hardware_inventory(config: dict):
             proposed = plan(inventory, mode=mode, config=snapshot,
                             loaded=resident_tts(inventory), generation=1)
             for component, placement in proposed["components"].items():
-                fallbacks = ",".join(d["kind"] for d in placement["fallback_details"]) or "none"
+                fallbacks = ",".join(d["device"] for d in placement["fallback_details"]) or "none"
                 reservation = placement["reservation_mib"]
                 reservation = f"{reservation}MiB" if reservation is not None else "unknown"
                 reason = " ".join(placement["reason"].split())
                 log(f"Device plan {proposed['id']} mode={mode} component={component} "
-                    f"device={placement['kind'] or placement['state']} fallbacks={fallbacks} "
+                    f"device={placement['device'] or placement['state']} fallbacks={fallbacks} "
                     f"reservation={reservation} reason={reason} confidence={placement['confidence']}")
         except Exception as e:
             log(f"Device plan failed: {type(e).__name__}: {e}")
@@ -892,6 +902,10 @@ class FasterWhisperCUDA:
         start = time.time()
         self.pipeline = WhisperModel(self.model_size, device="cuda", compute_type="int8_float16")
         hw_name = has_nvidia_gpu(return_name=True) or "NVIDIA GPU"
+        self.hardware_backend = "faster-whisper"
+        self.hardware_target = cuda_target(0, hw_name)
+        # CTranslate2's index is local to this process (e.g. CUDA_VISIBLE_DEVICES).
+        # Its default is 0; do not assign another process's CUDA index here.
         log(f"Loaded faster-whisper on {hw_name} in {time.time() - start:.1f}s")
 
     def supports_hotwords(self) -> bool:
@@ -1063,6 +1077,8 @@ class WhisperNPU:
     def __init__(self, model_path: Path, device: str = "NPU"):
         self.model_path = model_path
         self.device = device
+        self.hardware_fallbacks = []
+        self.hardware_backend = "openvino-genai"
         self.pipeline = None
         self._load_pipeline()
 
@@ -1091,9 +1107,12 @@ class WhisperNPU:
                 CACHE_DIR=str(CACHE_DIR)
             )
             try:
-                hw_name = ov.Core().get_property(self.device, "FULL_DEVICE_NAME")
+                core = ov.Core()
+                hw_name = core.get_property(self.device, "FULL_DEVICE_NAME")
+                self.hardware_target = ov_target(core, self.device)
             except Exception:
                 hw_name = self.device
+                self.hardware_target = f"OV:{self.device} (hardware identity unreported)"
             log(f"Loaded via openvino_genai on {hw_name} in {time.time() - start:.1f}s")
         except Exception as e:
             log(f"Failed to load model: {e}")
@@ -1104,6 +1123,7 @@ class WhisperNPU:
                 raise DeviceFailureError(kind, e) from e
             log("Falling back to CPU...")
             if self.device != "CPU":
+                self.hardware_fallbacks.append(f"{self.device}: {e}")
                 self.device = "CPU"
                 self._load_pipeline()
             else:
@@ -1223,6 +1243,9 @@ class ParakeetNPU:
     def __init__(self, model_path: Path, device: str = "NPU", latency_override: bool = None):
         self.model_path = model_path
         self.device = device
+        self.hardware_backend = "OpenVINO + ONNX Runtime"
+        self.hardware_fallbacks = []
+        self.hardware_buckets = {}
         # Measurable, opt-in lever from issue #3: sets
         # ov::intel_npu::compilation_mode_params with
         # performance-hint-override="latency" (NPU's default for that
@@ -1436,6 +1459,7 @@ class ParakeetNPU:
                 if kind is not None:
                     raise DeviceFailureError(kind, first_exc) from first_exc
                 fallback = "GPU" if self.device == "NPU" else "CPU"
+                self.hardware_fallbacks.append(f"encoder bucket {bucket} {self.device}: {first_exc}")
                 log(f"  Encoder bucket {bucket} failed on {self.device}: {first_exc}")
                 log(f"  Falling back to {fallback}...")
                 try:
@@ -1460,6 +1484,7 @@ class ParakeetNPU:
                         failed = fallback if fallback != "CPU" else kind
                         raise DeviceFailureError(failed, fallback_exc) from fallback_exc
                     log(f"  Encoder bucket {bucket} failed on {fallback}: {fallback_exc}")
+                    self.hardware_fallbacks.append(f"encoder bucket {bucket} {fallback}: {fallback_exc}")
                     log(f"  Falling back to CPU...")
                     c = core.compile_model(model_to_compile, "CPU", {"CACHE_DIR": str(CACHE_DIR)})
                     self.device = "CPU"
@@ -1497,6 +1522,7 @@ class ParakeetNPU:
                     else:
                         compiled = _fallback_compile(bucket, encoder_model, compile_config, e)
                 self.enc_compiled[bucket] = compiled
+                self.hardware_buckets[bucket] = ov_target(core, self.device, compiled)
 
                 # Determine encoder output time dimension via dummy inference
                 dummy_mel = np.zeros((1, 128, bucket), dtype=np.float32)
@@ -1525,6 +1551,7 @@ class ParakeetNPU:
                 if kind is not None:
                     raise DeviceFailureError(kind, e) from e
                 log(f"  Decoder failed on GPU: {e}, falling back to CPU")
+                self.hardware_fallbacks.append(f"decoder planned GPU: {e}")
                 self.dec_compiled = core.compile_model(decoder_model, "CPU")
                 self.dec_device = "CPU"
                 log(f"  Decoder compiled on CPU")
@@ -1564,6 +1591,10 @@ class ParakeetNPU:
             hw_str = f"{enc_hw} (Encoder) + {dec_hw} (Decoder)"
 
         log(f"Parakeet pipeline loaded on {hw_str} in {time.time() - start:.1f}s")
+        self.hardware_target = (
+            "encoder " + ", ".join(f"bucket {b}={d}" for b, d in self.hardware_buckets.items())
+            + "; decoder " + ov_target(core, self.dec_device, self.dec_compiled)
+            + "; mel preprocessor " + cpu_target())
 
     def _preprocess(self, audio_data) -> tuple:
         """Convert raw audio to mel features using nemo128.onnx."""
@@ -1961,8 +1992,11 @@ class AudioRecorder:
         if self.neural_vad is None:
             try:
                 self.neural_vad = NeuralVAD(sample_rate=self.sample_rate)
+                allocation.update("VAD", f"Silero (ONNX Runtime) -> {cpu_target()}  pid {os.getpid()}")
             except Exception as e:
                 log(f"Failed to initialize Neural VAD: {e}")
+                allocation.update("VAD", f"RMS -> {cpu_target()}  pid {os.getpid()}; "
+                                  f"planned Silero, fell back to RMS: {e}")
         if self._vad_thread is None or not self._vad_thread.is_alive():
             self._stop_vad = False
             self._vad_thread = threading.Thread(target=self._vad_loop, daemon=True)
@@ -2495,6 +2529,7 @@ class DictationApp:
 
     def __init__(self, config: dict):
         self.config = config
+        allocation.configure(config, log)
         if not config.get("save_last_recording"):
             discard_last_recording()
         self.recorder = AudioRecorder(
@@ -2572,6 +2607,7 @@ class DictationApp:
 
         self._resource_thread = threading.Thread(target=self._monitor_resources, daemon=True)
         self._resource_thread.start()
+        allocation.emit()
 
     def _accelerator_memory(self) -> str:
         """The active accelerator's memory for the telemetry line: CUDA's
@@ -2666,6 +2702,13 @@ class DictationApp:
                     backend=model_info["backend"],
                     model_size=self.config["model_size"]
                 )
+                self._report_stt_allocation()
+
+    def _report_stt_allocation(self):
+        planned = getattr(self, "_allocation_planned", self.config["device"])
+        allocation.update("STT", model_description(
+            self.whisper, self.config["model_size"], planned,
+            getattr(self, "_allocation_fallback", None)))
 
     def _quarantine_lost_model(self):
         """Take the model bound to a lost device out of service for good."""
@@ -2690,8 +2733,13 @@ class DictationApp:
         else:
             kind = classify_device_failure(exc, _model_active_devices(self.whisper))
         if kind is None:
+            if self.whisper is None:
+                allocation.update("STT", f"not loaded; {type(exc).__name__}: {exc}")
             return {"error": str(exc)}
         cause = f"{type(exc).__name__}: {exc}"
+        self._allocation_fallback = cause
+        self._allocation_planned = self.config["device"]
+        allocation.update("STT", f"unavailable; {cause}; device lost/quarantined")
         if kind == "LATCHED":
             failure = device_failure()
             self._load_error = failure["message"]
@@ -2865,6 +2913,8 @@ class DictationApp:
             return
         log(f"Falling back to device: {new_device}")
         with self._model_lock:
+            self._allocation_planned = getattr(self, "_allocation_planned", self.config["device"])
+            self._allocation_fallback = getattr(self, "_allocation_fallback", None) or self._load_error or "device fallback requested"
             self._load_error = None
             self._model_ready.clear()
             self.whisper = None  # a lost model is already quarantined
@@ -2899,6 +2949,10 @@ class DictationApp:
             old = self.whisper
             self.config["device"] = new_device
             self.whisper = new_whisper
+            self._allocation_planned = new_device
+            self._allocation_fallback = None
+            allocation.update("STT RECOVERY", None, emit=False)
+            self._report_stt_allocation()
             self._lost_device = None
             self._load_error = None
             self._model_ready.set()
@@ -3597,6 +3651,7 @@ class DictationApp:
         loaded either way, so switching back is instant. With `listen` (the
         mode hotkey or tray), an idle microphone starts continuous listening."""
         set_voice_chat_config(self.config, enabled)
+        allocation.emit()
         if listen:
             threading.Thread(target=self.start_listening, daemon=True).start()
         if enabled:
@@ -3890,6 +3945,8 @@ def run_setup():
             model = create_model(model_path, device=config["device"],
                                  backend=model_info["backend"],
                                  model_size=config["model_size"])
+            log("Hardware allocation (mode=setup):\n  STT  " + model_description(
+                model, config["model_size"], config["device"]))
             silence = np.zeros(config["sample_rate"], dtype=np.float32)  # 1 second of silence
             model.transcribe(silence, sample_rate=config["sample_rate"], language=config["language"])
             log("Cache warm-up complete — subsequent starts will be fast.")

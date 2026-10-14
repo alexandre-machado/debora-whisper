@@ -293,6 +293,9 @@ class GUIApp:
             probe_npu(probe_config, model_path)
             test_model = create_model(model_path, device="NPU", backend=model_info["backend"],
                                       model_size=self._config["model_size"])
+            from debora_whisper.hardware_allocation import allocation, model_description
+            allocation.update("STT RECOVERY", model_description(
+                test_model, self._config["model_size"], "NPU") + "; candidate, awaiting warmup/swap")
             # Loaders fall back silently on benign errors (e.g. a locked
             # ov-cache blob), so a successful load is not proof of recovery.
             if test_model.device != "NPU":
@@ -307,6 +310,8 @@ class GUIApp:
             self._root.after(0, lambda: self._swap_to_recovered_npu(engine, test_model))
 
         except Exception as e:
+            from debora_whisper.hardware_allocation import allocation
+            allocation.update("STT RECOVERY", None)
             log(f"Background NPU recovery probe failed: {e}")
             self._schedule_npu_recovery()
 
@@ -315,6 +320,8 @@ class GUIApp:
     def _swap_to_recovered_npu(self, engine, test_model):
         if self._engine is not engine:
             # Settings rebuilt the engine meanwhile; it chose its own device.
+            from debora_whisper.hardware_allocation import allocation
+            allocation.update("STT RECOVERY", None)
             return
         if not engine.inject_recovered_model("NPU", test_model):
             self._root.after(self.SWAP_RETRY_MS,
@@ -452,6 +459,8 @@ class GUIApp:
             log("Voice chat: backend settings changed; applied on the next turn.")
         self._config.update({key: value for key, value in new_config.items()
                              if key != "_saved_voice_chat"})
+        from debora_whisper.hardware_allocation import allocation
+        allocation.emit()
         if voice_chat_changed:
             set_voice_chat_config(self._config, bool(voice_chat))
         save_config(self._config)

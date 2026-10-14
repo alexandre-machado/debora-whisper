@@ -16,6 +16,7 @@ import re
 import shutil
 import socket
 import subprocess
+from debora_whisper.hardware_allocation import allocation, report_tts
 import sys
 import threading
 import time
@@ -393,6 +394,14 @@ class LLMProcess:
                 self.log(f"Voice chat: {message['log']}")
             elif "ready" in message:
                 self.device = message["ready"]
+                report = message.get("allocation", {})
+                target = report.get("target", self.device + " (hardware identity unreported)")
+                detail = (f"{self.key[0]} (openvino-genai) -> {target}  "
+                          f"pid {self.process.pid}")
+                if report.get("fallbacks"):
+                    detail += (f"; planned {report['planned']}, fell back to {target}: "
+                               + "; ".join(report["fallbacks"]))
+                allocation.update("LLM", detail)
                 self.log(f"Voice chat: {self.key[0]} loaded on {self.device} in "
                          f"{time.time() - self._start:.1f}s (process {self.process.pid})")
                 self.loaded.set()
@@ -404,6 +413,7 @@ class LLMProcess:
         if self.error is None:
             self.error = f"the LLM process exited (code {code})"
         self.loaded.set()
+        allocation.update("LLM", f"unavailable; {self.error}  pid {self.process.pid}")
         for replies in list(self._replies.values()):
             replies.put({"error": self.error})
 
@@ -512,6 +522,7 @@ def stop_llm():
         llm, _llm = _llm, None
     if llm is not None:
         llm.stop()
+        allocation.update("LLM", None)
 
 
 def generate_reply(messages: list[dict], config: dict, on_text, stop: threading.Event,
@@ -671,7 +682,14 @@ def tts_server_up(config: dict) -> bool:
     try:
         url = config["tts_url"].rstrip("/") + "/health"
         with _opener().open(url, timeout=1) as response:
-            return response.status == 200
+            if response.status != 200:
+                return False
+            try:
+                inventory = json.loads(response.read(16_384)).get("inventory")
+            except (ValueError, TypeError, AttributeError):
+                inventory = None
+            report_tts(config, inventory)
+            return True
     except Exception:
         return False
 
@@ -691,6 +709,7 @@ def ensure_tts_server(config: dict, log=print, log_path=None):
                 _tts_process.reported = True
                 log(f"Voice chat: the TTS server exited (code {_tts_process.returncode}); "
                     f"see {log_path or 'its output'}. Restart the app after fixing it.")
+                allocation.update("TTS", f"unavailable; server exited (launcher pid {_tts_process.pid})")
             return
         if tts_server_up(config):
             return  # started by hand, or left over from an earlier run
@@ -739,6 +758,7 @@ def stop_tts_server():
     # uv runs the server as a child process: end the whole tree, or the
     # server keeps its GPU memory after uv is gone.
     kill_tree(process)
+    allocation.update("TTS", None)
     try:
         process.wait(5)
     except subprocess.TimeoutExpired:
