@@ -346,7 +346,8 @@ uv run --script docs/benchmarks/tts-bench/bench_tts.py --out "$env:TEMP\debora-t
     marca.
 - **Windows:**
   - Nemotron e NeMo são oficialmente só Linux.
-  - Kokoro em pt precisa do espeak-ng.
+  - Kokoro em pt usa o espeak-ng, que vem embutido no ambiente do script
+    (pacote `espeakng-loader`); não precisa instalar no sistema.
   - O Qwen3-TTS recomenda FlashAttention 2, que é difícil de compilar no
     Windows. Sem ele deve funcionar, com mais memória **[suposição]**.
   - O Smart App Control do Windows já bloqueou o uv nesta máquina (erro de

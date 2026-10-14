@@ -30,8 +30,9 @@ def check_espeak():
         EspeakG2P(language="pt-br")("Olá.")
     except Exception as exc:
         raise RuntimeError(
-            "Kokoro requires espeak-ng for pt-BR. Install espeak-ng (64-bit on Windows), "
-            "set PHONEMIZER_ESPEAK_LIBRARY to its libespeak-ng.dll if it is not found, "
+            "Kokoro's pt-BR phonemizer (espeak-ng, bundled through espeakng-loader) "
+            "failed to load. Delete the uv cache entry for this script to reinstall it, "
+            "and check that Windows did not block the DLL (Smart App Control), "
             f"then restart the TTS server. Details: {exc}") from exc
 
 

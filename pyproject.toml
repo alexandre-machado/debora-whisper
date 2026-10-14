@@ -98,7 +98,6 @@ packages = ["debora_whisper"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "debora_whisper/harness_prompt.md" = "debora_whisper/harness_prompt.md"
-"debora_whisper/voices" = "debora_whisper/voices"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

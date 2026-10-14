@@ -472,9 +472,9 @@ transcripts produce an actionable `/health` error; they are never guessed.
 `tts_voice: null` is unsupported by Qwen. It uses SDPA without FlashAttention.
 
 `kokoro` uses **Kokoro-82M** (Apache-2.0), voice **pf_dora**, language **p**
-(pt-BR). It has **no voice cloning** and ignores `tts_voice`. Install **espeak-ng**
-with pt-BR data; on Windows its 64-bit DLL may need `PHONEMIZER_ESPEAK_LIBRARY`.
-If unavailable, `/health` reports how to fix it. Both new backends accept
+(pt-BR). It has **no voice cloning** and ignores `tts_voice`. Its pt-BR
+phonemizer, espeak-ng, comes bundled through `espeakng-loader`: no system install
+is needed. If it fails to load, `/health` reports how to fix it. Both new backends accept
 `--device cpu` or `--device cuda` when launched manually (default CUDA, CPU
 fallback when unavailable).
 

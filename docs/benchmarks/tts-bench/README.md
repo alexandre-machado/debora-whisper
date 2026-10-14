@@ -17,18 +17,15 @@ uv run --script debora_whisper/tts_server_kokoro.py --device cpu
 uv run --script debora_whisper/tts_server_kokoro.py --device cuda
 ```
 
-Kokoro needs **espeak-ng**, including the pt-BR language data. On Windows install
-the 64-bit [espeak-ng release](https://github.com/espeak-ng/espeak-ng/releases).
-If its DLL is not discovered, set this in terminal A before starting the server:
-
-```powershell
-$env:PHONEMIZER_ESPEAK_LIBRARY = 'C:\Program Files\eSpeak NG\libespeak-ng.dll'
-```
+Kokoro's pt-BR phonemizer, espeak-ng, comes bundled with the script's
+environment through `espeakng-loader`, so no system install is needed. If
+`/health` reports that it failed to load, check whether Windows blocked the DLL
+(Smart App Control) and rebuild the script environment.
 
 Qwen requires the exact reference transcript in UTF-8 `<voice>.txt`, next to
 `<voice>.wav`. `debora_whisper/voices/debora_v2.txt` ships with the app;
 other voices (including user overrides of `debora_v2.wav`) need their own sidecar.
-Missing/empty transcripts and missing espeak-ng return an actionable HTTP 503
+Missing/empty transcripts and an espeak-ng load failure return an actionable HTTP 503
 from `/health`; correct the problem and restart the server. No transcript is guessed.
 
 In terminal B, for each selected backend:

@@ -161,8 +161,8 @@ def test_missing_espeak_fails_at_health_before_model_load(monkeypatch):
     handler = server.make_handler(model, "pt", adapter=True, error=error)
     code, body = response(handler)
     assert code == 503
-    assert "Install espeak-ng" in json.loads(body)["error"]
-    assert "PHONEMIZER_ESPEAK_LIBRARY" in json.loads(body)["error"]
+    assert "espeakng-loader" in json.loads(body)["error"]
+    assert "Smart App Control" in json.loads(body)["error"]
     assert response(handler, "/tts", {"text": "Olá"})[0] == 503
     load.assert_not_called()
 
@@ -319,7 +319,10 @@ def test_default_transcript_is_exact_and_packaged():
     assert (ROOT / "debora_whisper/voices/debora_v2.txt").read_text(encoding="utf-8").splitlines() == [expected]
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     targets = project["tool"]["hatch"]["build"]["targets"]
-    assert targets["wheel"]["force-include"]["debora_whisper/voices"] == "debora_whisper/voices"
+    # packages = ["debora_whisper"] already ships voices/; a force-include of
+    # the same folder adds every file twice and breaks the wheel build.
+    assert targets["wheel"]["packages"] == ["debora_whisper"]
+    assert "debora_whisper/voices" not in targets["wheel"].get("force-include", {})
     assert "debora_whisper" in targets["sdist"]["include"]
 
 
