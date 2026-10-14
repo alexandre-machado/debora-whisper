@@ -572,6 +572,43 @@ def test_retry_with_context_and_smart_quotes_can_replace_entire_draft(screen, mo
     de.delete_text.assert_called_once_with(len("d'água... "))
 
 
+@pytest.mark.parametrize("cluster", ["e\u0301", "\u0915\u093e", "\u1100\u1161",
+                                     "\u2764\ufe0f", "\U0001f469\u200d\U0001f4bb",
+                                     "\U0001f44d\U0001f3fd", "\U0001f1e7\U0001f1f7"])
+@pytest.mark.parametrize("update_first", [False, True])
+def test_grapheme_movement_never_deletes_preceding_user_text(screen, monkeypatch, cluster, update_first):
+    app = _app(auto_enter=True)
+    screen.text = "X"
+    _say(app, cluster, is_final=False)
+    kept = screen.text
+    # This editor moves one grapheme per key, including for UIA reads.
+    # In particular, six movements read/delete all of "Xe\u0301... ".
+    units = ["X", cluster, ".", ".", ".", " "]
+    assert "".join(units) == kept
+
+    def read(count):
+        return "".join(units[-count:]) if count else ""
+
+    def delete(count):
+        if count > 0:
+            del units[-count:]
+            screen.text = "".join(units)
+
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    de.delete_text.side_effect = delete
+    assert read(len(app._draft_typed_text)) == kept
+    if update_first:
+        _say(app, "Replacement draft", is_final=False)
+    _say(app, "Replacement final!", is_final=True)
+
+    assert screen.text == kept
+    de.delete_text.assert_not_called()
+    assert screen.drafted == [cluster + "... "]
+    assert screen.pasted == []
+    assert screen.enters == 0
+    assert app._history[-1]["text"] == "Replacement final! "
+
+
 def test_unsafe_selection_is_not_retried_or_overwritten(screen, monkeypatch):
     app = _app(auto_enter=True)
     _say(app, "Minha frase", is_final=False)
@@ -632,21 +669,49 @@ def test_unproven_autocorrect_or_hidden_text_keeps_draft(screen, monkeypatch, re
 
 def test_mismatch_diagnostic_once_per_segment_including_recovered_reads(screen, monkeypatch, capsys):
     app = _app()
-    draft = "Uma frase muito longa para verificar que o diagnóstico tem apenas a cauda"
+    draft = "Uma frase muito longa para verificar que o diagnóstico não contém texto"
     _say(app, draft, is_final=False)
     expected = screen.text
-    read = MagicMock(side_effect=["stale\r", expected, "other", "other"])
+    private = "credential-never-dictated\r"
+    read = MagicMock(side_effect=[private, expected, "other", "other"])
     monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
     _say(app, draft + " maior", is_final=False)
     _say(app, draft + " maior!", is_final=True)
     output = capsys.readouterr().out
     assert output.count("Inline draft: verification mismatch;") == 1
-    assert f"expected_len={len(expected)} read_len=6" in output
-    assert f"expected_tail={expected[-40:]!r} read_tail='stale\\r'" in output
+    diagnostic = next(line for line in output.splitlines() if "verification mismatch;" in line)
+    assert f"expected_len={len(expected)} read_len={len(private)}" in diagnostic
+    assert "read_status=text representation_changed=True equivalent=False safe_count=False" in diagnostic
+    assert expected[-40:] not in diagnostic
+    for logged in (output, de.LOG_FILE.read_text(encoding="utf-8")):
+        assert private.strip() not in logged
+        assert "expected_tail=" not in logged
+        assert "read_tail=" not in logged
     monkeypatch.setattr(de.platforms.current(), "text_before_caret", lambda count: "")
     _say(app, "Outra frase", is_final=False)
     _say(app, "Outra frase!", is_final=True)
     assert capsys.readouterr().out.count("Inline draft: verification mismatch;") == 1
+
+
+@pytest.mark.parametrize("change_focus", [False, True])
+def test_unrelated_editor_text_never_reaches_logs(screen, monkeypatch, capsys, change_focus):
+    app = _app()
+    _say(app, "Minha frase", is_final=False)
+    private = "confidential-document-password"
+
+    def read(count):
+        if change_focus:
+            screen.target = ("window", "another control")
+        return private
+
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    _say(app, "Minha frase completa!", is_final=True)
+    output = capsys.readouterr().out
+    assert private not in output
+    assert private not in de.LOG_FILE.read_text(encoding="utf-8")
+    assert ("verification mismatch;" in output) is not change_focus
+    de.delete_text.assert_not_called()
+    assert screen.pasted == []
 
 
 @pytest.mark.parametrize("expected,observed,equivalent,safe", [
@@ -656,6 +721,9 @@ def test_mismatch_diagnostic_once_per_segment_including_recovered_reads(screen, 
     ("two\nlines ", "two\r\nlines ", True, False),
     ("draft ", "other draft\u00a0", True, True),
     ("don't ", "don\u2019t ", True, True),
+    ("e\u0301... ", "Xe\u0301... ", True, False),
+    ("e\u0301... ", "e\u0301... ", True, False),
+    ("é... ", "Xé... ", True, True),
     ("a--b ", "a\u2014b ", False, False),
     ("two spaces ", "two  spaces ", False, False),
     ("draft ", "different ", False, False),

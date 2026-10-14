@@ -24,7 +24,7 @@ from datetime import datetime
 from debora_whisper import paths, platforms, processes
 from debora_whisper.platforms.base import CaretReadStatus
 # Kept for callers checking the shared clipboard transaction lock.
-from debora_whisper.platforms.windows_text import _clipboard_lock
+from debora_whisper.platforms.windows_text import _clipboard_lock, can_backspace_draft
 from debora_whisper.harness import MemoryHotwords, ProjectHotwords, bounded_hotwords
 from debora_whisper.solo_key import SoloKeyTap
 from debora_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
@@ -2383,7 +2383,8 @@ def _draft_read_matches(expected: str, observed: str | CaretReadStatus | None) -
 
     Extra paragraph/cell marks and trimmed whitespace can explain a match,
     but do not establish how many Shift+Left keys would select our text.
-    Only one-for-one substitutions authorize the existing deletion count.
+    Only one-for-one substitutions of unambiguous characters authorize the
+    existing deletion count; a provider may count graphemes, not code points.
     """
     if not isinstance(observed, str) or not expected:
         return False, False
@@ -2392,7 +2393,10 @@ def _draft_read_matches(expected: str, observed: str | CaretReadStatus | None) -
     equivalent = bool(body) and _normalize_draft_text(observed).rstrip(" \t\n\x07").endswith(body)
     suffix = observed[-len(expected):]
     safe = (len(suffix) == len(expected) == len(normalized)
-            and _normalize_draft_text(suffix) == normalized)
+            and _normalize_draft_text(suffix) == normalized
+            # Reuse the conservative key-count guard. Verified single line
+            # separators are supported, unlike unverified Backspace drafts.
+            and can_backspace_draft(normalized.replace("\n", " ")))
     return equivalent, safe
 
 
@@ -2997,18 +3001,22 @@ class DictationApp:
             # A little context on retry prevents a provider's trailing marks
             # from cutting the first characters off the expected suffix.
             observed = platforms.current().text_before_caret(len(expected) + (8 if attempt else 0))
-            equivalent, safe = _draft_read_matches(expected, observed)
-            exact = isinstance(observed, str) and observed[-len(expected):] == expected
-            if not exact and not self._draft_mismatch_logged:
-                self._draft_mismatch_logged = True
-                observed_len = len(observed) if isinstance(observed, str) else None
-                tail = observed[-40:] if isinstance(observed, str) else observed
-                log(f"Inline draft: verification mismatch; expected_len={len(expected)} "
-                    f"read_len={observed_len} expected_tail={expected[-40:]!r} "
-                    f"read_tail={tail!r} equivalent={equivalent} safe_count={safe}")
             # Focus may change while COM is reading or between retries.
             if not same_input_target(get_input_target(), self._draft_target):
                 break
+            equivalent, safe = _draft_read_matches(expected, observed)
+            exact = isinstance(observed, str) and observed[-len(expected):] == expected
+            if (not exact or not safe) and not self._draft_mismatch_logged:
+                self._draft_mismatch_logged = True
+                observed_len = len(observed) if isinstance(observed, str) else None
+                read_status = ("text" if isinstance(observed, str) else
+                               "unsafe" if observed is CaretReadStatus.UNSAFE else "unavailable")
+                representation_changed = (isinstance(observed, str)
+                                          and _normalize_draft_text(observed) != observed)
+                log(f"Inline draft: verification mismatch; expected_len={len(expected)} "
+                    f"read_len={observed_len} read_status={read_status} "
+                    f"representation_changed={representation_changed} "
+                    f"equivalent={equivalent} safe_count={safe}")
             if safe:
                 return True
             if observed is CaretReadStatus.UNSAFE:
