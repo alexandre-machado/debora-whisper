@@ -277,6 +277,72 @@ def test_terminal_complex_unicode_uses_overlay(terminal, complex_text, previous)
     assert terminal.pasted == ["Olá, tudo bem? "]
 
 
+@pytest.mark.parametrize("complex_text", ["emoji 👍", "cafe\u0301", "mark \ufe0f", "join\u200der",
+                                         "hangul \u1100\u1161", "surrogate \ud83d",
+                                         "control\x07text", "two\r\nlines"])
+@pytest.mark.parametrize("previous", [False, True])
+def test_readable_complex_unicode_switches_to_overlay(screen, complex_text, previous):
+    app = _app(auto_enter=True)
+    prefix = "Existing user text: "
+    screen.text = prefix
+    if previous:
+        _say(app, "Olá tudo", is_final=False)
+    _say(app, complex_text, is_final=False)
+
+    assert screen.text == prefix
+    assert screen.drafted == (["Olá tudo... "] if previous else [])
+    assert app.last_draft_text == complex_text + "... "
+    assert app._draft_strategy == "overlay"
+    assert app._inline_drafts_abandoned
+    assert not app._draft_final_suppressed
+    assert app._draft_typed_text == ""
+    if previous:
+        de.delete_text.assert_called_once_with(len("Olá tudo... "))
+    else:
+        de.delete_text.assert_not_called()
+
+    _say(app, "Simple update", is_final=False)
+    assert screen.text == prefix
+    assert app.last_draft_text == "Simple update... "
+    final = complex_text + " completo! "
+    _say(app, final, is_final=True)
+    assert screen.text == prefix + final
+    assert screen.pasted == [final]
+    assert screen.enters == 1
+    assert app._history[-1]["text"] == final
+    assert app._draft_strategy is None
+    assert not app._inline_drafts_abandoned
+    _say(app, "Next segment", is_final=False)
+    assert screen.text == prefix + final + "Next segment... "
+    assert app._draft_strategy == "verified"
+
+
+@pytest.mark.parametrize("obstacle", ["focus", "mismatch", "unsafe"])
+def test_readable_complex_transition_keeps_unremovable_draft(screen, monkeypatch, obstacle):
+    app = _app(auto_enter=True)
+    _say(app, "Olá tudo", is_final=False)
+    if obstacle == "focus":
+        screen.target = ("other window", "field")
+        screen.text = "Other user text"
+    elif obstacle == "mismatch":
+        screen.text += "user edit"
+    else:
+        monkeypatch.setattr(de.platforms.current(), "text_before_caret",
+                            lambda count: CaretReadStatus.UNSAFE)
+    kept = screen.text
+    _say(app, "cafe\u0301", is_final=False)
+    assert app._draft_strategy == "overlay"
+    assert app._draft_final_suppressed
+    _say(app, "cafe\u0301 completo!", is_final=True)
+
+    assert screen.text == kept
+    de.delete_text.assert_not_called()
+    assert screen.drafted == ["Olá tudo... "]
+    assert screen.pasted == []
+    assert screen.enters == 0
+    assert app._history[-1]["text"] == "cafe\u0301 completo! "
+
+
 def test_terminal_focus_change_leaves_draft_and_abandons_segment(terminal):
     app = _app()
     _say(app, "Olá tudo", is_final=False)
@@ -284,7 +350,18 @@ def test_terminal_focus_change_leaves_draft_and_abandons_segment(terminal):
     terminal.text, terminal.caret = "user text: ", len("user text: ")
     _say(app, "Olá tudo bem", is_final=False)
     _say(app, "Olá, tudo bem?", is_final=True)
-    assert terminal.text == "user text: Olá, tudo bem? "
+    assert terminal.text == "user text: "
+    assert terminal.keys == []
+
+
+def test_terminal_focus_change_with_complex_draft_does_not_duplicate(terminal):
+    app = _app()
+    _say(app, "Olá tudo", is_final=False)
+    terminal.target = ("other window", "field")
+    terminal.text, terminal.caret = "user text: ", len("user text: ")
+    _say(app, "Olá tudo 👍", is_final=False)
+    _say(app, "Olá tudo 👍!", is_final=True)
+    assert terminal.text == "user text: "
     assert terminal.keys == []
 
 
@@ -429,12 +506,13 @@ def test_changed_draft_abandons_segment(screen, monkeypatch, capsys, observed, s
         assert app._inline_drafts_abandoned
         assert states[-1]["draft_text"] == "Olá tudo bem hoje... "
     _say(app, "Olá, tudo bem?", is_final=True)
-    assert screen.text == kept + "Olá, tudo bem? "
+    assert screen.text == kept
     assert screen.drafted == ["Olá tudo... "]
-    assert screen.pasted == ["Olá, tudo bem? "]
-    assert read.call_args_list == [call(0), call(len("Olá tudo... "))]
+    assert screen.pasted == []
+    assert read.call_args_list == [call(0), call(len("Olá tudo... ")),
+                                   call(len("Olá tudo... ") + 8)]
     assert capsys.readouterr().out.count(
-        "Inline draft: target changed; leaving the draft and typing the final") == 1
+        "Inline draft: cannot safely reconcile; keeping the draft and suppressing final paste") == 1
     assert not app._inline_drafts_abandoned
     _say(app, "Nova frase", is_final=False)
     assert screen.drafted[-1] == "Nova frase... "
@@ -453,6 +531,20 @@ def test_abandoned_draft_resets_after_empty_or_failed_final(screen, monkeypatch,
     assert screen.drafted[-1] == "Nova frase... "
 
 
+@pytest.mark.parametrize("final", ["Frase corrigida!", "", RuntimeError("failed final")])
+def test_suppression_resets_for_next_final_only_segment(screen, monkeypatch, final):
+    app = _app()
+    _say(app, "Minha frase", is_final=False)
+    kept = screen.text
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", lambda count: None)
+    _say(app, "Minha frase completa", is_final=False)
+    _say(app, final, is_final=True)
+    assert screen.text == kept
+    assert not app._draft_final_suppressed
+    _say(app, "Outra frase!", is_final=True)
+    assert screen.text == kept + "Outra frase! "
+
+
 def test_empty_final_verifies_before_erasing(screen, monkeypatch):
     monkeypatch.setattr(de.platforms.current(), "text_before_caret", lambda count: "changed")
     app = _app()
@@ -460,6 +552,256 @@ def test_empty_final_verifies_before_erasing(screen, monkeypatch):
     _say(app, "", is_final=True)
     assert screen.text == "Olá tudo... "
     assert app._draft_typed_text == ""
+
+
+@pytest.mark.parametrize("plain,rich", [(" ", "\u00a0"), (" ", "\u202f"),
+                                      (" ", "\u2009"), ("'", "\u2019"),
+                                      ('"', '\u201c'), ("\n", "\r"),
+                                      ("\n", "\v"), ("\n", "\u2029")])
+def test_word_one_for_one_changes_rewrite_only_our_tail(screen, monkeypatch, plain, rich):
+    app = _app()
+    prefix = "Existing user text: "
+    screen.text = prefix
+    draft = f"Minha{plain}frase"
+    _say(app, draft, is_final=False)
+    # Simulate transformations in the editor itself, not just in the UIA read.
+    screen.text = prefix + screen.text[len(prefix):].replace(plain, rich)
+    _say(app, draft + " completa", is_final=False)
+    screen.text = prefix + screen.text[len(prefix):].replace(plain, rich)
+    _say(app, draft + " completa!", is_final=True)
+
+    assert screen.text == prefix + (draft + " completa").replace(plain, rich) + "! "
+    assert screen.pasted == ["! "]
+    assert not app._draft_final_suppressed
+
+
+@pytest.mark.parametrize("suffix", ["\r", "\v", "\r\n", "\x07", "\r\x07", "  "])
+def test_word_extra_trailing_marks_preserve_draft_without_duplicate(screen, monkeypatch, suffix):
+    app = _app(auto_enter=True)
+    screen.text = "Existing user text: "
+    _say(app, "Minha frase", is_final=False)
+    kept = screen.text
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret",
+                        lambda count: (screen.text + suffix)[-count:])
+    _say(app, "Minha frase completa", is_final=False)
+    _say(app, "Minha frase completa!", is_final=True)
+
+    assert screen.text == kept
+    assert screen.pasted == []
+    assert screen.enters == 0
+    de.delete_text.assert_not_called()
+    assert app._history[-1]["text"] == "Minha frase completa! "
+
+
+@pytest.mark.parametrize("actually_trimmed", [False, True])
+def test_word_trimmed_trailing_space_never_overdeletes_or_duplicates(screen, monkeypatch, actually_trimmed):
+    app = _app()
+    screen.text = "Existing user text: "
+    _say(app, "Minha frase", is_final=False)
+    if actually_trimmed:
+        screen.text = screen.text.rstrip()
+    kept = screen.text
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret",
+                        lambda count: screen.text.rstrip()[-count:])
+    _say(app, "Frase corrigida!", is_final=True)
+    assert screen.text == kept
+    assert screen.pasted == []
+    de.delete_text.assert_not_called()
+
+
+@pytest.mark.parametrize("stale", [None, "", "Minha", "Minha frase...", "Minha frase... \r"])
+def test_stale_then_fresh_read_reconciles_without_duplicate(screen, monkeypatch, stale):
+    app = _app()
+    _say(app, "Minha frase", is_final=False)
+    read = MagicMock(side_effect=[stale, screen.text])
+    wait = MagicMock()
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    monkeypatch.setattr(de.time, "sleep", wait)
+    _say(app, "Minha frase completa!", is_final=True)
+    assert screen.text == "Minha frase completa! "
+    assert screen.pasted == [" completa! "]
+    assert read.call_args_list == [call(len("Minha frase... ")), call(len("Minha frase... ") + 8)]
+    wait.assert_called_once_with(0.040)
+
+
+def test_retry_with_context_and_smart_quotes_can_replace_entire_draft(screen, monkeypatch):
+    app = _app()
+    prefix = "Existing user text: "
+    screen.text = prefix
+    _say(app, "d'água", is_final=False)
+    screen.text = screen.text.replace("'", "\u2019")
+    read = MagicMock(side_effect=["stale", screen.text])
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    _say(app, "Água fresca!", is_final=True)
+    assert screen.text == prefix + "Água fresca! "
+    assert screen.pasted == ["Água fresca! "]
+    de.delete_text.assert_called_once_with(len("d'água... "))
+
+
+@pytest.mark.parametrize("cluster", ["e\u0301", "\u0915\u093e", "\u1100\u1161",
+                                     "\u2764\ufe0f", "\U0001f469\u200d\U0001f4bb",
+                                     "\U0001f44d\U0001f3fd", "\U0001f1e7\U0001f1f7"])
+@pytest.mark.parametrize("update_first", [False, True])
+def test_grapheme_movement_never_deletes_preceding_user_text(screen, monkeypatch, cluster, update_first):
+    app = _app(auto_enter=True)
+    screen.text = "X"
+    # Seed a pre-existing guarded draft to test the verifier's defense even
+    # though the insertion path now prevents this state.
+    app._draft_strategy = "verified"
+    app._draft_target = screen.target
+    app._draft_typed_text = cluster + "... "
+    screen.type_draft(app._draft_typed_text)
+    kept = screen.text
+    # This editor moves one grapheme per key, including for UIA reads.
+    # In particular, six movements read/delete all of "Xe\u0301... ".
+    units = ["X", cluster, ".", ".", ".", " "]
+    assert "".join(units) == kept
+
+    def read(count):
+        return "".join(units[-count:]) if count else ""
+
+    def delete(count):
+        if count > 0:
+            del units[-count:]
+            screen.text = "".join(units)
+
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    de.delete_text.side_effect = delete
+    assert read(len(app._draft_typed_text)) == kept
+    if update_first:
+        _say(app, "Replacement draft", is_final=False)
+    _say(app, "Replacement final!", is_final=True)
+
+    assert screen.text == kept
+    de.delete_text.assert_not_called()
+    assert screen.drafted == [cluster + "... "]
+    assert screen.pasted == []
+    assert screen.enters == 0
+    assert app._history[-1]["text"] == "Replacement final! "
+
+
+def test_unsafe_selection_is_not_retried_or_overwritten(screen, monkeypatch):
+    app = _app(auto_enter=True)
+    _say(app, "Minha frase", is_final=False)
+    kept = screen.text
+    read = MagicMock(return_value=CaretReadStatus.UNSAFE)
+    wait = MagicMock()
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    monkeypatch.setattr(de.time, "sleep", wait)
+    _say(app, "Minha frase completa!", is_final=True)
+    read.assert_called_once_with(len("Minha frase... "))
+    wait.assert_not_called()
+    de.delete_text.assert_not_called()
+    assert screen.text == kept
+    assert screen.pasted == []
+    assert screen.enters == 0
+
+
+@pytest.mark.parametrize("when", ["first_read", "wait", "second_read"])
+def test_focus_change_during_verification_never_deletes_or_pastes(screen, monkeypatch, when):
+    app = _app(auto_enter=True)
+    _say(app, "Minha frase", is_final=False)
+    previous = screen.text
+    reads = []
+
+    def move():
+        screen.target = ("window", "another control")
+        screen.text = "User's other field"
+
+    def read(count):
+        reads.append(count)
+        if when == "first_read" or (when == "second_read" and len(reads) == 2):
+            move()
+            return previous  # A late but matching result must not authorize keys.
+        return "stale"
+
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    monkeypatch.setattr(de.time, "sleep", lambda seconds: move() if when == "wait" else None)
+    _say(app, "Minha frase completa!", is_final=True)
+    assert screen.text == "User's other field"
+    assert screen.pasted == []
+    assert screen.enters == 0
+    de.delete_text.assert_not_called()
+    assert len(reads) == (2 if when == "second_read" else 1)
+
+
+@pytest.mark.parametrize("replacement", ["Minha frase... ", "minha\u200b frase... ",
+                                         "minha\x13 frase... ", "minha\x07 frase... ",
+                                         "minha frase\u2026 ", "unrelated text"])
+def test_unproven_autocorrect_or_hidden_text_keeps_draft(screen, monkeypatch, replacement):
+    app = _app()
+    _say(app, "minha frase", is_final=False)
+    screen.text = replacement
+    _say(app, "minha frase completa!", is_final=True)
+    assert screen.text == replacement
+    assert screen.pasted == []
+    de.delete_text.assert_not_called()
+
+
+def test_mismatch_diagnostic_once_per_segment_including_recovered_reads(screen, monkeypatch, capsys):
+    app = _app()
+    draft = "Uma frase muito longa para verificar que o diagnóstico não contém texto"
+    _say(app, draft, is_final=False)
+    expected = screen.text
+    private = "credential-never-dictated\r"
+    read = MagicMock(side_effect=[private, expected, "other", "other"])
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    _say(app, draft + " maior", is_final=False)
+    _say(app, draft + " maior!", is_final=True)
+    output = capsys.readouterr().out
+    assert output.count("Inline draft: verification mismatch;") == 1
+    diagnostic = next(line for line in output.splitlines() if "verification mismatch;" in line)
+    assert f"expected_len={len(expected)} read_len={len(private)}" in diagnostic
+    assert "read_status=text representation_changed=True equivalent=False safe_count=False" in diagnostic
+    assert expected[-40:] not in diagnostic
+    for logged in (output, de.LOG_FILE.read_text(encoding="utf-8")):
+        assert private.strip() not in logged
+        assert "expected_tail=" not in logged
+        assert "read_tail=" not in logged
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", lambda count: "")
+    _say(app, "Outra frase", is_final=False)
+    _say(app, "Outra frase!", is_final=True)
+    assert capsys.readouterr().out.count("Inline draft: verification mismatch;") == 1
+
+
+@pytest.mark.parametrize("change_focus", [False, True])
+def test_unrelated_editor_text_never_reaches_logs(screen, monkeypatch, capsys, change_focus):
+    app = _app()
+    _say(app, "Minha frase", is_final=False)
+    private = "confidential-document-password"
+
+    def read(count):
+        if change_focus:
+            screen.target = ("window", "another control")
+        return private
+
+    monkeypatch.setattr(de.platforms.current(), "text_before_caret", read)
+    _say(app, "Minha frase completa!", is_final=True)
+    output = capsys.readouterr().out
+    assert private not in output
+    assert private not in de.LOG_FILE.read_text(encoding="utf-8")
+    assert ("verification mismatch;" in output) is not change_focus
+    de.delete_text.assert_not_called()
+    assert screen.pasted == []
+
+
+@pytest.mark.parametrize("expected,observed,equivalent,safe", [
+    ("draft ", "prefix draft\r", True, False),
+    ("draft ", "prefix draft", True, False),
+    ("draft ", "prefix draft \r\x07", True, False),
+    ("two\nlines ", "two\r\nlines ", True, False),
+    ("draft ", "other draft\u00a0", True, True),
+    ("don't ", "don\u2019t ", True, True),
+    ("e\u0301... ", "Xe\u0301... ", True, False),
+    ("e\u0301... ", "e\u0301... ", True, False),
+    ("é... ", "Xé... ", True, True),
+    ("a--b ", "a\u2014b ", False, False),
+    ("two spaces ", "two  spaces ", False, False),
+    ("draft ", "different ", False, False),
+    ("draft ", CaretReadStatus.UNSAFE, False, False),
+])
+def test_draft_representation_match_does_not_guess_key_counts(expected, observed, equivalent, safe):
+    assert de._draft_read_matches(expected, observed) == (equivalent, safe)
 
 
 def test_final_equal_to_draft_still_presses_auto_enter(screen):
@@ -493,7 +835,7 @@ def test_final_log_is_not_truncated(screen, capsys):
     assert f"Final transcription: {text.strip()}" in capsys.readouterr().out
 
 
-def test_focus_change_leaves_old_draft_and_types_full_text(screen):
+def test_focus_change_leaves_old_draft_and_suppresses_final(screen):
     app = _app()
     _say(app, "Primeira parte", is_final=False)
     typed_in_old_window = screen.text
@@ -502,7 +844,9 @@ def test_focus_change_leaves_old_draft_and_types_full_text(screen):
 
     _say(app, "Primeira parte.", is_final=True)
 
-    assert screen.text == "código do usuário" + "Primeira parte. "
+    assert screen.text == "código do usuário"
+    assert screen.pasted == []
+    assert app._history[-1]["text"] == "Primeira parte. "
     assert typed_in_old_window == "Primeira parte... "
 
 
@@ -514,7 +858,8 @@ def test_focus_moving_to_another_field_counts_as_change(screen):
 
     _say(app, "Rascunho final.", is_final=True)
 
-    assert screen.text == "outro campo" + "Rascunho final. "
+    assert screen.text == "outro campo"
+    assert screen.pasted == []
 
 
 def test_empty_draft_keeps_typed_draft(screen):

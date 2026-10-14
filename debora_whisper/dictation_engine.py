@@ -12,6 +12,7 @@ import json
 import re
 import argparse
 import inspect
+import unicodedata
 from copy import deepcopy
 import threading
 import zlib
@@ -21,8 +22,9 @@ from pathlib import Path
 from datetime import datetime
 
 from debora_whisper import paths, platforms, processes
+from debora_whisper.platforms.base import CaretReadStatus
 # Kept for callers checking the shared clipboard transaction lock.
-from debora_whisper.platforms.windows_text import _clipboard_lock
+from debora_whisper.platforms.windows_text import _clipboard_lock, can_backspace_draft
 from debora_whisper.harness import MemoryHotwords, ProjectHotwords, bounded_hotwords
 from debora_whisper.solo_key import SoloKeyTap
 from debora_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
@@ -2368,6 +2370,36 @@ def _type_text_ctypes(text: str):
     return platforms.current()._type_text_ctypes(text)
 
 
+def _normalize_draft_text(text: str) -> str:
+    """Compare representations, without case folding or dropping hidden text."""
+    quotes = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
+    text = text.replace("\r\n", "\n").translate(quotes)
+    return "".join(" " if unicodedata.category(c) == "Zs" else
+                   "\n" if c in "\r\v\u2028\u2029" else c for c in text)
+
+
+def _draft_read_matches(expected: str, observed: str | CaretReadStatus | None) -> tuple[bool, bool]:
+    """Return (equivalent suffix, safe key count).
+
+    Extra paragraph/cell marks and trimmed whitespace can explain a match,
+    but do not establish how many Shift+Left keys would select our text.
+    Only one-for-one substitutions of unambiguous characters authorize the
+    existing deletion count; a provider may count graphemes, not code points.
+    """
+    if not isinstance(observed, str) or not expected:
+        return False, False
+    normalized = _normalize_draft_text(expected)
+    body = normalized.rstrip(" \t\n\x07")
+    equivalent = bool(body) and _normalize_draft_text(observed).rstrip(" \t\n\x07").endswith(body)
+    suffix = observed[-len(expected):]
+    safe = (len(suffix) == len(expected) == len(normalized)
+            and _normalize_draft_text(suffix) == normalized
+            # Reuse the conservative key-count guard. Verified single line
+            # separators are supported, unlike unverified Backspace drafts.
+            and can_backspace_draft(normalized.replace("\n", " ")))
+    return equivalent, safe
+
+
 # ---------------------------------------------------------------------------
 # Audio feedback (chimes)
 # ---------------------------------------------------------------------------
@@ -2559,6 +2591,8 @@ class DictationApp:
         self._draft_target = None
         self._inline_drafts_abandoned = False
         self._draft_strategy = None
+        self._draft_final_suppressed = False
+        self._draft_mismatch_logged = False
         self.voice_chat = VoiceChat(config, log=log, tts_log_path=TTS_SERVER_LOG,
                                     llm_log_path=LLM_SERVER_LOG)
         self.recorder.on_voice = self._voice_activity
@@ -2960,13 +2994,40 @@ class DictationApp:
         """Caller holds _output_lock. A changed target ends inline output."""
         if self._draft_strategy == "backspace":
             return True
-        observed = platforms.current().text_before_caret(len(self._draft_typed_text))
-        if observed == self._draft_typed_text:
-            return True
+        expected = self._draft_typed_text
+        for attempt in range(2):
+            if not same_input_target(get_input_target(), self._draft_target):
+                break
+            # A little context on retry prevents a provider's trailing marks
+            # from cutting the first characters off the expected suffix.
+            observed = platforms.current().text_before_caret(len(expected) + (8 if attempt else 0))
+            # Focus may change while COM is reading or between retries.
+            if not same_input_target(get_input_target(), self._draft_target):
+                break
+            equivalent, safe = _draft_read_matches(expected, observed)
+            exact = isinstance(observed, str) and observed[-len(expected):] == expected
+            if (not exact or not safe) and not self._draft_mismatch_logged:
+                self._draft_mismatch_logged = True
+                observed_len = len(observed) if isinstance(observed, str) else None
+                read_status = ("text" if isinstance(observed, str) else
+                               "unsafe" if observed is CaretReadStatus.UNSAFE else "unavailable")
+                representation_changed = (isinstance(observed, str)
+                                          and _normalize_draft_text(observed) != observed)
+                log(f"Inline draft: verification mismatch; expected_len={len(expected)} "
+                    f"read_len={observed_len} read_status={read_status} "
+                    f"representation_changed={representation_changed} "
+                    f"equivalent={equivalent} safe_count={safe}")
+            if safe:
+                return True
+            if observed is CaretReadStatus.UNSAFE:
+                break
+            if attempt == 0:
+                time.sleep(0.040)
         self._inline_drafts_abandoned = True
+        self._draft_final_suppressed = True
         self._draft_typed_text = ""
         self._draft_target = None
-        log("Inline draft: target changed; leaving the draft and typing the final")
+        log("Inline draft: cannot safely reconcile; keeping the draft and suppressing final paste")
         return False
 
     def _choose_draft_strategy_locked(self):
@@ -2990,17 +3051,23 @@ class DictationApp:
 
     def _forget_draft_locked(self, erase: bool):
         """Stop tracking the typed draft, first erasing it if asked and keys
-        still land where it was typed. Caller holds _output_lock."""
+        still land where it was typed. Return whether text was left behind.
+        Caller holds _output_lock."""
+        retained = bool(self._draft_typed_text) or self._draft_final_suppressed
         if erase and self._draft_typed_text:
             if same_input_target(get_input_target(), self._draft_target):
                 if self._verify_draft_locked():
                     self._delete_draft_tail_locked(len(self._draft_typed_text))
+                    retained = False
             else:
                 log("Input focus changed; leaving the draft where it was typed.")
         self._draft_typed_text = ""
         self._draft_target = None
         self._inline_drafts_abandoned = False
         self._draft_strategy = None
+        self._draft_final_suppressed = False
+        self._draft_mismatch_logged = False
+        return retained
 
     def _finish_recording(self, generation=None, audio=None, is_final=True,
                           segment_id=None, audio_end=None, captured_at=None):
@@ -3123,13 +3190,17 @@ class DictationApp:
                                 and not self._inline_drafts_abandoned):
                             if self._draft_strategy is None:
                                 self._choose_draft_strategy_locked()
-                            if (self._draft_strategy == "backspace"
-                                    and not platforms.current().can_backspace_draft(text)):
+                            if ((self._draft_strategy == "backspace"
+                                    and not platforms.current().can_backspace_draft(text))
+                                    or (self._draft_strategy == "verified"
+                                        and not _draft_read_matches(text, text)[1])):
                                 # Remove only the previous, simple-character draft.
                                 # Never inline text whose deletion count is ambiguous.
-                                self._forget_draft_locked(erase=True)
+                                # Even an exact read must authorize its later removal.
+                                retained = self._forget_draft_locked(erase=True)
                                 self._draft_strategy = "overlay"
                                 self._inline_drafts_abandoned = True
+                                self._draft_final_suppressed = retained
                                 log("Inline draft: complex Unicode; drafts stay in the overlay")
                         if self._draft_typed_text:
                             if same_input_target(target, self._draft_target):
@@ -3142,9 +3213,12 @@ class DictationApp:
                                 self._draft_typed_text = ""
                                 self._draft_target = None
                                 self._inline_drafts_abandoned = True
+                                self._draft_final_suppressed = True
 
                         if is_final:
-                            if text_to_type:
+                            if self._draft_final_suppressed:
+                                log("Inline draft: final kept in history; no duplicate pasted")
+                            elif text_to_type:
                                 type_text(text_to_type, auto_enter=self.config["auto_enter"])
                             elif self.config["auto_enter"]:
                                 # The draft already holds the whole text.
@@ -3153,6 +3227,8 @@ class DictationApp:
                             self._draft_target = None
                             self._inline_drafts_abandoned = False
                             self._draft_strategy = None
+                            self._draft_final_suppressed = False
+                            self._draft_mismatch_logged = False
                             log(f"Final transcription: {text.strip()}")
 
                             self._history.append({
