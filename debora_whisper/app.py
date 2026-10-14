@@ -120,6 +120,9 @@ class GUIApp:
 
     def _new_engine(self) -> DictationApp:
         engine = DictationApp(self._config)
+        previous = getattr(self, "_engine", None)
+        if previous is not None:
+            engine.restore_history(previous)
         engine.add_callback(self._on_state_change)
         engine.on_voice_chat_toggle = self._toggle_voice_chat
         return engine

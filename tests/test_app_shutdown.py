@@ -89,6 +89,8 @@ def test_audio_settings_restart_engine(key, value):
         app._on_settings_apply({**app._config, key: value})
     old_engine.stop_if_idle.assert_called_once()
     engine_factory.assert_called_once_with(app._config)
+    # The rebuilt engine keeps the dictation history and the conversation.
+    new_engine.restore_history.assert_called_once_with(old_engine)
     new_engine.start_background.assert_called_once()
 
 

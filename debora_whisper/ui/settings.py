@@ -27,7 +27,7 @@ _BADGE_DL = "#9CA3AF"          # Gray-400 for "Download"
 _DEFAULT_VOICE = "Chatterbox default"
 _TTS_ENGINES = {
     "chatterbox": "Chatterbox (clones the voice)",
-    "qwen3": "Qwen3-TTS (faster, clones the voice)",
+    "qwen3": "Qwen3-TTS (experimental, clones the voice)",
     "kokoro": "Kokoro (fastest, pt-BR voice pf_dora)",
 }
 _TTS_ENGINE_KEYS = {label: key for key, label in _TTS_ENGINES.items()}

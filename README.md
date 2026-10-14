@@ -469,7 +469,9 @@ WAV. The confirmed transcript `debora_whisper/voices/debora_v2.txt` ships with
 the default voice. Other voices need their own exact transcript; a user WAV
 that overrides the bundled voice also needs its own sidecar. Missing or empty
 transcripts produce an actionable `/health` error; they are never guessed.
-`tts_voice: null` is unsupported by Qwen. It uses SDPA without FlashAttention.
+`tts_voice: null` is unsupported by Qwen, and Settings rejects it. It uses SDPA
+without FlashAttention. On an RTX 4070 Laptop it measured about 2.9 s of compute
+per second of audio, slower than Chatterbox, so it is experimental.
 
 `kokoro` uses **Kokoro-82M** (Apache-2.0), voice **pf_dora**, language **p**
 (pt-BR). It has **no voice cloning** and ignores `tts_voice`. Its pt-BR

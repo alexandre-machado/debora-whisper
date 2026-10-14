@@ -430,6 +430,10 @@ def validate_config(config: dict):
     voice = config.get("tts_voice")
     if voice is not None and (not isinstance(voice, str) or not voice.strip()):
         raise ValueError(f"tts_voice must be null or a file path or name, got {voice!r}")
+    if config.get("tts_backend") == "qwen3" and voice is None:
+        raise ValueError("Qwen3 requires a reference voice (tts_voice); "
+                         "select a WAV voice with a matching UTF-8 .txt transcript "
+                         "instead of Chatterbox default.")
     url = config.get("tts_url", DEFAULT_CONFIG["tts_url"])
     if not is_http_url(url):
         raise ValueError(f"tts_url must be an http(s) URL, got {url!r}")
@@ -2685,6 +2689,13 @@ class DictationApp:
     @property
     def history(self) -> list[dict]:
         return list(self._history)
+
+    def restore_history(self, previous: "DictationApp"):
+        """Carry session history from a stopped engine into its replacement."""
+        self._history = previous.history
+        self.voice_chat._history = list(previous.voice_chat._history)
+        # The next turn uses this timestamp to expire idle conversations.
+        self.voice_chat._last_turn = previous.voice_chat._last_turn
 
     # -- Model management -----------------------------------------------
 

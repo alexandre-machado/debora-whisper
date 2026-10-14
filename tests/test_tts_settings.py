@@ -13,11 +13,11 @@ from debora_whisper.ui.settings import (
 
 @pytest.mark.parametrize("backend,label", [
     ("chatterbox", "Chatterbox (clones the voice)"),
-    ("qwen3", "Qwen3-TTS (faster, clones the voice)"),
+    ("qwen3", "Qwen3-TTS (experimental, clones the voice)"),
     ("kokoro", "Kokoro (fastest, pt-BR voice pf_dora)"),
 ])
 @pytest.mark.parametrize("voice", [_DEFAULT_VOICE, "isabel"])
-def test_settings_save_engine_and_voice(backend, label, voice, monkeypatch):
+def test_settings_apply_engine_and_voice(backend, label, voice, monkeypatch):
     assert _TTS_ENGINES[backend] == label
     assert _TTS_ENGINE_KEYS[label] == backend
     window = SettingsWindow.__new__(SettingsWindow)
@@ -35,9 +35,16 @@ def test_settings_save_engine_and_voice(backend, label, voice, monkeypatch):
     window._harness_cwd = None
     window._get_selected_lang_code = lambda: "pt"
     window._on_apply = MagicMock()
+    window.update_status = MagicMock()
     monkeypatch.setattr(de, "detect_devices", lambda: ["CPU"])
     monkeypatch.setattr(de, "select_device", lambda *args: "CPU")
+    original = dict(window._config)
     window._apply()
+    if backend == "qwen3" and voice == _DEFAULT_VOICE:
+        window._on_apply.assert_not_called()
+        assert window._config == original
+        assert "Qwen3 requires a reference voice" in window.update_status.call_args.args[0]
+        return
     saved = window._on_apply.call_args.args[0]
     assert saved["tts_backend"] == backend
     assert saved["tts_voice"] == (None if voice == _DEFAULT_VOICE else voice)
@@ -163,3 +170,20 @@ def test_engine_loader_restarts_tts_off_the_calling_thread(managed_tts, monkeypa
     assert len(threads) == 1 and threads[0] != threading.get_ident()
     assert popen.call_count == 2
     engine.voice_chat.warm_tts.assert_called_once()
+
+
+def test_restore_history_carries_dictation_and_conversation():
+    previous = de.DictationApp.__new__(de.DictationApp)
+    previous._history = [{"text": "ditado antigo"}]
+    previous.voice_chat = MagicMock(_history=[{"role": "user", "content": "oi"}], _last_turn=123.0)
+    engine = de.DictationApp.__new__(de.DictationApp)
+    engine._history = []
+    engine.voice_chat = MagicMock(_history=[], _last_turn=0.0)
+    engine.restore_history(previous)
+    assert engine.history == [{"text": "ditado antigo"}]
+    assert engine.voice_chat._history == [{"role": "user", "content": "oi"}]
+    assert engine.voice_chat._last_turn == 123.0
+    # Copies, so the stopped engine cannot change the new one.
+    previous._history.append({"text": "x"})
+    previous.voice_chat._history.append({"role": "user", "content": "y"})
+    assert len(engine.history) == 1 and len(engine.voice_chat._history) == 1
