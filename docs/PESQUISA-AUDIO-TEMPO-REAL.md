@@ -3,10 +3,11 @@
 Pedido: "uma investigação avançada de como fazer áudio em tempo real local com
 o hardware que temos disponível".
 
-Este documento separa três tipos de afirmação:
+Este documento separa quatro tipos de afirmação:
 
 - **[medido]** vem desta máquina: logs em `~/.debora/logs`, `nvidia-smi`, CIM.
 - **[fonte]** vem de documentação ou artigo, com link.
+- **[fonte fraca]** vem de divulgação comercial ou de afirmação sem benchmark reproduzível.
 - **[suposição]** é estimativa ainda não verificada; cada uma tem um benchmark
   proposto na seção 8.
 
@@ -168,11 +169,13 @@ Leitura da tabela:
   clonagem, e pode rodar em CPU para deixar a GPU para o STT.
 - O **Pocket TTS** é interessante por rodar em CPU, mas a qualidade e a
   variante do português precisam ser ouvidas antes de qualquer decisão.
-- **Antes de trocar o modelo,** dá para ganhar algo com o Chatterbox atual:
-  sintetizar primeiro uma oração curta (até a primeira vírgula, ~6–10
-  palavras) em vez da frase inteira. Isso adianta a primeira fala em ~1–2 s
-  **[suposição]**, mas não resolve o RTF > 1: o prebuffer continua segurando o
-  resto para evitar lacunas.
+- **Já implementado no chat:** primeira oração curta (`split_sentences(first=True)`)
+  e log `first_audio=` por turno. O ganho estimado de ~1–2 s ainda precisa
+  ser medido; isso não resolve o RTF > 1 e o prebuffer continua evitando lacunas.
+- **Etapa 2 implementada, benchmark pendente:** seleção por `tts_backend`,
+  scripts isolados para Qwen3 0.6B Base e Kokoro, transcrição distribuída da
+  `debora_v2` e cliente de benchmark. A API entrega WAVs completos, sem
+  streaming HTTP; a velocidade real e a qualidade precisam da medição local.
 
 ### 5.2 STT
 
@@ -233,7 +236,7 @@ Regras propostas:
 2. **A iGPU fica com o modelo local**, sem disputar VRAM.
 3. **A CPU fica com VAD, fim de turno e AEC**. O 185H tem margem de sobra.
 4. **NPU:** não usar no caminho crítico enquanto o `DEVICE_LOST` não estiver
-   resolvido: o erro foi reproduzido fora do app, com o driver 32.0.100.5540
+   resolvido: o erro foi reproduzido fora do app, com o driver NPU 32.0.100.5540
    e o OpenVINO 2025.4.1, então não é o cache nem o código do app. O
    tratamento do erro está em `docs/PLANO-DISTRIBUICAO-HARDWARE.md`. Se voltar a ser confiável, é
    candidata a rodar o Smart Turn ou o VAD em baixo consumo, sem ganho real de
@@ -272,7 +275,7 @@ Cada etapa só avança se o benchmark dela passar.
 |---|---|---|
 | **0. Medir o que já existe** | <ul><li>Registrar a espera do prebuffer (já logada como `prebuffer held`) junto do tempo total.</li><li>Logar o tempo do fim da fala até o primeiro áudio real (`voice_to_voice`) em cada turno.</li><li>Medir a VRAM do Chatterbox.</li></ul> | Linha de base com p50 e p90 de `voice_to_voice` |
 | **1. Ganhos sem trocar modelo** | <ul><li>Primeira oração curta para o TTS.</li><li>Ajustar `voice_chat_prebuffer_max` só depois de medir lacunas versus atraso.</li><li>Saída por WASAPI.</li></ul> | `voice_to_voice` p50 −1 s sem aumentar as lacunas |
-| **2. TTS novo** | Backend `qwen3-tts`, um servidor uv script como o `tts_server.py` com a mesma API HTTP, com streaming por chunks e a voz `debora_v2` clonada; e `kokoro` como modo rápido. **Pré-requisito:** consentimento por escrito de quem cedeu a voz da `debora_v2`, cobrindo clonagem com outro modelo e publicação | RTF < 0,3; 1º áudio < 300 ms; avaliação pt-BR às cegas (o usuário ouve 10 frases de cada) |
+| **2. TTS novo — implementada, benchmark pendente** | `tts_backend`: `chatterbox` (padrão), `qwen3` (0.6B Base, clonagem com WAV + transcrição) ou `kokoro` (`pf_dora`, sem clonagem). Scripts uv isolados, mesma API HTTP, um WAV completo por frase; sem streaming por chunks nesta etapa. `debora_v2.txt` acompanha a voz padrão | Medir RTF e tempo até a resposta completa (p50/p90); alvo RTF < 0,3 e avaliação pt-BR às cegas (10 frases de cada). A meta de 1º chunk < 300 ms fica para uma etapa futura com streaming |
 | **3. Smart Turn** | Fim de turno em duas fases (seção 5.3) | Menos de 5% de cortes no meio da frase em 50 turnos reais; −0,4 s p50 |
 | **4. AEC** | WebRTC AEC com o alto-falante como referência; barge-in sem fone | Sem auto-interrupção em 20 respostas pelo alto-falante |
 | **5. Streaming STT + especulação** | Nemotron streaming (se compilar no Windows) ou Voxtral Realtime; começar o modelo local com o texto parcial | `voice_to_voice` < 1 s com o modelo local |
@@ -280,37 +283,47 @@ Cada etapa só avança se o benchmark dela passar.
 
 ## 8. Benchmarks propostos (comandos exatos)
 
-Todos rodam fora do app, em ambiente uv isolado, como o `tts_server.py`.
-**Cada um baixa modelos:** é preciso aprovar antes de rodar.
+Os servidores TTS rodam fora do app, cada um em seu ambiente uv isolado.
+O cliente `docs/benchmarks/tts-bench/bench_tts.py` usa apenas a biblioteca padrão
+e envia as 20 frases de `frases_ptbr.txt` a um servidor já iniciado.
+**Não foram executados servidores nem baixados modelos nesta implementação.**
+Ao executar os servidores pela primeira vez, uv prepara as dependências e os
+backends baixam seus pesos. Comandos completos e instruções do espeak-ng no
+[README do benchmark](benchmarks/tts-bench/README.md).
 
 ```powershell
 # Durante cada benchmark, em outro terminal:
 nvidia-smi --query-gpu=memory.used,clocks.sm,temperature.gpu --format=csv -l 1
 
-# TTS Qwen3-TTS 0.6B Base: RTF, 1º áudio e VRAM (download de ~1-2 GB)
-uv run --script bench_tts_qwen3.py --model Qwen/Qwen3-TTS-12Hz-0.6B-Base `
-  --ref debora_whisper/voices/debora_v2.wav --ref-text debora_v2.txt `
-  --sentences frases_ptbr.txt --out $env:TEMP\debora-tts-bench
+# Terminal A: escolher UM servidor por vez, com o app parado
+uv run --script debora_whisper/tts_server.py --device cuda --voice debora_whisper/voices/debora_v2.wav
+uv run --script debora_whisper/tts_server_qwen3.py --device cuda --voice debora_whisper/voices/debora_v2.wav
+uv run --script debora_whisper/tts_server_kokoro.py --device cpu
+uv run --script debora_whisper/tts_server_kokoro.py --device cuda
 
-# TTS Kokoro, voz pf_dora (precisa do espeak-ng instalado)
-uv run --script bench_tts_kokoro.py --voice pf_dora --lang p --device cpu --out $env:TEMP\debora-tts-bench
-uv run --script bench_tts_kokoro.py --voice pf_dora --lang p --device cuda --out $env:TEMP\debora-tts-bench
+# Terminal B: após o servidor responder /health, repetir para cada backend
+Invoke-RestMethod http://127.0.0.1:8765/health
+uv run --script docs/benchmarks/tts-bench/bench_tts.py --out "$env:TEMP\debora-tts-bench"
 ```
 
-- Os `bench_tts_*.py` são scripts uv (PEP 723) com o mesmo cabeçalho do
-  `tts_server.py`:
-  - versões exatas (`qwen-tts==X`, `kokoro==Y`, `soundfile==Z`);
+- Os servidores são scripts uv (PEP 723) com o padrão do `tts_server.py`:
+  - versões exatas (`qwen-tts==0.1.1`, `kokoro==0.9.4`, torch/torchaudio 2.6.0);
   - o índice `pytorch-cu124` restrito a `torch`/`torchaudio` via
     `[tool.uv.sources]`, nunca um `--index` global (evita confusão de
     dependências).
-- `debora_v2.txt` é a transcrição do áudio de referência, que o Qwen3-TTS
-  exige para clonar.
+- `debora_whisper/voices/debora_v2.txt` é o sidecar UTF-8 distribuído com a
+  voz padrão, transcrição confirmada pelo usuário. O Qwen3 exige esse texto
+  para clonar. Outras vozes e WAVs que sobrescrevem a voz padrão precisam do
+  próprio `<voice>.txt` ao lado do WAV; nunca inferimos a transcrição.
 
-- `bench_tts_*.py` (a escrever na etapa 2) mede, para cada uma das 20 frases
+- `bench_tts.py` mede, para cada uma das 20 frases
   de `frases_ptbr.txt`:
-  - tempo até o primeiro chunk de áudio;
-  - tempo total e RTF;
-  - VRAM no pico.
+  - tempo até receber a resposta HTTP completa;
+  - duração do WAV e RTF (tempo de resposta / duração), com p50/p90;
+  - CSV por frase e JSON com inventário do servidor, após um aquecimento
+    excluído da medição (`--warmup 0` para incluir a primeira requisição fria).
+  VRAM no pico é registrada separadamente com `nvidia-smi`. Não mede primeiro
+  chunk nem `voice_to_voice`: não há streaming HTTP nesta etapa.
 - Os WAVs ficam fora do git (pasta temporária local), só para a avaliação às
   cegas. No repositório entram só os números.
 - Smart Turn: rodar o modelo ONNX int8 (8 MB) com o `onnxruntime` do `.venv`
@@ -325,14 +338,16 @@ uv run --script bench_tts_kokoro.py --voice pf_dora --lang p --device cuda --out
 - **Licenças:**
   - Voxtral TTS (CC BY-NC) e XTTS-v2 (CPML) ficam fora.
   - A licença dos pesos do Pocket TTS não está publicada.
-  - Clonar voz exige consentimento de quem cedeu a voz. Confirmar a origem e
-    o consentimento da `debora_v2` é pré-requisito da etapa 2.
+  - Clonar voz exige consentimento de quem cedeu a voz. O usuário confirmou
+    o áudio fonte e a transcrição da `debora_v2`; essa confirmação não deve
+    ser interpretada como uma nova autorização de publicação de áudio gerado.
   - O Chatterbox marca o áudio com a marca d'água PerTh. Qwen3-TTS e Kokoro
     não parecem ter equivalente **[suposição]**: trocar o modelo perde essa
     marca.
 - **Windows:**
   - Nemotron e NeMo são oficialmente só Linux.
-  - Kokoro em pt precisa do espeak-ng.
+  - Kokoro em pt usa o espeak-ng, que vem embutido no ambiente do script
+    (pacote `espeakng-loader`); não precisa instalar no sistema.
   - O Qwen3-TTS recomenda FlashAttention 2, que é difícil de compilar no
     Windows. Sem ele deve funcionar, com mais memória **[suposição]**.
   - O Smart App Control do Windows já bloqueou o uv nesta máquina (erro de

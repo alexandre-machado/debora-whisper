@@ -4,7 +4,7 @@
 #     "chatterbox-tts==0.1.7", "torch==2.6.0", "torchaudio==2.6.0",
 #     # resemble-perth (Chatterbox's watermark) imports pkg_resources,
 #     # which setuptools 81 dropped.
-#     "setuptools<81",
+#     "setuptools==80.9.0",
 # ]
 #
 # [[tool.uv.index]]
@@ -216,14 +216,25 @@ def check_connection(connection):
 
 
 @contextmanager
-def cancellable_synthesis(model, connection):
+def cancellable_synthesis(model, connection, modules=None):
     """Check between speech tokens and flow steps; always remove our hooks."""
+    last_check = 0.0
     def check(*args):
+        nonlocal last_check
+        # Adapters hook leaf modules, including callers that use forward()
+        # directly. Bound socket polling overhead to once every 20 ms.
+        now = time.monotonic()
+        if modules is not None and args and now - last_check < 0.02:
+            return
+        last_check = now
         check_connection(connection)
 
     hooks = []
     try:
         check()
+        if modules is not None:
+            for module in modules:
+                hooks.append(module.register_forward_pre_hook(check))
         # Hook inner modules: Chatterbox calls the transformer/estimator's
         # forward directly, bypassing hooks on those outer modules.
         for path in ("t3.tfmr.layers.0", "s3gen.flow.decoder.estimator.time_mlp"):
@@ -241,21 +252,22 @@ def cancellable_synthesis(model, connection):
             hook.remove()
 
 
-def make_handler(model, default_language: str):
+def make_handler(model, default_language: str, *, adapter=False, error=None):
     # One generation at a time: the GPU is shared and Chatterbox is not
     # thread-safe.
     lock = threading.Lock()
-    voices = Voices(model)
+    voices = model if adapter else Voices(model)
     from importlib.metadata import PackageNotFoundError, version
     versions = {}
-    for package in ("torch", "chatterbox-tts"):
+    for package in (("torch", model.package) if adapter else ("torch", "chatterbox-tts")):
         try:
             versions[package] = version(package)
         except PackageNotFoundError:
             versions[package] = None
     inventory = {"schema_version": 1, "device": getattr(model, "_debora_device", None),
-                 "versions": versions, "loaded": True,
-                 "model": "ChatterboxMultilingualTTS", "precision": "unknown"}
+                 "versions": versions, "loaded": error is None,
+                 "model": model.model_id if adapter else "ChatterboxMultilingualTTS",
+                 "precision": getattr(model, "precision", "unknown") if adapter else "unknown"}
 
     class Handler(BaseHTTPRequestHandler):
         def _reply(self, code, body: bytes, content_type="application/json"):
@@ -274,13 +286,19 @@ def make_handler(model, default_language: str):
         def do_GET(self):
             if self.path != "/health":
                 return self._error(404, "not found")
+            if error:
+                return self._reply(503, json.dumps({"ok": False, "error": error,
+                                                   "inventory": inventory}).encode())
             self._reply(200, json.dumps({"ok": True, "sample_rate": model.sr,
                                         "inventory": inventory}).encode())
 
         def do_POST(self):
             if self.path != "/tts":
                 return self._error(404, "not found")
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._error(400, "invalid Content-Length")
             if length <= 0 or length > MAX_BODY_BYTES:
                 return self._error(413, "body missing or too large")
             # Read the body even when refusing it: closing a socket with
@@ -293,6 +311,8 @@ def make_handler(model, default_language: str):
             if self.headers.get("Origin") is not None or not (
                     self.headers.get("Content-Type") or "").startswith("application/json"):
                 return self._error(403, "only local JSON clients")
+            if error:
+                return self._error(503, error)
             try:
                 request = json.loads(body.decode("utf-8"))
                 text = str(request["text"]).strip()[:MAX_TEXT_CHARS]
@@ -315,8 +335,13 @@ def make_handler(model, default_language: str):
                     log(f"Voice {voice!r} unusable: {type(e).__name__}: {e}")
                     return self._error(400, f"voice unusable: {e}")
                 try:
-                    drop_attention_spies(model)
-                    with cancellable_synthesis(model, self.connection), torch.inference_mode():
+                    if not adapter:
+                        drop_attention_spies(model)
+                    modules = model.cancel_modules if adapter else None
+                    with cancellable_synthesis(model, self.connection, modules), torch.inference_mode():
+                        # Reference encoding also needs cancellation on new voices.
+                        if adapter:
+                            model.prepare_voice()
                         wav = model.generate(text, language_id=language)
                 except SynthesisCancelled:
                     log(f"Cancelled synthesis after {time.time() - start:.1f}s (client disconnected)")
@@ -335,6 +360,40 @@ def make_handler(model, default_language: str):
             pass
 
     return Handler
+
+
+def backend_main(loader, package, model_id, argv=None):
+    """Shared entry point for isolated uv scripts; no app imports required."""
+    parser = argparse.ArgumentParser(description=f"Local TTS: {model_id}")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--voice", help="Local reference WAV (Qwen requires its .txt sidecar)")
+    parser.add_argument("--language", default="pt")
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    args = parser.parse_args(argv)
+    setup_logging()
+    model, error = load_backend(loader, args.device, args.voice, package, model_id)
+    server = ThreadingHTTPServer(("127.0.0.1", args.port),
+                                make_handler(model, args.language, adapter=True, error=error))
+    log(f"Listening on http://127.0.0.1:{args.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log("Stopped.")
+    finally:
+        server.server_close()
+
+
+def load_backend(loader, device, voice, package, model_id):
+    """Keep /health available with an actionable error after startup failure."""
+    try:
+        start = time.time()
+        model = loader(device, voice)
+        log(f"{model_id} loaded on {model._debora_device} in {time.time() - start:.1f}s")
+        return model, None
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        log(f"TTS startup failed: {error}")
+        return types.SimpleNamespace(package=package, model_id=model_id), error
 
 
 def main():

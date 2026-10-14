@@ -1,5 +1,5 @@
 """Voice chat: each final transcription goes to a local LLM or Claude Code,
-and its reply is spoken aloud by the Chatterbox TTS server
+and its reply is spoken aloud by the configured TTS server
 (debora_whisper/tts_server.py, in its own uv environment).
 
 The reply is streamed and spoken sentence by sentence: the first sentence
@@ -20,11 +20,11 @@ import sys
 import threading
 import time
 import unicodedata
-import urllib.error
 import urllib.parse
-import urllib.request
 import wave
 from dataclasses import dataclass
+# Bound at import: tests replace threading.Timer to drive reply feedback.
+from threading import Timer as _DeadlineTimer
 from pathlib import Path
 
 from debora_whisper import paths
@@ -105,7 +105,15 @@ TTS_MAX_RESPONSE_BYTES = 50_000_000
 # How long the first reply waits for a TTS server this process started
 # (Chatterbox loads in ~15 s; uv builds its environment on the very first run).
 TTS_STARTUP_SECONDS = 180
+# One health check, start to finish: a peer trickling bytes cannot stretch it.
+TTS_HEALTH_SECONDS = 1.0
+TTS_HEALTH_MAX_BYTES = 64_000
 TTS_SERVER_SCRIPT = Path(__file__).with_name("tts_server.py")
+TTS_SERVER_SCRIPTS = {
+    "chatterbox": TTS_SERVER_SCRIPT,
+    "qwen3": TTS_SERVER_SCRIPT.with_name("tts_server_qwen3.py"),
+    "kokoro": TTS_SERVER_SCRIPT.with_name("tts_server_kokoro.py"),
+}
 # Shorter sentences wait for the next one: "Opa!" alone sounds clipped, and
 # Chatterbox cannot speak a bare "OK" at all.
 TTS_MIN_CHARS = 16
@@ -121,12 +129,6 @@ _EMOJI = re.compile(f"[{_EMOJI_CHAR}](?:[️⃣\U000E0020-\U000E007F]"
 
 def is_http_url(url) -> bool:
     return isinstance(url, str) and re.match(r"https?://", url, re.IGNORECASE) is not None
-
-
-def _opener():
-    # No proxies: the reply goes straight to the local TTS server, never
-    # through HTTP(S)_PROXY from the environment.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def speakable(text: str) -> str:
@@ -639,23 +641,25 @@ def list_voices() -> list[str]:
 
 
 def tts_command(config: dict, log=print) -> list[str] | None:
-    """tts_server_command, or uv running tts_server.py on tts_url's port
+    """tts_server_command, or uv running the selected backend on tts_url's port
     with tts_voice (None if tts_url is not local or uv is missing)."""
     if config.get("tts_server_command"):
         return config["tts_server_command"]
     url = urllib.parse.urlparse(config.get("tts_url") or "")
     if url.hostname not in ("127.0.0.1", "localhost"):
         return None
+    backend = config.get("tts_backend", "chatterbox")
+    script = TTS_SERVER_SCRIPTS[backend]
     uv = shutil.which("uv")
     if not uv:
         log("Voice chat: uv not found on PATH; start the TTS server yourself "
-            f"(uv run --script {TTS_SERVER_SCRIPT}).")
+            f"(uv run --script {script}).")
         return None
-    command = [uv, "run", "--script", str(TTS_SERVER_SCRIPT), "--port", str(url.port or 80)]
+    command = [uv, "run", "--script", str(script), "--port", str(url.port or 80)]
     voice = resolve_voice(config.get("tts_voice"))
-    if voice is not None and voice.is_file():
+    if voice is not None and backend != "kokoro" and (voice.is_file() or backend == "qwen3"):
         command += ["--voice", str(voice)]
-    elif voice is not None:
+    elif voice is not None and backend == "chatterbox":
         log(f"Voice chat: voice {voice} not found; using Chatterbox's own voice.")
     if config.get("language") and config["language"] != "auto":
         command += ["--language", config["language"]]
@@ -667,13 +671,50 @@ _tts_process: subprocess.Popen | None = None
 _tts_stopping = threading.Event()
 
 
-def tts_server_up(config: dict) -> bool:
+class TTSStartupError(RuntimeError):
+    """The server is reachable, but its backend cannot finish startup."""
+
+
+def _shutdown_socket(sock):
     try:
-        url = config["tts_url"].rstrip("/") + "/health"
-        with _opener().open(url, timeout=1) as response:
-            return response.status == 200
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def tts_server_up(config: dict) -> bool:
+    """True if /health answers 200; TTSStartupError if the server reports
+    a terminal startup error (503 with {"ok": false, "error": ...})."""
+    connection = timer = None
+    try:
+        target = urllib.parse.urlsplit(config["tts_url"].rstrip("/") + "/health")
+        connection_type = (http.client.HTTPSConnection if target.scheme == "https"
+                           else http.client.HTTPConnection)
+        connection = connection_type(target.hostname, target.port, timeout=TTS_HEALTH_SECONDS)
+        connection.connect()
+        # The socket timeout restarts with every byte, so a peer trickling its
+        # answer could hold this check (and _tts_lock) indefinitely. Closing
+        # the socket at an absolute deadline ends any read still blocked.
+        timer = _DeadlineTimer(TTS_HEALTH_SECONDS, _shutdown_socket, (connection.sock,))
+        timer.daemon = True
+        timer.start()
+        connection.request("GET", urllib.parse.urlunsplit(("", "", target.path, target.query, "")))
+        with connection.getresponse() as response:
+            if response.status != 503:
+                return response.status == 200
+            raw = response.read(TTS_HEALTH_MAX_BYTES + 1)
+        health = json.loads(raw) if len(raw) <= TTS_HEALTH_MAX_BYTES else None
     except Exception:
         return False
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if connection is not None:
+            connection.close()
+    if (isinstance(health, dict) and health.get("ok") is False
+            and isinstance(health.get("error"), str) and health["error"]):
+        raise TTSStartupError(health["error"])
+    return False
 
 
 def ensure_tts_server(config: dict, log=print, log_path=None):
@@ -692,8 +733,12 @@ def ensure_tts_server(config: dict, log=print, log_path=None):
                 log(f"Voice chat: the TTS server exited (code {_tts_process.returncode}); "
                     f"see {log_path or 'its output'}. Restart the app after fixing it.")
             return
-        if tts_server_up(config):
-            return  # started by hand, or left over from an earlier run
+        try:
+            if tts_server_up(config):
+                return  # started by hand, or left over from an earlier run
+        except TTSStartupError as exc:
+            log(f"Voice chat: TTS startup failed ({exc}); restart the server after fixing it.")
+            return
         command = tts_command(config, log)
         if not command:
             return
@@ -717,7 +762,7 @@ def ensure_tts_server(config: dict, log=print, log_path=None):
 
 def wait_tts_server(config: dict, timeout=TTS_STARTUP_SECONDS) -> bool:
     """True once the TTS server answers; waits only while a server this
-    process started is still loading."""
+    process started is still loading. Raise TTSStartupError on terminal failure."""
     deadline = time.time() + timeout
     while True:
         if tts_server_up(config):
@@ -868,7 +913,8 @@ class VoiceChat:
 
     def _select_tts_cache(self, config):
         """Called under the cache lock; settings changes discard the old voice."""
-        key = (config.get("tts_voice"), config.get("language"), config.get("tts_url"))
+        key = (config.get("tts_backend", "chatterbox"), config.get("tts_voice"),
+               config.get("language"), config.get("tts_url"))
         if key != self._tts_cache_key:
             self._tts_cache_key = key
             self._waiting_clip = None
@@ -908,6 +954,8 @@ class VoiceChat:
                     self._waiting_audio(config)
                     self._tts_warmed = True
                     self.log(f"Voice chat: TTS warmed in {time.perf_counter() - started:.1f}s")
+            except TTSStartupError as e:
+                self.log(f"Voice chat: TTS startup failed ({e}); restart the server after fixing it.")
             except Exception as e:
                 self.log(f"Voice chat: TTS warm-up failed ({e}); will try on the next reply.")
 
@@ -1275,9 +1323,14 @@ class VoiceChat:
                         continue  # an emoji or punctuation: nothing to say
                     audio = None
                     if tts_ok is None:
-                        tts_ok = wait_tts_server(self.config)
-                        if not tts_ok:
-                            self.log("Voice chat: TTS server not reachable; showing the reply only.")
+                        try:
+                            tts_ok = wait_tts_server(self.config)
+                        except TTSStartupError as e:
+                            tts_ok = False
+                            self.log(f"Voice chat: TTS startup failed ({e}); showing the reply only.")
+                        else:
+                            if not tts_ok:
+                                self.log("Voice chat: TTS server not reachable; showing the reply only.")
                     if tts_ok:
                         try:
                             config = dict(self.config)
