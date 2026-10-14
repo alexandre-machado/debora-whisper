@@ -989,6 +989,7 @@ def test_voice_chat_flag_turns_the_mode_on(monkeypatch, module, session_flags, f
 @pytest.fixture
 def no_tts_process(monkeypatch):
     monkeypatch.setattr(vc, "_tts_process", None)
+    monkeypatch.setattr(vc, "_tts_server_key", None)
     yield
     vc.stop_tts_server()
 
@@ -1079,9 +1080,14 @@ def test_live_failed_tts_does_not_wait_again_on_repeated_turns(server, monkeypat
     process.poll.return_value = None  # Startup failed, but the HTTP server is still alive.
     monkeypatch.setattr(vc, "_tts_process", process)
     logs, shown = [], []
-    chat, played = _chat(server, FakeLLM(["A resposta continua disponível."]))
+    chat, played = _chat(server, FakeLLM(["A resposta continua disponível."]),
+                         tts_server_command=["never-run"])
+    # A managed process retains the settings it was started with.
+    monkeypatch.setattr(vc, "_tts_server_key",
+                        (chat.config["tts_backend"], tuple(chat.config["tts_server_command"])))
     chat.log = logs.append
-    with patch.object(vc.time, "sleep", side_effect=AssertionError("must not poll startup")):
+    with patch.object(vc, "kill_tree") as kill_tree, \
+            patch.object(vc.time, "sleep", side_effect=AssertionError("must not poll startup")):
         for _ in range(2):
             chat.respond("Olá", on_reply=shown.append)
     assert server.health_requests == 2
@@ -1089,6 +1095,7 @@ def test_live_failed_tts_does_not_wait_again_on_repeated_turns(server, monkeypat
     assert played == [] and server.requests == []
     assert sum("TTS startup failed" in line and error in line for line in logs) == 2
     assert not any("not reachable" in line for line in logs)
+    kill_tree.assert_not_called()
     process.kill.assert_not_called()
 
 
@@ -1414,15 +1421,18 @@ def test_warmup_discards_audio_and_caches_waiting_phrase(server):
 
 
 @pytest.mark.parametrize("key,value", [("tts_voice", "another"), ("language", "en"),
+                                      ("tts_backend", "kokoro"),
                                       ("tts_url", "http://127.0.0.1:9999")])
 def test_waiting_cache_is_invalidated_by_settings(key, value, monkeypatch):
     synth = MagicMock(side_effect=[(AUDIO, 16000), (AUDIO.copy(), 16000)])
     monkeypatch.setattr(vc, "synthesize", synth)
     chat = vc.VoiceChat({**DEFAULT_CONFIG, "language": "pt"})
     old = chat._waiting_audio(chat.config)
+    chat._tts_warmed = True
     assert chat._waiting_audio(chat.config) is old
     chat.config[key] = value
     assert chat._waiting_audio(chat.config) is not old
+    assert not chat._tts_warmed
     assert synth.call_count == 2
 
 
@@ -1633,6 +1643,7 @@ def test_settings_apply_rejects_invalid_session_name(name, monkeypatch):
         "_voice_chat_var": True, "_backend_var": "Claude Code",
         "_harness_new_session_var": True, "_harness_session_name_var": name,
         "_voice_var": "test", "_balloon_var": True, "_font_size_var": "16",
+        "_tts_engine_var": "Chatterbox (clones the voice)",
     }.items():
         setattr(window, attr, MagicMock(get=MagicMock(return_value=value)))
     window._harness_cwd = None

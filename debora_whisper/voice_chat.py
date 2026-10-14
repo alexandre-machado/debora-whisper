@@ -666,8 +666,9 @@ def tts_command(config: dict, log=print) -> list[str] | None:
     return command
 
 
-_tts_lock = threading.Lock()
+_tts_lock = threading.RLock()
 _tts_process: subprocess.Popen | None = None
+_tts_server_key = None  # (backend, command); also remembers settings seen with an external server
 _tts_stopping = threading.Event()
 
 
@@ -719,11 +720,18 @@ def tts_server_up(config: dict) -> bool:
 
 def ensure_tts_server(config: dict, log=print, log_path=None):
     """Start the TTS server (tts_command) if nothing answers at tts_url.
-    One server per process: engine rebuilds (Settings) reuse it."""
-    global _tts_process
+    Called by the background engine loader; reuse only matching servers."""
+    global _tts_process, _tts_server_key
     if not is_http_url(config.get("tts_url")):
         return
     with _tts_lock:
+        command = tts_command(config, log)
+        key = (config.get("tts_backend", "chatterbox"), tuple(command) if command else None)
+        if _tts_process is not None and _tts_server_key != key:
+            log("Voice chat: TTS settings changed; restarting the managed server.")
+            # Keep the outer lock through shutdown and startup so another loader
+            # cannot start a replacement while the old process still owns the port.
+            stop_tts_server()
         _tts_stopping.clear()
         if _tts_process is not None:
             if _tts_process.poll() is not None and not _tts_process.reported:
@@ -735,11 +743,15 @@ def ensure_tts_server(config: dict, log=print, log_path=None):
             return
         try:
             if tts_server_up(config):
+                if _tts_server_key is not None and _tts_server_key != key:
+                    log(f"Voice chat: configured TTS backend/command changed to {key[0]}; "
+                        "keeping the external server. Restart it manually to apply the change.")
+                if _tts_server_key is None:
+                    _tts_server_key = key
                 return  # started by hand, or left over from an earlier run
         except TTSStartupError as exc:
             log(f"Voice chat: TTS startup failed ({exc}); restart the server after fixing it.")
             return
-        command = tts_command(config, log)
         if not command:
             return
         output = open(log_path, "ab") if log_path else subprocess.DEVNULL
@@ -755,6 +767,7 @@ def ensure_tts_server(config: dict, log=print, log_path=None):
             if log_path:
                 output.close()
         _tts_process.reported = False
+        _tts_server_key = key
         atexit.register(stop_tts_server)
         log(f"Voice chat: starting the TTS server (pid {_tts_process.pid}); "
             f"output in {log_path or 'nowhere'}")
@@ -775,10 +788,11 @@ def wait_tts_server(config: dict, timeout=TTS_STARTUP_SECONDS) -> bool:
 
 def stop_tts_server():
     """Stop the TTS server this process started, if any."""
-    global _tts_process
+    global _tts_process, _tts_server_key
     with _tts_lock:
         _tts_stopping.set()
         process, _tts_process = _tts_process, None
+        _tts_server_key = None
     if process is None:
         return
     # uv runs the server as a child process: end the whole tree, or the

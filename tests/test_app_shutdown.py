@@ -62,6 +62,9 @@ GUIApp = _under_test()
     ('beep_on_start', False),
     ('sample_rate', 48000),
     ('max_record_seconds', 30),
+    ('tts_backend', 'kokoro'),
+    ('tts_backend', 'qwen3'),
+    ('tts_voice', 'isabel'),
 ])
 def test_audio_settings_restart_engine(key, value):
     from debora_whisper.dictation_engine import DEFAULT_CONFIG

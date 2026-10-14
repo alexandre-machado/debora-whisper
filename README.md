@@ -457,9 +457,9 @@ a few GB, and caches it). It is started only when nothing answers at
 `~/.debora/logs/tts_server.log`. `tts_server_command` replaces that
 command line (a list of arguments).
 
-Set `tts_backend` in `~/.debora/config.json`, then restart the app and stop any
-manually started server at `tts_url` to switch backends. An already running
-server or `tts_server_command` takes precedence over script selection.
+Pick the engine in **Settings → Voice chat voice → Voice engine**; Apply switches the app-managed server without restarting the app.
+A manually started server at `tts_url` must be restarted manually to switch backends;
+`tts_server_command` takes precedence over script selection.
 All backends keep the same loopback HTTP API, Origin checks, disconnect
 cancellation and complete WAV responses; this stage does not add streaming.
 
