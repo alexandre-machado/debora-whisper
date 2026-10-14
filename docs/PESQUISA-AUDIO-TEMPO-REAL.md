@@ -18,7 +18,7 @@ Nenhum pacote foi instalado e nenhum modelo foi baixado para esta pesquisa.
 
 - O Chatterbox Multilingual sintetiza mais devagar que o tempo real: leva
   1,4 s para cada 1 s de áudio (mediana de 458 frases) **[medido]**.
-- A primeira frase de verdade começa a tocar 9–10 s depois que o usuário para
+- A primeira frase de verdade começa a tocar 7–10 s depois que o usuário para
   de falar. O "Um instante." do cache cobre só o primeiro segundo e meio.
 - O reconhecimento (0,3 s) e o primeiro token do Claude (mediana 1,3 s) somam
   menos de 2 s.
@@ -33,8 +33,8 @@ Nenhum pacote foi instalado e nenhum modelo foi baixado para esta pesquisa.
    - Somar o **Smart Turn v3.2** ao Silero VAD, para encerrar o turno antes
      dos 0,8 s de silêncio quando a frase está completa.
    - Usar WASAPI no lugar de MME.
-   - Investigar a espera de até 3 s entre o fim da síntese e o início da
-     reprodução.
+   - Com o TTS mais rápido que o tempo real, a espera do prebuffer (até 3 s
+     hoje, para evitar lacunas) cai sozinha.
    - Meta: primeira frase em ~2–2,5 s com o Claude e ~1–1,5 s com um modelo
      local.
 2. **Médio prazo:**
@@ -57,10 +57,11 @@ A NPU fica fora do caminho crítico enquanto houver `DEVICE_LOST`
 | dGPU | NVIDIA GeForce RTX 4070 Laptop, 8188 MiB, driver 617.14 (CUDA) |
 | iGPU | Intel Arc Graphics, driver 32.0.101.9150 (OpenVINO `GPU.0`), memória compartilhada com a RAM |
 | NPU | Intel AI Boost (OpenVINO `NPU`), com histórico de `DEVICE_LOST` no whisper-turbo |
-| Áudio | Microfone Fifine, MME, 16 kHz, latência 13 ms; saída Realtek/LE-HD 450BT, MME, 44,1 kHz, latência 91 ms |
-| Energia | Notebook sempre na tomada (bateria com defeito) |
+| Áudio | Microfone USB, MME, 16 kHz, latência 13 ms; saída (alto-falante ou fone Bluetooth), MME, 44,1 kHz, latência 91 ms |
+| Energia | Notebook sempre na tomada |
 
-Com o app ocioso no modo ditado, a dGPU estava com 1219 MiB em uso.
+Com o app ocioso no modo ditado (modelo carregado, sem transcrever), a dGPU
+estava com 1219 MiB em uso; ~1,5 GB é o valor durante a transcrição.
 
 ## 3. Pipeline atual e linha de base
 
@@ -99,9 +100,12 @@ chunk=2 enqueued=2.365s synth_start=6.256s synth_end=11.757s audio=3.560s play=1
   lacunas: o TTS não acompanha a reprodução.
 - Entre `synth_end` (6,26 s) e `play` (9,27 s) houve 3 s de espera. Outros
   turnos mostram o mesmo padrão: 7,13 → 10,16 s e 6,53 → 9,56 s.
-- Essa espera não é síntese. Pode ser a fila atrás do "Um instante.", a pausa
-  por fala detectada ou o prebuffer. **A investigar no código** (seção 7,
-  etapa 0).
+- Essa espera é o **prebuffer** funcionando como projetado
+  (`voice_chat.py`, `voice_chat_prebuffer_max = 3.0`). O log do mesmo turno
+  diz `prebuffer held 3.00s (predicted gap 6.06s, buffered 2.15s, pending 2)`.
+  Com RTF > 1, ele segura a reprodução para não haver lacunas no meio da
+  resposta. Tirar a espera agora só trocaria o atraso inicial por buracos na
+  fala; ela só cai de verdade com um TTS mais rápido que o tempo real.
 
 ### Linha de base completa
 
@@ -109,7 +113,7 @@ Do fim da fala do usuário até a primeira frase real:
 
 ```
 0,8 s VAD + 0,3 s STT + 1,3 s 1º token + ~1 s até a 1ª frase completa
-+ ~4 s síntese + ~0–3 s de espera = ~7–10 s
++ ~4 s síntese + ~0–3 s de prebuffer = ~7–10 s
 ```
 
 O "Um instante." do cache toca em ~1,5 s e disfarça parte dessa espera.
@@ -147,13 +151,13 @@ contra a ideia central do projeto (`docs/VOICE_HARNESS_IDEA.md`).
 
 | Modelo | pt-BR | Streaming / 1º áudio | Clonagem | Licença | Onde roda aqui |
 |---|---|---|---|---|---|
-| **Chatterbox Multilingual 0.1.7 (atual)** | Sim | Não; RTF 1,39 **[medido]** | Sim | MIT | CUDA |
+| **Chatterbox Multilingual 0.1.7 (atual)** | Sim | Não; RTF 1,39 **[medido]** | Sim | MIT | CUDA. Marca o áudio com a marca d'água PerTh |
 | **Qwen3-TTS 0.6B / 1.7B Base** | Sim, entre 10 línguas | Sim; "a partir de 97 ms", hardware não informado **[fonte]** ([repo](https://github.com/QwenLM/Qwen3-TTS)) | Sim, com 3 s de referência e transcrição | Apache-2.0 | CUDA (bf16; FlashAttention 2 opcional). VRAM não publicada **[suposição: 0.6B < 3 GB]** |
-| **Kokoro-82M** | Sim: `pf_dora` (feminina), `pm_alex`, `pm_santa`; G2P via espeak-ng `pt-br` ([VOICES.md](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md)) | Sim; ~1,5 GB e "~100x tempo real" em GPU, número de divulgação **[fonte]** ([tts.ai](https://tts.ai/voices/kokoro/?lang=it)) | Não | Apache-2.0 | CPU, CUDA ou ONNX. Precisa de espeak-ng no Windows **[suposição]** |
+| **Kokoro-82M** | Sim: `pf_dora` (feminina), `pm_alex`, `pm_santa`; G2P via espeak-ng `pt-br` ([VOICES.md](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md)) | Sim; ~1,5 GB e "~100x tempo real" em GPU, número de página comercial, não benchmark **[fonte fraca]** ([tts.ai](https://tts.ai/voices/kokoro/?lang=it)) | Não | Apache-2.0 | CPU, CUDA ou ONNX. Precisa de espeak-ng no Windows **[suposição]** |
 | Pocket TTS (Kyutai, 100M) | Português listado, voz `rafael`, variante não informada ([repo](https://github.com/kyutai-labs/pocket-tts)) | ~200 ms até o 1º áudio; ~2,3–6x tempo real em CPU **[fonte]** | Sim (WAV) | Código MIT; licença dos pesos não informada | CPU, deixando a GPU livre |
-| Chatterbox-Flash | Não (tokenizer inglês) ([card](https://huggingface.co/ResembleAI/chatterbox-flash)) | 103–119 ms TTFP, RTF ~0,1 | Sim | MIT | Sem pt-BR |
-| Chatterbox-Turbo (350M) | Não, focado em inglês | <200 ms (divulgação) | Sim | MIT | Sem pt-BR |
-| Voxtral TTS (Mistral, 4B) | Sim | ~70 ms (divulgação) ([MarkTechPost](https://www.marktechpost.com/2026/03/28/mistral-ai-releases-voxtral-tts-a-4b-open-weight-streaming-speech-model-for-low-latency-multilingual-voice-generation/)) | Sim | **CC BY-NC** | Licença não comercial |
+| Chatterbox-Flash | Não (tokenizer inglês) ([card](https://huggingface.co/ResembleAI/chatterbox-flash)) | 103–119 ms TTFP, RTF ~0,1, GPU não informada **[fonte]** | Sim | MIT | Sem pt-BR |
+| Chatterbox-Turbo (350M) | Não, focado em inglês | <200 ms (divulgação) **[fonte]** | Sim | MIT | Sem pt-BR |
+| Voxtral TTS (Mistral, 4B) | Sim | ~70 ms (divulgação) **[fonte]** ([MarkTechPost](https://www.marktechpost.com/2026/03/28/mistral-ai-releases-voxtral-tts-a-4b-open-weight-streaming-speech-model-for-low-latency-multilingual-voice-generation/)) | Sim | **CC BY-NC** | Licença não comercial |
 | XTTS-v2 | Sim | Streaming ~200 ms **[suposição]** | Sim | **CPML, não comercial** | Licença |
 
 Leitura da tabela:
@@ -165,11 +169,10 @@ Leitura da tabela:
 - O **Pocket TTS** é interessante por rodar em CPU, mas a qualidade e a
   variante do português precisam ser ouvidas antes de qualquer decisão.
 - **Antes de trocar o modelo,** dá para ganhar algo com o Chatterbox atual:
-  - sintetizar primeiro uma oração curta (até a primeira vírgula, ~6–10
-    palavras) em vez da frase inteira;
-  - eliminar a espera entre `synth_end` e `play`.
-
-  Isso não resolve o RTF > 1, mas tira de 1 a 3 s da primeira resposta.
+  sintetizar primeiro uma oração curta (até a primeira vírgula, ~6–10
+  palavras) em vez da frase inteira. Isso adianta a primeira fala em ~1–2 s
+  **[suposição]**, mas não resolve o RTF > 1: o prebuffer continua segurando o
+  resto para evitar lacunas.
 
 ### 5.2 STT
 
@@ -180,16 +183,16 @@ fala, com transcrição parcial e envio especulativo.
 | Modelo | pt-BR | Streaming | Licença | Windows |
 |---|---|---|---|---|
 | faster-whisper `turbo` (atual) | Sim | Não (os rascunhos reprocessam a janela) | MIT | Sim (CUDA) |
-| Nemotron 3.5 ASR Streaming 0.6B | Sim, pronto para uso; WER no FLEURS de 5,8% com chunk de 320 ms e 6,3% com 80 ms ([card](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)) | Sim, chunks de 80 a 1120 ms | OpenMDW-1.1 (uso comercial) | Oficialmente só Linux. Existe um runtime C++ (NeMo-Speech.cpp, GGUF) **[suposição: compila no Windows]** |
-| Voxtral Realtime (Mistral) | Sim, entre 13 línguas; WER 8,72% com 480 ms de atraso, conforme blog ([Weesper](https://weesperneonflow.ai/en/blog/2026-03-31-voxtral-whisper-open-source-speech-models-comparison-2026/)) | Sim, atraso configurável de 80 ms a 2,4 s | Verificar no card **[suposição]** | Verificar |
-| Parakeet TDT 0.6B v3 | 25 línguas europeias | Só em blocos, sem cache | CC-BY-4.0 **[suposição]** | Via NeMo/ONNX |
+| Nemotron 3.5 ASR Streaming 0.6B | Sim, pronto para uso; WER no FLEURS de 5,8% com chunk de 320 ms e 6,3% com 80 ms **[fonte]** ([card](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)) | Sim, chunks de 80 a 1120 ms | OpenMDW-1.1 (uso comercial) | Oficialmente só Linux. Existe um runtime C++ (NeMo-Speech.cpp, GGUF) **[suposição: compila no Windows]** |
+| Voxtral Realtime (Mistral) | Sim, entre 13 línguas; WER 8,72% com 480 ms de atraso, conforme blog **[fonte]** ([Weesper](https://weesperneonflow.ai/en/blog/2026-03-31-voxtral-whisper-open-source-speech-models-comparison-2026/)) | Sim, atraso configurável de 80 ms a 2,4 s | Verificar no card **[suposição]** | Verificar |
+| Parakeet TDT 0.6B v3 | 25 línguas europeias | Só em blocos, sem cache | CC-BY-4.0 **[suposição]** | **Já integrado** ao app (OpenVINO / onnxruntime, `dictation_engine.py`) |
 | Kyutai STT | Não (inglês e francês) | Sim | – | – |
 
 ### 5.3 Fim de turno, interrupção e eco
 
 | Item | Hoje | Proposta |
 |---|---|---|
-| Fim de turno | Silero VAD + 0,8 s de silêncio | Silero VAD + **Smart Turn v3.2**, que lê a prosódia ([repo](https://github.com/pipecat-ai/smart-turn)): <ul><li>português entre 23 línguas; BSD-2;</li><li>8M parâmetros, 8 MB em ONNX int8, ~10–65 ms em CPU;</li><li>janela de até 8 s de áudio 16 kHz.</li></ul>Com ~200 ms de silêncio, se o Smart Turn disser "completo", fecha o turno; senão espera até 0,8–2 s. O `onnxruntime` já está no ambiente. Ganho esperado: ~0,5 s **[suposição]** |
+| Fim de turno | Silero VAD + 0,8 s de silêncio | Silero VAD + **Smart Turn v3.2**, que lê a prosódia ([repo](https://github.com/pipecat-ai/smart-turn)): <ul><li>português entre 23 línguas; BSD-2;</li><li>8M parâmetros, 8 MB em ONNX int8, ~10–65 ms em CPU **[fonte]**;</li><li>janela de até 8 s de áudio 16 kHz.</li></ul>Com ~200 ms de silêncio, se o Smart Turn disser "completo", fecha o turno; senão espera até 0,8–2 s. O `onnxruntime` já está no ambiente. Ganho esperado: ~0,5 s **[suposição]** |
 | Eco e interrupção | Filtro de eco por texto (`voice_chat_echo_filter`) e pausa ao detectar fala | Cancelamento acústico de eco (WebRTC AEC), usando o sinal do alto-falante como referência: <ul><li>`pywebrtc-audio` tem wheels para Windows x86_64 e Python 3.10–3.14, com `process(near, far)` e `stream_delay_ms` ([docs](https://strandsagents.com/docs/labs/pywebrtc-audio/));</li><li>`echoff` usa loopback WASAPI ([GitHub](https://github.com/koljab/echoff));</li><li>alternativa: o APM do SDK LiveKit, com quadros de 10 ms.</li></ul>Com fone, o AEC pode ficar desligado |
 | Full-duplex | Não | Depende do AEC: só com eco cancelado dá para ouvir enquanto fala sem se auto-interromper |
 | Modelos de decisão tipo "Jev" | – | Não recebem áudio; continua valendo `docs/benchmarks/turn-detection-e-classificadores-2026-10-10.md` |
@@ -221,7 +224,7 @@ fala, com transcrição parcial e envio especulativo.
 | Modelo local Gemma 4 E4B int4 | **iGPU (Arc)** | 0 de VRAM; ~6,5 GB de RAM compartilhada |
 | Silero VAD + Smart Turn | CPU | 0 |
 | AEC WebRTC | CPU | 0 |
-| **Total na dGPU** | | **~4–4,5 GB de 8 GB**, com folga para o Windows |
+| **Total na dGPU** | | **~3,5–4,5 GB de 8 GB**, sem contar o que o Windows e o desktop já usam na dGPU (medir com `nvidia-smi`) |
 
 Regras propostas:
 
@@ -230,7 +233,9 @@ Regras propostas:
 2. **A iGPU fica com o modelo local**, sem disputar VRAM.
 3. **A CPU fica com VAD, fim de turno e AEC**. O 185H tem margem de sobra.
 4. **NPU:** não usar no caminho crítico enquanto o `DEVICE_LOST` não estiver
-   resolvido (memória `npu-turbo-device-lost`). Se voltar a ser confiável, é
+   resolvido: o erro foi reproduzido fora do app, com o driver 32.0.100.5540
+   e o OpenVINO 2025.4.1, então não é o cache nem o código do app. O
+   tratamento do erro está em `docs/PLANO-DISTRIBUICAO-HARDWARE.md`. Se voltar a ser confiável, é
    candidata a rodar o Smart Turn ou o VAD em baixo consumo, sem ganho real de
    latência.
 5. **Disputa na dGPU:** STT e TTS podem rodar ao mesmo tempo na interrupção,
@@ -251,7 +256,7 @@ Regras propostas:
 | 1º token | 1,3 s | 1,2 s | 0,3 s |
 | Até a 1ª oração completa | ~1 s | 0,3 s (oração curta) | 0,3 s |
 | TTS até o 1º áudio | ~4 s | 0,2 s (streaming) | 0,2 s |
-| Espera até tocar | 0–3 s | ~0 | ~0 |
+| Espera do prebuffer | 0–3 s | ~0, só com TTS de RTF < 1 | ~0, só com TTS de RTF < 1 |
 | Saída de áudio | 0,09 s | 0,02 s (WASAPI) | 0,02 s |
 | **Total** | **~7–10 s** | **~2,3 s** | **~1,4 s** |
 
@@ -265,9 +270,9 @@ Cada etapa só avança se o benchmark dela passar.
 
 | Etapa | O que fazer | Critério para seguir |
 |---|---|---|
-| **0. Medir o que já existe** | <ul><li>Explicar a espera `synth_end → play` de até 3 s.</li><li>Logar o tempo do fim da fala até o primeiro áudio real (`voice_to_voice`) em cada turno.</li><li>Medir a VRAM do Chatterbox.</li></ul> | Linha de base com p50 e p90 de `voice_to_voice` |
-| **1. Ganhos sem trocar modelo** | <ul><li>Primeira oração curta para o TTS.</li><li>Eliminar a espera encontrada na etapa 0.</li><li>Saída por WASAPI.</li></ul> | `voice_to_voice` p50 −2 s |
-| **2. TTS novo** | Backend `qwen3-tts`, um servidor uv script como o `tts_server.py` com a mesma API HTTP, com streaming por chunks e a voz `debora_v2` clonada; e `kokoro` como modo rápido | RTF < 0,3; 1º áudio < 300 ms; avaliação pt-BR às cegas (o usuário ouve 10 frases de cada) |
+| **0. Medir o que já existe** | <ul><li>Registrar a espera do prebuffer (já logada como `prebuffer held`) junto do tempo total.</li><li>Logar o tempo do fim da fala até o primeiro áudio real (`voice_to_voice`) em cada turno.</li><li>Medir a VRAM do Chatterbox.</li></ul> | Linha de base com p50 e p90 de `voice_to_voice` |
+| **1. Ganhos sem trocar modelo** | <ul><li>Primeira oração curta para o TTS.</li><li>Ajustar `voice_chat_prebuffer_max` só depois de medir lacunas versus atraso.</li><li>Saída por WASAPI.</li></ul> | `voice_to_voice` p50 −1 s sem aumentar as lacunas |
+| **2. TTS novo** | Backend `qwen3-tts`, um servidor uv script como o `tts_server.py` com a mesma API HTTP, com streaming por chunks e a voz `debora_v2` clonada; e `kokoro` como modo rápido. **Pré-requisito:** consentimento por escrito de quem cedeu a voz da `debora_v2`, cobrindo clonagem com outro modelo e publicação | RTF < 0,3; 1º áudio < 300 ms; avaliação pt-BR às cegas (o usuário ouve 10 frases de cada) |
 | **3. Smart Turn** | Fim de turno em duas fases (seção 5.3) | Menos de 5% de cortes no meio da frase em 50 turnos reais; −0,4 s p50 |
 | **4. AEC** | WebRTC AEC com o alto-falante como referência; barge-in sem fone | Sem auto-interrupção em 20 respostas pelo alto-falante |
 | **5. Streaming STT + especulação** | Nemotron streaming (se compilar no Windows) ou Voxtral Realtime; começar o modelo local com o texto parcial | `voice_to_voice` < 1 s com o modelo local |
@@ -279,25 +284,35 @@ Todos rodam fora do app, em ambiente uv isolado, como o `tts_server.py`.
 **Cada um baixa modelos:** é preciso aprovar antes de rodar.
 
 ```powershell
-# TTS Qwen3-TTS 0.6B Base: RTF, 1º áudio e VRAM (download de ~1-2 GB)
-uv run --python 3.12 --with qwen-tts --with soundfile `
-  --index https://download.pytorch.org/whl/cu124 `
-  python bench_tts_qwen3.py --model Qwen/Qwen3-TTS-12Hz-0.6B-Base `
-  --ref debora_whisper/voices/debora_v2.wav --sentences frases_ptbr.txt
-# Durante a execução, em outro terminal:
+# Durante cada benchmark, em outro terminal:
 nvidia-smi --query-gpu=memory.used,clocks.sm,temperature.gpu --format=csv -l 1
 
-# TTS Kokoro, voz pf_dora em CPU e CUDA (precisa do espeak-ng instalado)
-uv run --python 3.12 --with kokoro --with soundfile `
-  python bench_tts_kokoro.py --voice pf_dora --lang p --device cpu
+# TTS Qwen3-TTS 0.6B Base: RTF, 1º áudio e VRAM (download de ~1-2 GB)
+uv run --script bench_tts_qwen3.py --model Qwen/Qwen3-TTS-12Hz-0.6B-Base `
+  --ref debora_whisper/voices/debora_v2.wav --ref-text debora_v2.txt `
+  --sentences frases_ptbr.txt --out $env:TEMP\debora-tts-bench
+
+# TTS Kokoro, voz pf_dora (precisa do espeak-ng instalado)
+uv run --script bench_tts_kokoro.py --voice pf_dora --lang p --device cpu --out $env:TEMP\debora-tts-bench
+uv run --script bench_tts_kokoro.py --voice pf_dora --lang p --device cuda --out $env:TEMP\debora-tts-bench
 ```
+
+- Os `bench_tts_*.py` são scripts uv (PEP 723) com o mesmo cabeçalho do
+  `tts_server.py`:
+  - versões exatas (`qwen-tts==X`, `kokoro==Y`, `soundfile==Z`);
+  - o índice `pytorch-cu124` restrito a `torch`/`torchaudio` via
+    `[tool.uv.sources]`, nunca um `--index` global (evita confusão de
+    dependências).
+- `debora_v2.txt` é a transcrição do áudio de referência, que o Qwen3-TTS
+  exige para clonar.
 
 - `bench_tts_*.py` (a escrever na etapa 2) mede, para cada uma das 20 frases
   de `frases_ptbr.txt`:
   - tempo até o primeiro chunk de áudio;
   - tempo total e RTF;
   - VRAM no pico.
-- Os WAVs vão para `docs/benchmarks/tts-<data>/`, para a avaliação às cegas.
+- Os WAVs ficam fora do git (pasta temporária local), só para a avaliação às
+  cegas. No repositório entram só os números.
 - Smart Turn: rodar o modelo ONNX int8 (8 MB) com o `onnxruntime` do `.venv`
   sobre os WAVs dos turnos salvos (se houver gravações) ou sobre 50 frases
   gravadas na hora.
@@ -310,15 +325,18 @@ uv run --python 3.12 --with kokoro --with soundfile `
 - **Licenças:**
   - Voxtral TTS (CC BY-NC) e XTTS-v2 (CPML) ficam fora.
   - A licença dos pesos do Pocket TTS não está publicada.
-  - Clonar voz exige consentimento de quem cedeu a voz. Vale confirmar a
-    origem da `debora_v2`.
+  - Clonar voz exige consentimento de quem cedeu a voz. Confirmar a origem e
+    o consentimento da `debora_v2` é pré-requisito da etapa 2.
+  - O Chatterbox marca o áudio com a marca d'água PerTh. Qwen3-TTS e Kokoro
+    não parecem ter equivalente **[suposição]**: trocar o modelo perde essa
+    marca.
 - **Windows:**
   - Nemotron e NeMo são oficialmente só Linux.
   - Kokoro em pt precisa do espeak-ng.
   - O Qwen3-TTS recomenda FlashAttention 2, que é difícil de compilar no
     Windows. Sem ele deve funcionar, com mais memória **[suposição]**.
-  - O Smart App Control já bloqueou o uv aqui (memória
-    `smart-app-control-blocks-uv`).
+  - O Smart App Control do Windows já bloqueou o uv nesta máquina (erro de
+    SO 4551 ao iniciar o servidor de TTS).
 - **Qualidade pt-BR:**
   - Os números de latência das fontes são de divulgação, quase sempre em
     inglês e sem hardware informado.
