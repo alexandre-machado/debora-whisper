@@ -296,7 +296,7 @@ def test_adapter_disconnect_cancels_and_removes_hooks(qwen_model, monkeypatch):
     "debora_whisper/tts_server_qwen3.py", "debora_whisper/tts_server_kokoro.py",
     "docs/benchmarks/tts-bench/bench_tts.py"])
 def test_pep723_pins_and_scoped_indexes(filename):
-    import tomllib
+    tomllib = pytest.importorskip("tomllib")  # stdlib from Python 3.11
     from packaging.requirements import Requirement
     text = (ROOT / filename).read_text(encoding="utf-8")
     block = text.split("# /// script\n", 1)[1].split("# ///", 1)[0]
@@ -314,7 +314,7 @@ def test_pep723_pins_and_scoped_indexes(filename):
 
 
 def test_default_transcript_is_exact_and_packaged():
-    import tomllib
+    tomllib = pytest.importorskip("tomllib")  # stdlib from Python 3.11
     expected = "Sistemas iniciados com sucesso. Estou processando o áudio localmente, garantindo a sua privacidade. A captação está limpa. Pode começar a ditar quando quiser. Eu estarei aqui, ouvindo."
     assert (ROOT / "debora_whisper/voices/debora_v2.txt").read_text(encoding="utf-8").splitlines() == [expected]
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
