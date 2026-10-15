@@ -51,6 +51,15 @@ FRAME_SECONDS = 0.01
 SILENCE_RMS = 0.002
 MIN_SILENCE_SECONDS = 0.15
 TAIL_SECONDS = 1.0
+# A pause mark among the last words ("Pode ser, sim") makes XTTS pause there
+# for 230-400 ms before the final word(s). That pause and the word after it
+# cannot be told from the artifact by sound: over 72 measured clips the gap,
+# the loudness against the speech before it, the length and the spectral
+# centroid of the sound after it all overlapped. Such texts are never trimmed.
+_PAUSE_MARKS = re.compile(r"[,;:.!?…—–-]")
+LICENSE_NOTICE = ("XTTS-v2 weights are under the Coqui Public Model License (non-commercial "
+                  "use only, https://coqui.ai/cpml); choosing this backend accepts it "
+                  "(COQUI_TOS_AGREED=1).")
 
 
 def xtts_language(language_id):
@@ -74,6 +83,15 @@ def speakable_text(text):
     if not stripped:
         raise ValueError(f"nothing to speak in {text[:80]!r}")
     return stripped
+
+
+def pauses_before_last_word(text):
+    """True if the last three words carry a pause mark (ignoring a final "?"
+    or "!"), so a silence before the final words is speech, not the artifact.
+    Three: the 1 s window fits two short words after the pause ("sim, mas
+    não" paused 280-360 ms before "mas não")."""
+    words = text.rstrip(" ?!").split()[-3:]
+    return bool(_PAUSE_MARKS.search(" ".join(words)))
 
 
 def trim_trailing_artifact(samples, sample_rate=SAMPLE_RATE):
@@ -134,6 +152,7 @@ class XttsBackend:
         self.use(voice)  # Fail before importing/loading the model if the file is missing.
         # The user picked this backend, which accepts XTTS-v2's non-commercial
         # CPML; without this Coqui asks on stdin, which this server never reads.
+        server.log(LICENSE_NOTICE)
         os.environ["COQUI_TOS_AGREED"] = "1"
         import torch
         from TTS.tts.configs.xtts_config import XttsConfig
@@ -179,14 +198,15 @@ class XttsBackend:
         import torch
         language = xtts_language(language_id)
         gpt_cond_latent, speaker_embedding = self.latents
-        out = self.model.inference(speakable_text(text), language, gpt_cond_latent,
+        spoken = speakable_text(text)
+        out = self.model.inference(spoken, language, gpt_cond_latent,
                                    speaker_embedding, enable_text_splitting=False)
         raw = out["wav"].reshape(-1)
-        samples = trim_trailing_artifact(raw)
+        samples = raw if pauses_before_last_word(spoken) else trim_trailing_artifact(raw)
         if len(samples) < len(raw):
             server.log(f"Trimmed {(len(raw) - len(samples)) / self.sr:.2f}s of trailing noise")
         return torch.as_tensor(samples).reshape(1, -1)
 
 
 if __name__ == "__main__":
-    server.backend_main(XttsBackend, XttsBackend.package, MODEL_ID)
+    server.backend_main(XttsBackend, XttsBackend.package, MODEL_ID, notice=LICENSE_NOTICE)

@@ -467,6 +467,50 @@ def test_trim_applies_to_generated_audio(xtts_model, monkeypatch):
     assert logs == ["Trimmed 0.70s of trailing noise"]
 
 
+@pytest.mark.parametrize("text,pause", [
+    ("Pode ser, sim", True), ("Acho que sim, mas não", True), ("Tá bom; tchau", True),
+    ("Eu vi: sim", True), ("Ele disse — sim", True), ("Tudo certo. Sim", True),
+    ("Pode ser, sim?", True), ("Pronto, foi!", True),
+    ("Isso parece certo", False), ("Pronto, terminei de organizar tudo agora", False),
+    ("Você quer que eu repita?", False), ("Olá", False), ("Sim, eu vou lá agora", False),
+])
+def test_xtts_pause_mark_in_last_three_words(text, pause):
+    assert xtts.pauses_before_last_word(text) is pause
+
+
+def test_xtts_keeps_short_final_word_after_comma_pause(xtts_model, monkeypatch):
+    # REV-1: XTTS pauses at the comma; that pause plus "sim" sounds exactly
+    # like the artifact (measured), so the text decides.
+    backend, model, _, _, _ = xtts_model
+    logs = []
+    monkeypatch.setattr(server, "log", logs.append)
+    audio = np.concatenate([tone(1.2), silence(0.2), tone(0.35)])
+    model.inference.return_value = {"wav": audio}
+    assert backend.generate("Pode ser, sim.", "pt").shape == (1, len(audio))
+    assert model.inference.call_args.args[0] == "Pode ser, sim"
+    assert logs == []
+    # Without the comma the same audio is the artifact and is cut at the gap.
+    assert backend.generate("Pode ser sim.", "pt").shape[1] - int(SR * 1.2) in range(0, SR // 100)
+
+
+def test_xtts_states_license_at_startup_and_in_help(monkeypatch, tmp_path, fake_torch, capsys):
+    logs = []
+    monkeypatch.setattr(server, "log", logs.append)
+    model = Mock()
+    model.modules.return_value = []
+    model.get_conditioning_latents.return_value = ("lat", "spk")
+    fake_coqui(monkeypatch, model)
+    voice = tmp_path / "voice.wav"
+    voice.write_bytes(b"reference")
+    xtts.XttsBackend("cpu", str(voice))
+    assert xtts.LICENSE_NOTICE in logs
+    assert "non-commercial" in xtts.LICENSE_NOTICE and "COQUI_TOS_AGREED" in xtts.LICENSE_NOTICE
+    with pytest.raises(SystemExit):
+        server.backend_main(xtts.XttsBackend, "coqui-tts", xtts.MODEL_ID, ["--help"],
+                            notice=xtts.LICENSE_NOTICE)
+    assert "Coqui Public Model License" in " ".join(capsys.readouterr().out.split())
+
+
 def test_xtts_download_progress_reaches_health(monkeypatch):
     hub = pytest.importorskip("huggingface_hub.utils")
     from debora_whisper.download_progress import DownloadProgress, track_hf_downloads
