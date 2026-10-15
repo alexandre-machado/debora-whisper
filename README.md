@@ -447,9 +447,9 @@ neither shown nor spoken, and dates, times, percentages and numbers
 are spelled out (with `num2words`) before they reach Chatterbox, which reads
 digits badly; the overlay keeps the digits.
 
-`tts_backend` selects `chatterbox` (the unchanged default), `qwen3` or `kokoro`.
-Each has its own server script (`tts_server.py`, `tts_server_qwen3.py` or
-`tts_server_kokoro.py`) and isolated uv environment with pinned dependencies;
+`tts_backend` selects `chatterbox` (the unchanged default), `qwen3`, `kokoro` or
+`xtts`. Each has its own server script (`tts_server.py`, `tts_server_qwen3.py`,
+`tts_server_kokoro.py` or `tts_server_xtts.py`) and isolated uv environment with pinned dependencies;
 none runs in the app's environment. The app
 starts it with `uv run --script` (uv builds that environment on the first run,
 a few GB, and caches it). It is started only when nothing answers at
@@ -480,10 +480,32 @@ is needed. If it fails to load, `/health` reports how to fix it. Both new backen
 `--device cpu` or `--device cuda` when launched manually (default CUDA, CPU
 fallback when unavailable).
 
-Stage 2 is implemented and **pending benchmark**: speed, VRAM and pt-BR quality
-have not been measured. See [exact server and benchmark commands](docs/benchmarks/tts-bench/README.md).
+Stage 2 (Qwen3 and Kokoro) is implemented and **pending benchmark**: speed, VRAM
+and pt-BR quality have not been measured. See
+[exact server and benchmark commands](docs/benchmarks/tts-bench/README.md).
 
-For Chatterbox and Qwen, `tts_voice` clones a voice from clean speech: a WAV path, or a name
+`xtts` uses **Coqui XTTS-v2** (`tts_models/multilingual/multi-dataset/xtts_v2`,
+through `coqui-tts`, Python 3.11) to clone `tts_voice` from the WAV alone, with
+no transcript. **Its weights are under the Coqui Public Model License (CPML),
+which allows non-commercial use only** (https://coqui.ai/cpml). Selecting this
+backend is taken as accepting it: the server sets `COQUI_TOS_AGREED=1` instead
+of asking on a console nobody sees, and says so in its log and `--help`. Pick
+another backend for commercial use. `tts_voice: null` is unsupported (XTTS-v2
+has no voice of its own), and Settings rejects it; changing the voice restarts
+the managed server. Languages follow XTTS-v2's list (`pt` covers `pt-BR`);
+others fail with an error naming the supported codes. A final `.`, `!`, `;`,
+`:` or `…` is dropped before synthesis (XTTS-v2 appends noise after it). As a
+safety net, a sound after a near-silent gap of at least 150 ms in the last
+second is trimmed, unless the last three words carry a pause mark (`Pode ser,
+sim`), where that gap is a real pause. On an RTX 4070 Laptop with `debora_v2`
+it loaded in about 12 s, used about 2 GB of VRAM and needed about 0.6 s of
+compute per second of audio, faster than Chatterbox (1.4 s). The first run
+downloads about 1.8 GB to `%LOCALAPPDATA%\tts`. On every start, `coqui-tts`
+also fetches the model's `config.json` from Hugging Face and downloads the
+whole model again if it changed upstream; without network access it keeps the
+local copy.
+
+For Chatterbox, Qwen and XTTS-v2, `tts_voice` clones a voice from clean speech: a WAV path, or a name
 looked up as `<name>.wav` in the voices folder (see File Paths), then among
 the voices that ship with the app: `carol`, `debora`, `debora_v2` (the
 default), `isabel` and `mari`. A file of the same name in the voices folder wins. `null` uses

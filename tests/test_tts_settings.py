@@ -17,6 +17,7 @@ from debora_whisper.ui.settings import (
     ("chatterbox", "Chatterbox (clones the voice)"),
     ("qwen3", "Qwen3-TTS (experimental, clones the voice)"),
     ("kokoro", "Kokoro (fastest, pt-BR voice pf_dora)"),
+    ("xtts", "XTTS-v2 (fast, clones the voice, non-commercial)"),
 ])
 @pytest.mark.parametrize("voice", [_DEFAULT_VOICE, "isabel"])
 def test_settings_apply_engine_and_voice(backend, label, voice, monkeypatch):
@@ -42,10 +43,11 @@ def test_settings_apply_engine_and_voice(backend, label, voice, monkeypatch):
     monkeypatch.setattr(de, "select_device", lambda *args: "CPU")
     original = dict(window._config)
     window._apply()
-    if backend == "qwen3" and voice == _DEFAULT_VOICE:
+    if backend in ("qwen3", "xtts") and voice == _DEFAULT_VOICE:
         window._on_apply.assert_not_called()
         assert window._config == original
-        assert "Qwen3 requires a reference voice" in window.update_status.call_args.args[0]
+        name = "Qwen3" if backend == "qwen3" else "XTTS-v2"
+        assert f"{name} requires a reference voice" in window.update_status.call_args.args[0]
         return
     saved = window._on_apply.call_args.args[0]
     assert saved["tts_backend"] == backend
@@ -55,7 +57,7 @@ def test_settings_apply_engine_and_voice(backend, label, voice, monkeypatch):
 def test_kokoro_disables_voice_and_other_engines_restore_it():
     window = SettingsWindow.__new__(SettingsWindow)
     window._voice_dropdown = MagicMock()
-    for backend in ("kokoro", "qwen3", "kokoro", "chatterbox"):
+    for backend in ("kokoro", "qwen3", "kokoro", "xtts", "chatterbox"):
         window._on_tts_engine_change(_TTS_ENGINES[backend])
         window._voice_dropdown.configure.assert_called_with(
             state="disabled" if backend == "kokoro" else "normal")
@@ -95,7 +97,7 @@ def managed_tts(monkeypatch):
             worker.join(3)
 
 
-@pytest.mark.parametrize("backend", ["qwen3", "kokoro"])
+@pytest.mark.parametrize("backend", ["qwen3", "kokoro", "xtts"])
 def test_backend_change_stops_old_server_before_starting_new(managed_tts, backend):
     popen, kill, processes = managed_tts
     calls = MagicMock()
@@ -111,7 +113,7 @@ def test_backend_change_stops_old_server_before_starting_new(managed_tts, backen
     assert not vc._tts_stopping.is_set()
 
 
-@pytest.mark.parametrize("backend", ["chatterbox", "qwen3", "kokoro"])
+@pytest.mark.parametrize("backend", ["chatterbox", "qwen3", "kokoro", "xtts"])
 def test_same_backend_and_command_reuse_server(managed_tts, backend):
     popen, kill, _ = managed_tts
     config = {**de.DEFAULT_CONFIG, "tts_backend": backend}
@@ -121,9 +123,10 @@ def test_same_backend_and_command_reuse_server(managed_tts, backend):
     kill.assert_not_called()
 
 
-def test_qwen_voice_change_restarts_startup_clone(managed_tts):
+@pytest.mark.parametrize("backend", ["qwen3", "xtts"])
+def test_startup_voice_change_restarts_clone(managed_tts, backend):
     popen, kill, processes = managed_tts
-    config = {**de.DEFAULT_CONFIG, "tts_backend": "qwen3"}
+    config = {**de.DEFAULT_CONFIG, "tts_backend": backend}
     vc.ensure_tts_server(config)
     vc.ensure_tts_server({**config, "tts_voice": "isabel"})
     kill.assert_called_once_with(processes[0])
@@ -141,7 +144,7 @@ def test_kokoro_ignores_voice_change(managed_tts):
     kill.assert_not_called()
 
 
-@pytest.mark.parametrize("backend", ["chatterbox", "qwen3", "kokoro"])
+@pytest.mark.parametrize("backend", ["chatterbox", "qwen3", "kokoro", "xtts"])
 def test_language_change_does_not_restart_managed_server(managed_tts, backend):
     popen, kill, _ = managed_tts
     config = {**de.DEFAULT_CONFIG, "tts_backend": backend, "language": "pt"}
@@ -211,14 +214,18 @@ def test_retiring_child_is_not_adopted_after_shutdown_timeout(managed_tts, monke
     kill.assert_called_once_with(processes[0])
 
 
+@pytest.mark.parametrize("backend", ["qwen3", "xtts"])
 @pytest.mark.parametrize("command", [None, ["custom-server", "--voice", "own.wav"]])
-def test_qwen_null_voice_is_valid_at_startup(command):
-    de.validate_config({**de.DEFAULT_CONFIG, "tts_backend": "qwen3",
+def test_clone_only_null_voice_is_valid_at_startup(command, backend):
+    # A saved config must still load; Settings and the server's /health
+    # explain the missing voice instead.
+    de.validate_config({**de.DEFAULT_CONFIG, "tts_backend": backend,
                         "tts_voice": None, "tts_server_command": command})
 
 
-def test_qwen_custom_command_can_supply_its_own_voice_in_settings():
-    config = {**de.DEFAULT_CONFIG, "tts_backend": "qwen3", "tts_voice": None,
+@pytest.mark.parametrize("backend", ["qwen3", "xtts"])
+def test_clone_only_custom_command_can_supply_its_own_voice_in_settings(backend):
+    config = {**de.DEFAULT_CONFIG, "tts_backend": backend, "tts_voice": None,
               "tts_server_command": ["custom-server", "--voice", "own.wav"]}
     window = SettingsWindow.__new__(SettingsWindow)
     window._get_new_config = lambda: config

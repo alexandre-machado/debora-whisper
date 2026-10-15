@@ -426,9 +426,10 @@ def serve(server):
         server.server_close()
 
 
-def backend_main(loader, package, model_id, argv=None):
-    """Shared entry point for isolated uv scripts; no app imports required."""
-    parser = argparse.ArgumentParser(description=f"Local TTS: {model_id}")
+def backend_main(loader, package, model_id, argv=None, notice=None):
+    """Shared entry point for isolated uv scripts; no app imports required.
+    notice (license terms, for example) ends --help."""
+    parser = argparse.ArgumentParser(description=f"Local TTS: {model_id}", epilog=notice)
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--voice", help="Local reference WAV (Qwen requires its .txt sidecar)")
     parser.add_argument("--language", default="pt")

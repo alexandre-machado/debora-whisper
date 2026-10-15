@@ -113,7 +113,11 @@ TTS_SERVER_SCRIPTS = {
     "chatterbox": TTS_SERVER_SCRIPT,
     "qwen3": TTS_SERVER_SCRIPT.with_name("tts_server_qwen3.py"),
     "kokoro": TTS_SERVER_SCRIPT.with_name("tts_server_kokoro.py"),
+    "xtts": TTS_SERVER_SCRIPT.with_name("tts_server_xtts.py"),
 }
+# Backends that need their startup reference voice: --voice is passed even
+# when the file is missing, so /health explains it, and changing it restarts.
+_STARTUP_VOICE_BACKENDS = ("qwen3", "xtts")
 # Shorter sentences wait for the next one: "Opa!" alone sounds clipped, and
 # Chatterbox cannot speak a bare "OK" at all.
 TTS_MIN_CHARS = 16
@@ -657,7 +661,7 @@ def tts_command(config: dict, log=print) -> list[str] | None:
         return None
     command = [uv, "run", "--script", str(script), "--port", str(url.port or 80)]
     voice = resolve_voice(config.get("tts_voice"))
-    if voice is not None and backend != "kokoro" and (voice.is_file() or backend == "qwen3"):
+    if voice is not None and backend != "kokoro" and (voice.is_file() or backend in _STARTUP_VOICE_BACKENDS):
         command += ["--voice", str(voice)]
     elif voice is not None and backend == "chatterbox":
         log(f"Voice chat: voice {voice} not found; using Chatterbox's own voice.")
@@ -815,7 +819,8 @@ def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=Fa
         custom_command = config.get("tts_server_command")
         # Language and Chatterbox's voice are sent with every request. File
         # additions/removals must not turn them into process restart triggers.
-        voice = resolve_voice(config.get("tts_voice")) if backend == "qwen3" and not custom_command else None
+        voice = (resolve_voice(config.get("tts_voice"))
+                 if backend in _STARTUP_VOICE_BACKENDS and not custom_command else None)
         key = (backend, tuple(custom_command) if custom_command else None,
                urllib.parse.urlparse(config["tts_url"]).port or 80,
                str(voice) if voice is not None else None)

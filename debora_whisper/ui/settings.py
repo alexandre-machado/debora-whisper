@@ -29,6 +29,15 @@ _TTS_ENGINES = {
     "chatterbox": "Chatterbox (clones the voice)",
     "qwen3": "Qwen3-TTS (experimental, clones the voice)",
     "kokoro": "Kokoro (fastest, pt-BR voice pf_dora)",
+    # Choosing it accepts the Coqui Public Model License (non-commercial use).
+    "xtts": "XTTS-v2 (fast, clones the voice, non-commercial)",
+}
+# Engines that only clone a reference WAV: "Chatterbox default" is no voice.
+_CLONE_ONLY_ENGINES = {
+    "qwen3": "Qwen3 requires a reference voice (tts_voice); select a WAV voice with a "
+             "matching UTF-8 .txt transcript instead of Chatterbox default.",
+    "xtts": "XTTS-v2 requires a reference voice (tts_voice); select a WAV voice "
+            "instead of Chatterbox default.",
 }
 _TTS_ENGINE_KEYS = {label: key for key, label in _TTS_ENGINES.items()}
 
@@ -299,8 +308,10 @@ class SettingsWindow:
         )
         self._tts_engine_dropdown.pack(padx=20, pady=(4, 0), fill="x")
         ctk.CTkLabel(
-            scroll, text="Kokoro ignores the voice. First use downloads the model.",
+            scroll, text="Kokoro ignores the voice. First use downloads the model.\n"
+                         "XTTS-v2 is licensed for non-commercial use only (Coqui CPML).",
             font=ctk.CTkFont(size=11), text_color=_DESC_TEXT, fg_color="transparent",
+            justify="left",
         ).pack(padx=20, pady=(2, 0), anchor="w")
         voice_row = ctk.CTkFrame(scroll, fg_color="transparent")
         voice_row.pack(padx=20, pady=(4, 0), fill="x")
@@ -570,12 +581,10 @@ class SettingsWindow:
         from debora_whisper.dictation_engine import validate_config
         try:
             validate_config(new_config)
-            if (new_config.get("tts_backend") == "qwen3"
+            if (new_config.get("tts_backend") in _CLONE_ONLY_ENGINES
                     and new_config.get("tts_voice") is None
                     and not new_config.get("tts_server_command")):
-                raise ValueError("Qwen3 requires a reference voice (tts_voice); "
-                                 "select a WAV voice with a matching UTF-8 .txt transcript "
-                                 "instead of Chatterbox default.")
+                raise ValueError(_CLONE_ONLY_ENGINES[new_config["tts_backend"]])
         except ValueError as e:
             self.update_status(str(e), "#FF453A")
             return
