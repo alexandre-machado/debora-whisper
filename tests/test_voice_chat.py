@@ -991,7 +991,11 @@ def no_tts_process(monkeypatch):
     monkeypatch.setattr(vc, "_tts_process", None)
     monkeypatch.setattr(vc, "_tts_server_key", None)
     yield
+    with vc._tts_health_cache_lock:
+        workers = [worker for _, worker in vc._tts_health_polls.values()]
     vc.stop_tts_server()
+    for worker in workers:
+        worker.join(3)
 
 
 def _closed_port_url():

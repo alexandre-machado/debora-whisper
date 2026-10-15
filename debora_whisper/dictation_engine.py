@@ -21,6 +21,7 @@ from enum import Enum
 from pathlib import Path
 from datetime import datetime
 
+from debora_whisper.download_progress import STT_DOWNLOAD, format_download, track_hf_downloads
 from debora_whisper import paths, platforms, processes
 from debora_whisper.platforms.base import CaretReadStatus
 # Kept for callers checking the shared clipboard transaction lock.
@@ -30,7 +31,7 @@ from debora_whisper.solo_key import SoloKeyTap
 from debora_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
 from debora_whisper.vad_endpoint import AdaptiveEndpoint, VadSegment
 from debora_whisper.voice_chat import (VoiceChat, download_llm, ensure_tts_server, is_http_url,
-                                    llm_loaded, load_llm)
+                                    llm_loaded, load_llm, tts_download_progress)
 
 # Disable HuggingFace symlinks on Windows to avoid WinError 1314
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
@@ -474,50 +475,8 @@ def setup_model(config: dict, progress_callback=None):
     try:
         from huggingface_hub import snapshot_download
 
-        # Build tqdm_class wrapper for progress reporting.
-        # snapshot_download creates one _ProgressBar per file, so we
-        # accumulate bytes across all instances for overall progress.
-        tqdm_kwargs = {}
-        if progress_callback:
-            _cumulative = [0, 0]  # [downloaded_bytes, total_bytes]
-
-            class _ProgressBar:
-                """Minimal tqdm-compatible wrapper that forwards to progress_callback."""
-                _lock = None
-                def __init__(self, *args, **kwargs):
-                    self.total = kwargs.get("total", 0)
-                    self.n = 0
-                    _cumulative[1] += self.total
-                @classmethod
-                def get_lock(cls):
-                    import threading
-                    if cls._lock is None:
-                        cls._lock = threading.Lock()
-                    return cls._lock
-                @classmethod
-                def set_lock(cls, lock):
-                    cls._lock = lock
-                def update(self, n=1):
-                    self.n += n
-                    _cumulative[0] += n
-                    if _cumulative[1] > 0:
-                        progress_callback(_cumulative[0], _cumulative[1])
-                def close(self):
-                    pass
-                def set_description(self, *a, **kw):
-                    pass
-                def set_postfix(self, *a, **kw):
-                    pass
-                def refresh(self, *a, **kw):
-                    pass
-                def __enter__(self):
-                    return self
-                def __exit__(self, *a):
-                    pass
-
-            tqdm_kwargs["tqdm_class"] = _ProgressBar
-
-        snapshot_download(ov_repo, local_dir=str(model_path), **tqdm_kwargs)
+        with track_hf_downloads(STT_DOWNLOAD, progress_callback):
+            snapshot_download(ov_repo, local_dir=str(model_path))
 
         # Verify download
         if model_files_complete(model_path):
@@ -898,7 +857,8 @@ class FasterWhisperCUDA:
         
         # compute_type="int8_float16" gives the best performance/VRAM tradeoff on RTX.
         start = time.time()
-        self.pipeline = WhisperModel(self.model_size, device="cuda", compute_type="int8_float16")
+        with track_hf_downloads(STT_DOWNLOAD):
+            self.pipeline = WhisperModel(self.model_size, device="cuda", compute_type="int8_float16")
         hw_name = has_nvidia_gpu(return_name=True) or "NVIDIA GPU"
         log(f"Loaded faster-whisper on {hw_name} in {time.time() - start:.1f}s")
 
@@ -2658,7 +2618,9 @@ class DictationApp:
                 state_name = self._state.value if hasattr(self, "_state") else "UNKNOWN"
                 # Short enough for an ~80-column console.
                 log(f"[Telemetry] {state_name:<10} CPU {cpu:3.0f}% RAM {mem:.0f}M "
-                    f"sys {sys_mem:.0f}%{vram_info}")
+                    f"sys {sys_mem:.0f}%{vram_info}"
+                    f"{format_download('STT', STT_DOWNLOAD.snapshot())}"
+                    f"{format_download('TTS', tts_download_progress(self.config))}")
         except ImportError:
             log("[Telemetry] psutil not found. Resource monitoring disabled.")
         except Exception as e:

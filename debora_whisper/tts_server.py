@@ -52,6 +52,11 @@ import wave
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+if __package__:
+    from .download_progress import DownloadProgress, track_hf_downloads
+else:  # uv run --script: sibling modules are available without the app.
+    from download_progress import DownloadProgress, track_hf_downloads
+
 MAX_TEXT_CHARS = 1000
 MAX_BODY_BYTES = 64_000
 VOICE_SUFFIXES = (".wav", ".flac", ".mp3", ".ogg")
@@ -362,6 +367,65 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
     return Handler
 
 
+def loading_server(address, loader, language, *, adapter=True):
+    """Bind before loading; atomically publish the finished request handler."""
+    progress = DownloadProgress()
+
+    class LoadingHandler(BaseHTTPRequestHandler):
+        def reply(self, body):
+            raw = json.dumps(body).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            if self.path != "/health":
+                return self.send_error(404)
+            self.reply({"ok": False, "state": "loading", "download": progress.snapshot()})
+
+        def do_POST(self):
+            if self.path != "/tts":
+                return self.send_error(404)
+            self.reply({"error": "loading"})
+
+        def log_message(self, *args):
+            pass
+
+    state = types.SimpleNamespace(handler=LoadingHandler)
+
+    def dispatch(*args, **kwargs):
+        state.handler(*args, **kwargs)
+
+    server = ThreadingHTTPServer(address, dispatch)
+
+    def load():
+        try:
+            with track_hf_downloads(progress):
+                model, error = loader()
+            handler = make_handler(model, language, adapter=adapter, error=error)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            log(f"TTS startup failed: {error}")
+            model = types.SimpleNamespace(package="unknown", model_id="unknown")
+            handler = make_handler(model, language, adapter=True, error=error)
+        state.handler = handler
+
+    threading.Thread(target=load, daemon=True).start()
+    return server
+
+
+def serve(server):
+    log(f"Listening on http://127.0.0.1:{server.server_port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log("Stopped.")
+    finally:
+        server.server_close()
+
+
 def backend_main(loader, package, model_id, argv=None):
     """Shared entry point for isolated uv scripts; no app imports required."""
     parser = argparse.ArgumentParser(description=f"Local TTS: {model_id}")
@@ -371,16 +435,9 @@ def backend_main(loader, package, model_id, argv=None):
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     args = parser.parse_args(argv)
     setup_logging()
-    model, error = load_backend(loader, args.device, args.voice, package, model_id)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port),
-                                make_handler(model, args.language, adapter=True, error=error))
-    log(f"Listening on http://127.0.0.1:{args.port}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log("Stopped.")
-    finally:
-        server.server_close()
+    serve(loading_server(("127.0.0.1", args.port),
+                         lambda: load_backend(loader, args.device, args.voice, package, model_id),
+                         args.language))
 
 
 def load_backend(loader, device, voice, package, model_id):
@@ -406,13 +463,9 @@ def main():
     setup_logging()
     log(f"Starting (pid {os.getpid()}, voice {args.voice or 'default'}, "
         f"language {args.language})")
-    model = load_model(args.device, args.voice)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(model, args.language))
-    log(f"Listening on http://127.0.0.1:{args.port}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log("Stopped.")
+    serve(loading_server(("127.0.0.1", args.port),
+                         lambda: (load_model(args.device, args.voice), None),
+                         args.language, adapter=False))
 
 
 if __name__ == "__main__":
