@@ -57,6 +57,10 @@ TAIL_SECONDS = 1.0
 # the loudness against the speech before it, the length and the spectral
 # centroid of the sound after it all overlapped. Such texts are never trimmed.
 _PAUSE_MARKS = re.compile(r"[,;:.!?…—–-]")
+# Sampling temperature. The model's default (0.75) sometimes renders a phrase
+# with an echo; a listening test with debora_v2 preferred 0.45 (no echo, still
+# natural) over 0.6 and 0.75.
+TEMPERATURE = 0.45
 LICENSE_NOTICE = ("XTTS-v2 weights are under the Coqui Public Model License (non-commercial "
                   "use only, https://coqui.ai/cpml); choosing this backend accepts it "
                   "(COQUI_TOS_AGREED=1).")
@@ -200,7 +204,8 @@ class XttsBackend:
         gpt_cond_latent, speaker_embedding = self.latents
         spoken = speakable_text(text)
         out = self.model.inference(spoken, language, gpt_cond_latent,
-                                   speaker_embedding, enable_text_splitting=False)
+                                   speaker_embedding, temperature=TEMPERATURE,
+                                   enable_text_splitting=False)
         raw = out["wav"].reshape(-1)
         samples = raw if pauses_before_last_word(spoken) else trim_trailing_artifact(raw)
         if len(samples) < len(raw):
