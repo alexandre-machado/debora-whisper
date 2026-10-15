@@ -311,7 +311,7 @@ def test_xtts_loads_once_clones_and_caches_latents(xtts_model):
     assert backend.generate("Olá, mundo.", "pt-BR").shape == (1, 2400)
     args, kwargs = model.inference.call_args
     assert args == ("Olá, mundo", "pt", f"lat:{voice.resolve()}", "spk")
-    assert kwargs == {"enable_text_splitting": False}
+    assert kwargs == {"temperature": 0.45, "enable_text_splitting": False}
     with pytest.raises(ValueError, match="no voice of its own"):
         backend.use("")
 
