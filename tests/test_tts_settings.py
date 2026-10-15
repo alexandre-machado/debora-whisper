@@ -85,7 +85,14 @@ def managed_tts(monkeypatch):
         process.poll.return_value = None
     popen = MagicMock(side_effect=processes)
     monkeypatch.setattr(vc.subprocess, "Popen", popen)
-    return popen, kill, processes
+    try:
+        yield popen, kill, processes
+    finally:
+        with vc._tts_health_cache_lock:
+            workers = [worker for _, worker in vc._tts_health_polls.values()]
+        vc.stop_tts_server()
+        for worker in workers:
+            worker.join(3)
 
 
 @pytest.mark.parametrize("backend", ["qwen3", "kokoro"])
@@ -392,13 +399,14 @@ def test_apply_reconciles_managed_tts_in_dictation(
             assert gui._engine is previous
             onboarding.call_args.kwargs["on_done"]()
     finally:
-        # The replacement's telemetry lives until fixture teardown; only
-        # startup/reconciliation workers should have finished at this point.
-        workers = [worker for worker in workers
-                   if worker is not gui._engine._resource_thread]
+        # Resource telemetry and TTS health polling live until fixture teardown;
+        # only startup/reconciliation workers must have finished at this point.
         for worker in workers:
-            worker.join(5)
-    assert all(not worker.is_alive() for worker in workers)
+            if worker is not gui._engine._resource_thread and worker.name != "tts-health":
+                worker.join(5)
+    # Reconciliation can append a poller while the parent worker is being joined.
+    assert all(not worker.is_alive() for worker in workers
+               if worker is not gui._engine._resource_thread and worker.name != "tts-health")
     assert (gui._engine is not previous) is download
     if not download:
         assert gui._engine.warm_voice_chat is warm_voice_chat

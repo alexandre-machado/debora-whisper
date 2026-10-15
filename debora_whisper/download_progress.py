@@ -1,5 +1,6 @@
 """Byte progress shared by telemetry and the standalone TTS scripts."""
 from contextlib import contextmanager
+from functools import wraps
 import math
 import threading
 
@@ -38,11 +39,12 @@ def format_download(label, progress):
     if not isinstance(progress, dict):
         return ""
     done, total = progress.get("done"), progress.get("total")
-    if (not isinstance(done, (int, float)) or not isinstance(total, (int, float))
-            or not math.isfinite(done) or not math.isfinite(total)
-            or total <= 0 or done < 0 or done >= total):
+    # Bound before converting integers to floats (isfinite can itself overflow).
+    if (type(done) not in (int, float) or type(total) not in (int, float)
+            or not 0 <= done < total <= 2**63 - 1
+            or not math.isfinite(done) or not math.isfinite(total)):
         return ""
-    return f" DL {label} {min(99, round(done * 100 / total))}% ({done / 1_000_000:.0f}/{total / 1_000_000:.0f} MB)"
+    return f" DL {label} {min(99, round((done / total) * 100))}% ({done / 1_000_000:.0f}/{total / 1_000_000:.0f} MB)"
 
 
 STT_DOWNLOAD = DownloadProgress()
@@ -57,19 +59,23 @@ def track_hf_downloads(tracker, callback=None):
     ignored. Counters remain valid when tqdm display is disabled.
     """
     from huggingface_hub.utils import tqdm
+    from huggingface_hub import file_download
 
     original_init, original_update, original_close = tqdm.__init__, tqdm.update, tqdm.close
+    original_http_get = file_download.http_get
     bars = {}
+    current_bars = {}
+    transfer = threading.local()
     lock = threading.RLock()
     tracker.clear()
 
     def publish(bar, amount=0, closed=False):
         with lock:
             entry = bars.get(id(bar))
-            if entry is None:
+            if entry is None or current_bars.get(entry[0]) != id(bar):
                 return
-            entry[0] += amount
-            progress = tracker.update(id(bar), *entry, closed=closed)
+            entry[1] += amount
+            progress = tracker.update(*entry, closed=closed)
             if callback and not closed:
                 callback(progress["done"], progress["total"])
 
@@ -79,9 +85,22 @@ def track_hf_downloads(tracker, callback=None):
         if kwargs.get("unit") == "B" and total and total > 0:
             with lock:
                 # Retain the bar to prevent object-id reuse between files.
-                bars[id(bar)] = [kwargs.get("initial", 0), total]
+                key = getattr(transfer, "key", None) or ("bar", id(bar))
+                bars[id(bar)] = [key, kwargs.get("initial", 0), total]
+                current_bars[key] = id(bar)
                 retained.append(bar)
                 publish(bar)
+
+    @wraps(original_http_get)
+    def http_get(url, temp_file, *args, **kwargs):
+        # The destination survives recursive retries, unlike the bar or its
+        # truncated display name. Separate files with identical names stay separate.
+        previous = getattr(transfer, "key", None)
+        transfer.key = ("http", temp_file)
+        try:
+            return original_http_get(url, temp_file, *args, **kwargs)
+        finally:
+            transfer.key = previous
 
     def update(bar, n=1):
         result = original_update(bar, n)
@@ -94,8 +113,10 @@ def track_hf_downloads(tracker, callback=None):
 
     retained = []
     tqdm.__init__, tqdm.update, tqdm.close = init, update, close
+    file_download.http_get = http_get
     try:
         yield
     finally:
         tqdm.__init__, tqdm.update, tqdm.close = original_init, original_update, original_close
+        file_download.http_get = original_http_get
         tracker.clear()

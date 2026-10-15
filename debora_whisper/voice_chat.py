@@ -684,13 +684,18 @@ def _shutdown_socket(sock):
         pass
 
 
-# Filled by the existing startup health checks, never by telemetry itself.
+# Filled by startup checks and background polling, never by telemetry itself.
 _tts_health_cache = {}
 _tts_health_cache_lock = threading.Lock()
+_tts_health_polls = {}
+_tts_health_poll_context = threading.local()
 
 
 def _cache_tts_health(config, health=None):
     with _tts_health_cache_lock:
+        cancelled = getattr(_tts_health_poll_context, "cancelled", None)
+        if cancelled is not None and cancelled.is_set():
+            return  # An in-flight check must not repopulate the cache after stop.
         url = config.get("tts_url", "").rstrip("/")
         if health is None:
             _tts_health_cache.pop(url, None)
@@ -709,6 +714,39 @@ def _tts_loading_health(config):
 def tts_download_progress(config):
     """Local snapshot only: no I/O or startup/process lock on telemetry's thread."""
     return _tts_loading_health(config).get("download")
+
+
+def _start_tts_health_poll(config, process=None):
+    """Keep loading telemetry fresh independently of any caller's wait deadline."""
+    config = {"tts_url": config["tts_url"]}
+    url = config["tts_url"].rstrip("/")
+    with _tts_health_cache_lock:
+        if url in _tts_health_polls:
+            return
+        cancelled = threading.Event()
+
+        def poll():
+            _tts_health_poll_context.cancelled = cancelled
+            try:
+                while not cancelled.wait(0.5):
+                    if process is not None and process.poll() is not None:
+                        break
+                    if tts_server_up(config):
+                        break
+                    if process is None and not _tts_loading_health(config):
+                        break
+            except TTSStartupError:
+                pass  # Individual waiters still receive the terminal error.
+            finally:
+                with _tts_health_cache_lock:
+                    if _tts_health_polls.get(url, (None,))[0] is cancelled:
+                        _tts_health_polls.pop(url, None)
+                        _tts_health_cache.pop(url, None)
+                del _tts_health_poll_context.cancelled
+
+        worker = threading.Thread(target=poll, daemon=True, name="tts-health")
+        _tts_health_polls[url] = (cancelled, worker)
+        worker.start()
 
 
 def tts_server_up(config: dict) -> bool:
@@ -800,6 +838,8 @@ def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=Fa
             return
         try:
             if tts_server_up(config) or _tts_loading_health(config):
+                if _tts_loading_health(config):
+                    _start_tts_health_poll(config)
                 if _tts_server_key is not None and _tts_server_key != key:
                     log(f"Voice chat: configured TTS backend/command changed to {key[0]}; "
                         "keeping the external server. Restart it manually to apply the change.")
@@ -827,6 +867,7 @@ def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=Fa
         _tts_process.reported = False
         _tts_process.tts_url = config["tts_url"]
         _tts_server_key = key
+        _start_tts_health_poll(config, _tts_process)
         atexit.register(stop_tts_server)
         log(f"Voice chat: starting the TTS server (pid {_tts_process.pid}); "
             f"output in {log_path or 'nowhere'}")
@@ -841,9 +882,11 @@ def wait_tts_server(config: dict, timeout=TTS_STARTUP_SECONDS) -> bool:
             return True
         process = _tts_process
         if ((process is None and not _tts_loading_health(config))
-                or (process is not None and process.poll() is not None)
-                or time.time() > deadline):
+                or (process is not None and process.poll() is not None)):
             _cache_tts_health(config)
+            return False
+        _start_tts_health_poll(config, process)
+        if time.time() > deadline:
             return False
         time.sleep(0.5)
 
@@ -854,6 +897,9 @@ def stop_tts_server():
     with _tts_lock:
         _tts_stopping.set()
         with _tts_health_cache_lock:
+            for cancelled, _ in _tts_health_polls.values():
+                cancelled.set()
+            _tts_health_polls.clear()
             _tts_health_cache.clear()
         process, _tts_process = _tts_process, None
         _tts_server_key = None
