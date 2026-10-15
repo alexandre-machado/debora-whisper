@@ -3,6 +3,7 @@ import importlib.util
 import http.client
 import io
 import json
+import os
 from pathlib import Path
 import runpy
 import socket
@@ -21,6 +22,7 @@ import pytest
 from debora_whisper import tts_server as server
 from debora_whisper import tts_server_kokoro as kokoro
 from debora_whisper import tts_server_qwen3 as qwen
+from debora_whisper import tts_server_xtts as xtts
 from debora_whisper import voice_chat as vc
 from debora_whisper.dictation_engine import DEFAULT_CONFIG, validate_config
 
@@ -84,7 +86,7 @@ def fake_torch(monkeypatch):
 
 @pytest.mark.parametrize("backend,filename", [
     ("chatterbox", "tts_server.py"), ("qwen3", "tts_server_qwen3.py"),
-    ("kokoro", "tts_server_kokoro.py"),
+    ("kokoro", "tts_server_kokoro.py"), ("xtts", "tts_server_xtts.py"),
 ])
 def test_backend_selection(monkeypatch, backend, filename):
     monkeypatch.setattr(vc.shutil, "which", lambda _: "uv.exe")
@@ -111,10 +113,11 @@ def test_invalid_backend_rejected(backend):
         validate_config({**DEFAULT_CONFIG, "tts_backend": backend})
 
 
-def test_qwen_missing_voice_is_not_silently_replaced(monkeypatch, tmp_path):
+@pytest.mark.parametrize("backend", ["qwen3", "xtts"])
+def test_clone_only_missing_voice_is_not_silently_replaced(monkeypatch, tmp_path, backend):
     monkeypatch.setattr(vc.shutil, "which", lambda _: "uv.exe")
     missing = tmp_path / "missing.wav"
-    command = vc.tts_command({**DEFAULT_CONFIG, "tts_backend": "qwen3", "tts_voice": str(missing)})
+    command = vc.tts_command({**DEFAULT_CONFIG, "tts_backend": backend, "tts_voice": str(missing)})
     assert command[command.index("--voice") + 1] == str(missing)
 
 
@@ -257,6 +260,236 @@ def test_kokoro_fixed_voice_and_complete_audio(monkeypatch, fake_torch):
     pipeline.assert_called_once_with("Olá, mundo.", voice="pf_dora")
 
 
+def fake_coqui(monkeypatch, model, downloads=None):
+    """Stand-ins for coqui-tts's modules: nothing is imported or downloaded."""
+    manager = Mock()
+    manager.download_model.side_effect = (
+        lambda name: (downloads if downloads is not None else []).append(name) or ("C:/xtts", None, {}))
+    monkeypatch.setattr(xtts, "report_coqui_downloads", lambda: manager)
+    config = Mock()
+    modules = {
+        "TTS": SimpleNamespace(), "TTS.tts": SimpleNamespace(), "TTS.tts.configs": SimpleNamespace(),
+        "TTS.tts.models": SimpleNamespace(),
+        "TTS.tts.configs.xtts_config": SimpleNamespace(XttsConfig=Mock(return_value=config)),
+        "TTS.tts.models.xtts": SimpleNamespace(Xtts=SimpleNamespace(init_from_config=Mock(return_value=model))),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return manager, config
+
+
+@pytest.fixture
+def xtts_model(monkeypatch, tmp_path, fake_torch):
+    monkeypatch.delenv("COQUI_TOS_AGREED", raising=False)
+    model = Mock()
+    model.modules.return_value = [FakeModule()]
+    model.get_conditioning_latents.side_effect = lambda audio_path: (f"lat:{audio_path[0]}", "spk")
+    model.inference.return_value = {"wav": np.full(2400, 0.1, dtype=np.float32)}
+    downloads = []
+    _, config = fake_coqui(monkeypatch, model, downloads)
+    voice = tmp_path / "voice.wav"
+    voice.write_bytes(b"reference")
+    backend = xtts.XttsBackend("cpu", str(voice))
+    return backend, model, voice, downloads, config
+
+
+def test_xtts_loads_once_clones_and_caches_latents(xtts_model):
+    backend, model, voice, downloads, config = xtts_model
+    # Choosing the backend accepts the non-commercial CPML: no stdin prompt.
+    assert os.environ["COQUI_TOS_AGREED"] == "1"
+    assert downloads == [xtts.MODEL_ID]
+    config.load_json.assert_called_once_with(os.path.join("C:/xtts", "config.json"))
+    model.load_checkpoint.assert_called_once_with(config, checkpoint_dir="C:/xtts", use_deepspeed=False)
+    model.cuda.assert_not_called()
+    assert backend._debora_device == "CPU"
+    model.get_conditioning_latents.assert_called_once_with(audio_path=[str(voice.resolve())])
+    backend.use(None)
+    backend.prepare_voice()
+    backend.use(str(voice))
+    backend.prepare_voice()
+    assert model.get_conditioning_latents.call_count == 1
+    assert backend.generate("Olá, mundo.", "pt-BR").shape == (1, 2400)
+    args, kwargs = model.inference.call_args
+    assert args == ("Olá, mundo", "pt", f"lat:{voice.resolve()}", "spk")
+    assert kwargs == {"enable_text_splitting": False}
+    with pytest.raises(ValueError, match="no voice of its own"):
+        backend.use("")
+
+
+def test_xtts_http_synthesis_returns_24khz_wav(xtts_model, monkeypatch):
+    backend, model, voice, _, _ = xtts_model
+    monkeypatch.setattr(server, "check_connection", lambda _: None)
+    handler = server.make_handler(backend, "pt", adapter=True)
+    code, body = response(handler)
+    health = json.loads(body)
+    assert code == 200 and health["sample_rate"] == 24000
+    assert health["inventory"]["model"] == xtts.MODEL_ID
+    code, wav, content_type = response(handler, "/tts", {"text": "Olá!", "voice": str(voice)})
+    assert code == 200 and content_type == "audio/wav"
+    with wave.open(io.BytesIO(wav), "rb") as audio:
+        assert audio.getnframes() == 2400 and audio.getframerate() == 24000
+    assert model.inference.call_args.args[:2] == ("Olá", "pt")
+    code, body = response(handler, "/tts", {"text": "Olá", "voice": ""})
+    assert code == 400 and "no voice of its own" in json.loads(body)["error"]
+    code, body = response(handler, "/tts", {"text": "Hej", "language": "sv"})
+    assert code == 500 and "does not speak language" in json.loads(body)["error"]
+
+
+def test_xtts_voice_cache_is_bounded_and_follows_file_changes(xtts_model, tmp_path):
+    backend, model, _, _, _ = xtts_model
+    others = []
+    for i in range(xtts.MAX_CACHED_VOICES):
+        other = tmp_path / f"other{i}.wav"
+        other.write_bytes(b"reference")
+        others.append(other)
+        backend.use(str(other))
+        backend.prepare_voice()
+    assert len(backend.cache) == xtts.MAX_CACHED_VOICES
+    calls = model.get_conditioning_latents.call_count
+    # The startup voice was the least recently used one: evicted, prepared again.
+    backend.use(None)
+    backend.prepare_voice()
+    assert model.get_conditioning_latents.call_count == calls + 1
+    # A recently used voice stays cached...
+    backend.use(str(others[-1]))
+    backend.prepare_voice()
+    assert model.get_conditioning_latents.call_count == calls + 1
+    # ...until its file changes.
+    stat = os.stat(others[-1])
+    os.utime(others[-1], ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+    backend.use(str(others[-1]))
+    backend.prepare_voice()
+    assert model.get_conditioning_latents.call_count == calls + 2
+    assert len(backend.cache) == xtts.MAX_CACHED_VOICES
+
+
+@pytest.mark.parametrize("voice", [None, "", "missing.wav"])
+def test_xtts_missing_voice_fails_at_health_before_model_load(monkeypatch, tmp_path, voice):
+    manager, _ = fake_coqui(monkeypatch, Mock())
+    voice = voice and str(tmp_path / voice)
+    loaded, error = server.load_backend(xtts.XttsBackend, "cpu", voice, "coqui-tts", xtts.MODEL_ID)
+    handler = server.make_handler(loaded, "pt", adapter=True, error=error)
+    code, body = response(handler)
+    assert code == 503
+    assert ("not found" if voice else "reference voice") in json.loads(body)["error"]
+    manager.download_model.assert_not_called()
+
+
+@pytest.mark.parametrize("language,expected", [
+    ("pt", "pt"), ("pt-BR", "pt"), ("PT_br", "pt"), ("en", "en"), ("en-US", "en"),
+    ("zh", "zh-cn"), ("zh-CN", "zh-cn"), ("ja", "ja"),
+])
+def test_xtts_language_codes(language, expected):
+    assert xtts.xtts_language(language) == expected
+
+
+@pytest.mark.parametrize("language", ["auto", "sv", "", "xx-pt"])
+def test_xtts_unsupported_language_is_a_clear_error(language):
+    with pytest.raises(ValueError, match="does not speak language"):
+        xtts.xtts_language(language)
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Olá, mundo.", "Olá, mundo"),
+    ("Que bom!", "Que bom"),
+    ("Veja isto:  ", "Veja isto"),
+    ("Pois é;", "Pois é"),
+    ("E então…", "E então"),
+    ("Fim... ", "Fim"),
+    ("Tudo bem?", "Tudo bem?"),
+    ("Sério?!", "Sério?"),
+    ("Dr. Silva chegou.", "Dr. Silva chegou"),
+    ("Sem pontuação", "Sem pontuação"),
+])
+def test_xtts_drops_only_final_punctuation(text, expected):
+    assert xtts.speakable_text(text) == expected
+
+
+@pytest.mark.parametrize("text", ["", "   ", ".", "!...", " … "])
+def test_xtts_never_sends_empty_text(xtts_model, text):
+    backend, model, _, _, _ = xtts_model
+    with pytest.raises(ValueError, match="nothing to speak"):
+        backend.generate(text, "pt")
+    model.inference.assert_not_called()
+
+
+SR = xtts.SAMPLE_RATE
+
+
+def tone(seconds, amplitude=0.2):
+    t = np.arange(int(SR * seconds)) / SR
+    return (amplitude * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+
+
+def silence(seconds, level=0.0):
+    return np.full(int(SR * seconds), level, dtype=np.float32)
+
+
+def test_trim_cuts_noise_after_a_gap_near_the_end():
+    speech = tone(1.5)
+    # Measured artifacts: a 170-430 ms near-silent gap, then ~0.6 s of noise.
+    audio = np.concatenate([speech, silence(0.17, 0.0005), tone(0.5, 0.3)])
+    trimmed = xtts.trim_trailing_artifact(audio)
+    # Cut at the start of the gap, rounded up to a 10 ms frame boundary.
+    assert len(speech) <= len(trimmed) < len(speech) + SR // 100
+    assert np.array_equal(trimmed[:len(speech)], speech)
+
+
+def test_trim_keeps_the_latest_gap():
+    audio = np.concatenate([tone(1.0), silence(0.2), tone(0.1), silence(0.2), tone(0.3)])
+    assert len(xtts.trim_trailing_artifact(audio)) - int(SR * 1.3) in range(0, SR // 100)
+
+
+@pytest.mark.parametrize("audio", [
+    # Clean ending: trailing silence is not followed by more sound.
+    np.concatenate([tone(1.5), silence(0.3)]),
+    # Stop consonants in the last word ("repita", "certo") went silent for up
+    # to 100 ms; an 80 ms rule cut those words off.
+    np.concatenate([tone(1.0), silence(0.10), tone(0.6)]),
+    np.concatenate([tone(1.5), silence(0.14), tone(0.4)]),
+    # Quiet but audible pauses inside speech stay (measured at ~0.004 RMS).
+    np.concatenate([tone(1.5), tone(0.15, 0.006), tone(0.4)]),
+    # A gap before the last second is speech, not the artifact.
+    np.concatenate([tone(1.0), silence(0.2), tone(1.2)]),
+    np.zeros(0, dtype=np.float32),
+    tone(0.005),
+])
+def test_trim_leaves_clean_endings_untouched(audio):
+    assert np.array_equal(xtts.trim_trailing_artifact(audio), audio)
+
+
+def test_trim_applies_to_generated_audio(xtts_model, monkeypatch):
+    backend, model, _, _, _ = xtts_model
+    logs = []
+    monkeypatch.setattr(server, "log", logs.append)
+    model.inference.return_value = {"wav": np.concatenate([tone(1.0), silence(0.2), tone(0.5)])}
+    assert abs(backend.generate("Olá.", "pt").shape[1] - SR) < SR // 100
+    assert logs == ["Trimmed 0.70s of trailing noise"]
+
+
+def test_xtts_download_progress_reaches_health(monkeypatch):
+    hub = pytest.importorskip("huggingface_hub.utils")
+    from debora_whisper.download_progress import DownloadProgress, track_hf_downloads
+
+    class Manager:
+        def __init__(self, progress_bar):
+            self.progress_bar = progress_bar
+
+    manage = SimpleNamespace(tqdm=None, ModelManager=Manager)
+    monkeypatch.setitem(sys.modules, "TTS", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "TTS.utils", SimpleNamespace(manage=manage))
+    monkeypatch.setitem(sys.modules, "TTS.utils.manage", manage)
+    progress = DownloadProgress()
+    with track_hf_downloads(progress):
+        assert xtts.report_coqui_downloads().progress_bar is True
+        # Coqui's _download_model_files: tqdm(total=..., unit="iB", unit_scale=True).
+        with manage.tqdm(total=1000, unit="iB", unit_scale=True) as bar:
+            assert isinstance(bar, hub.tqdm)
+            bar.update(250)
+            assert progress.snapshot() == {"done": 250, "total": 1000}
+        assert progress.snapshot() is None
+
+
 def test_adapter_http_contract_and_origin_checks(qwen_model, monkeypatch):
     backend, model, _, _ = qwen_model
     monkeypatch.setattr(server, "check_connection", lambda _: None)
@@ -294,7 +527,7 @@ def test_adapter_disconnect_cancels_and_removes_hooks(qwen_model, monkeypatch):
 
 @pytest.mark.parametrize("filename", ["debora_whisper/tts_server.py",
     "debora_whisper/tts_server_qwen3.py", "debora_whisper/tts_server_kokoro.py",
-    "docs/benchmarks/tts-bench/bench_tts.py"])
+    "debora_whisper/tts_server_xtts.py", "docs/benchmarks/tts-bench/bench_tts.py"])
 def test_pep723_pins_and_scoped_indexes(filename):
     tomllib = pytest.importorskip("tomllib")  # stdlib from Python 3.11
     from packaging.requirements import Requirement
@@ -326,7 +559,8 @@ def test_default_transcript_is_exact_and_packaged():
     assert "debora_whisper" in targets["sdist"]["include"]
 
 
-@pytest.mark.parametrize("filename", ["tts_server_qwen3.py", "tts_server_kokoro.py"])
+@pytest.mark.parametrize("filename", ["tts_server_qwen3.py", "tts_server_kokoro.py",
+                                      "tts_server_xtts.py"])
 def test_script_imports_sibling_http_code_without_app_install(monkeypatch, filename):
     monkeypatch.syspath_prepend(str(ROOT / "debora_whisper"))
     namespace = runpy.run_path(str(ROOT / "debora_whisper" / filename), run_name="isolated_backend")
