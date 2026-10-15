@@ -684,6 +684,33 @@ def _shutdown_socket(sock):
         pass
 
 
+# Filled by the existing startup health checks, never by telemetry itself.
+_tts_health_cache = {}
+_tts_health_cache_lock = threading.Lock()
+
+
+def _cache_tts_health(config, health=None):
+    with _tts_health_cache_lock:
+        url = config.get("tts_url", "").rstrip("/")
+        if health is None:
+            _tts_health_cache.pop(url, None)
+        else:
+            _tts_health_cache[url] = (time.monotonic(), health)
+
+
+def _tts_loading_health(config):
+    with _tts_health_cache_lock:
+        cached = _tts_health_cache.get(config.get("tts_url", "").rstrip("/"))
+        if cached and time.monotonic() - cached[0] <= 5 + TTS_HEALTH_SECONDS:
+            return cached[1]
+    return {}
+
+
+def tts_download_progress(config):
+    """Local snapshot only: no I/O or startup/process lock on telemetry's thread."""
+    return _tts_loading_health(config).get("download")
+
+
 def tts_server_up(config: dict) -> bool:
     """True if /health answers 200; TTSStartupError if the server reports
     a terminal startup error (503 with {"ok": false, "error": ...})."""
@@ -703,19 +730,24 @@ def tts_server_up(config: dict) -> bool:
         connection.request("GET", urllib.parse.urlunsplit(("", "", target.path, target.query, "")))
         with connection.getresponse() as response:
             if response.status != 503:
+                _cache_tts_health(config)
                 return response.status == 200
             raw = response.read(TTS_HEALTH_MAX_BYTES + 1)
         health = json.loads(raw) if len(raw) <= TTS_HEALTH_MAX_BYTES else None
     except Exception:
+        _cache_tts_health(config)
         return False
     finally:
         if timer is not None:
             timer.cancel()
         if connection is not None:
             connection.close()
+    _cache_tts_health(config)
     if (isinstance(health, dict) and health.get("ok") is False
             and isinstance(health.get("error"), str) and health["error"]):
         raise TTSStartupError(health["error"])
+    if isinstance(health, dict) and health.get("state") == "loading" and health.get("ok") is False:
+        _cache_tts_health(config, health)
     return False
 
 
@@ -747,7 +779,8 @@ def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=Fa
             deadline = time.monotonic() + 5.0
             while True:
                 try:
-                    if not tts_server_up({"tts_url": _tts_retiring_url}):
+                    if (not tts_server_up({"tts_url": _tts_retiring_url})
+                            and not _tts_loading_health({"tts_url": _tts_retiring_url})):
                         _tts_retiring_url = None
                         break
                 except TTSStartupError:
@@ -766,7 +799,7 @@ def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=Fa
                     f"see {log_path or 'its output'}. Restart the app after fixing it.")
             return
         try:
-            if tts_server_up(config):
+            if tts_server_up(config) or _tts_loading_health(config):
                 if _tts_server_key is not None and _tts_server_key != key:
                     log(f"Voice chat: configured TTS backend/command changed to {key[0]}; "
                         "keeping the external server. Restart it manually to apply the change.")
@@ -800,14 +833,17 @@ def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=Fa
 
 
 def wait_tts_server(config: dict, timeout=TTS_STARTUP_SECONDS) -> bool:
-    """True once the TTS server answers; waits only while a server this
-    process started is still loading. Raise TTSStartupError on terminal failure."""
+    """Wait for managed startup or an explicit loading response from /health.
+    Raise TTSStartupError on terminal failure."""
     deadline = time.time() + timeout
     while True:
         if tts_server_up(config):
             return True
         process = _tts_process
-        if process is None or process.poll() is not None or time.time() > deadline:
+        if ((process is None and not _tts_loading_health(config))
+                or (process is not None and process.poll() is not None)
+                or time.time() > deadline):
+            _cache_tts_health(config)
             return False
         time.sleep(0.5)
 
@@ -817,6 +853,8 @@ def stop_tts_server():
     global _tts_process, _tts_server_key
     with _tts_lock:
         _tts_stopping.set()
+        with _tts_health_cache_lock:
+            _tts_health_cache.clear()
         process, _tts_process = _tts_process, None
         _tts_server_key = None
     if process is None:

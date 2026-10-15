@@ -505,6 +505,7 @@ Changing the model, device, hotkey, chime, sample rate or maximum recording leng
 |------|---------|
 | `~/.debora/config.json` | User configuration |
 | `~/.debora/logs/` | `app.log`, `telemetry.log`, `tts_server.log`, `llm_server.log`; the first three with `[YYYY-MM-DD HH:MM:SS] message` lines; at startup a log over 5 MB moves to `<name>.1` |
+| Download telemetry | Every 5 s, active model downloads add `DL STT 42% (310/740 MB)` and/or `DL TTS 17%` to the resource line; progress covers files discovered so far and disappears when idle. |
 | `~/.debora/npu_lost.json` | An NPU lost to DEVICE_LOST: startup uses the next device and probes the NPU in the background (cleared when a probe passes or Windows restarts) |
 | `~/.debora/models/` | Downloaded model files |
 | `~/.debora/ov-cache/` | OpenVINO compilation cache (do not delete) |
