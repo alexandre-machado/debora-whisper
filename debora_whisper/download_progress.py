@@ -48,6 +48,7 @@ def format_download(label, progress):
 
 
 STT_DOWNLOAD = DownloadProgress()
+_HF_DOWNLOAD_LOCK = threading.Lock()
 
 
 @contextmanager
@@ -57,7 +58,17 @@ def track_hf_downloads(tracker, callback=None):
     Patch methods on HF's shared tqdm class so aliases already imported by
     download helpers are covered too. File-count and model-loading bars are
     ignored. Counters remain valid when tqdm display is disabled.
+
+    Serialize contexts for their entire lifetime: these hooks are process-wide,
+    and another download must not capture or restore an active context's hooks.
     """
+    with _HF_DOWNLOAD_LOCK:
+        with _observe_hf_downloads(tracker, callback):
+            yield
+
+
+@contextmanager
+def _observe_hf_downloads(tracker, callback):
     from huggingface_hub.utils import tqdm
     from huggingface_hub import file_download
 
@@ -75,6 +86,8 @@ def track_hf_downloads(tracker, callback=None):
             if entry is None or current_bars.get(entry[0]) != id(bar):
                 return
             entry[1] += amount
+            # Snapshot aggregate bars start at zero and grow as files are found.
+            entry[2] = bar.total
             progress = tracker.update(*entry, closed=closed)
             if callback and not closed:
                 callback(progress["done"], progress["total"])
@@ -82,7 +95,10 @@ def track_hf_downloads(tracker, callback=None):
     def init(bar, *args, **kwargs):
         original_init(bar, *args, **kwargs)
         total = kwargs.get("total")
-        if kwargs.get("unit") == "B" and total and total > 0:
+        # Hub 2.x reports transfer and reconstruction for the same files. Count
+        # reconstruction once (including resumed bytes), not both stages.
+        if (kwargs.get("unit") == "B" and total is not None and total >= 0
+                and kwargs.get("name") != "huggingface_hub.snapshot_download.transfer"):
             with lock:
                 # Retain the bar to prevent object-id reuse between files.
                 key = getattr(transfer, "key", None) or ("bar", id(bar))

@@ -35,6 +35,109 @@ def test_aggregate_concurrent_files_and_resume_even_with_disabled_bars():
     assert tracker.snapshot() is None
 
 
+@pytest.mark.parametrize("disable", [True, False])
+def test_hub_snapshot_aggregate_bars_with_growing_totals(disable):
+    from huggingface_hub.utils import tqdm
+
+    tracker, callback = DownloadProgress(), Mock()
+    with track_hf_downloads(tracker, callback):
+        # Hub 2.2.0 snapshot_download creates these two zero-total byte bars.
+        # Its per-file _AggregatedTqdm adjusts both totals, refreshes the parent,
+        # and forwards initial/resumed bytes and updates to reconstruction.
+        with (tqdm(total=0, unit="B", disable=disable, file=io.StringIO(),
+                   name="huggingface_hub.snapshot_download.transfer") as transfer,
+              tqdm(total=0, unit="B", disable=disable, file=io.StringIO(),
+                   name="huggingface_hub.snapshot_download") as reconstruction,
+              tqdm(total=2, disable=True) as files):
+            assert tracker.snapshot() is None
+
+            def discover_file(total, initial=0):
+                reconstruction.total = (reconstruction.total or 0) + total
+                transfer.total = (transfer.total or 0) + total
+                reconstruction.refresh()
+                if initial:
+                    reconstruction.update(initial)
+
+            discover_file(100_000_000, initial=20_000_000)
+            reconstruction.update(22_000_000)
+            transfer.update(22_000_000)
+            files.update(1)
+            assert tracker.snapshot() == {"done": 42_000_000, "total": 100_000_000}
+            assert callback.call_args.args == (42_000_000, 100_000_000)
+            assert format_download("STT", tracker.snapshot()) == " DL STT 42% (42/100 MB)"
+
+            discover_file(50_000_000)
+            reconstruction.update(8_000_000)
+            assert tracker.snapshot() == {"done": 50_000_000, "total": 150_000_000}
+            assert callback.call_args.args == (50_000_000, 150_000_000)
+            reconstruction.update(100_000_000)
+            assert callback.call_args.args == (150_000_000, 150_000_000)
+            assert tracker.snapshot() is None
+    assert tracker.snapshot() is None
+
+
+@pytest.mark.parametrize("shared_tracker", [True, False])
+def test_overlapping_tracking_contexts_wait_and_restore_hooks(shared_tracker):
+    from huggingface_hub import file_download as hf
+    from huggingface_hub.utils import tqdm
+
+    def hooks():
+        return tqdm.__init__, tqdm.update, tqdm.close, hf.http_get
+
+    original = hooks()
+    first = DownloadProgress()
+    second = first if shared_tracker else DownloadProgress()
+    first_callback, second_callback = Mock(), Mock()
+    attempted, entered, release = threading.Event(), threading.Event(), threading.Event()
+
+    def second_download():
+        attempted.set()
+        with track_hf_downloads(second, second_callback):
+            with tqdm(total=200, unit="B", disable=True) as bar:
+                bar.update(50)
+                entered.set()
+                assert release.wait(5)
+                bar.update(25)
+                assert second.snapshot() == {"done": 75, "total": 200}
+                assert second_callback.call_args.args == (75, 200)
+
+    # The first context exits while the second request is still outstanding.
+    # Even exceptional exits must restore hooks before the waiter installs its own.
+    with ThreadPoolExecutor(1) as pool:
+        future = None
+        try:
+            with pytest.raises(RuntimeError, match="first download interrupted"):
+                with track_hf_downloads(first, first_callback):
+                    with tqdm(total=100, unit="B", disable=True) as bar:
+                        bar.update(17)
+                        first_hooks = hooks()
+                        future = pool.submit(second_download)
+                        assert attempted.wait(5)
+                        assert not entered.wait(0.2)
+                        assert hooks() == first_hooks
+                        assert first.snapshot() == {"done": 17, "total": 100}
+                        second_callback.assert_not_called()
+                        raise RuntimeError("first download interrupted")
+            first_callback.reset_mock()
+            assert entered.wait(5)
+            assert second.snapshot() == {"done": 50, "total": 200}
+            assert second_callback.call_args.args == (50, 200)
+        finally:
+            release.set()
+            if future is not None:
+                future.result(timeout=5)
+
+    assert hooks() == original
+    assert first.snapshot() is None
+    assert second.snapshot() is None
+    first_callback.assert_not_called()
+    second_callback.reset_mock()
+    with tqdm(total=100, unit="B", disable=True) as bar:
+        bar.update(10)
+    first_callback.assert_not_called()
+    second_callback.assert_not_called()
+
+
 def test_progress_cleared_and_hf_hooks_restored_after_failure():
     from huggingface_hub import file_download as hf
     from huggingface_hub.utils import tqdm
@@ -117,7 +220,9 @@ def test_stt_setup_preserves_callback_and_clears_progress(monkeypatch, tmp_path)
     callback = Mock()
 
     def download(*args, **kwargs):
-        with tqdm(total=100_000_000, unit="B", disable=True) as bar:
+        with tqdm(total=0, unit="B", disable=True) as bar:
+            bar.total += 100_000_000
+            bar.refresh()
             bar.update(42_000_000)
             assert format_download("STT", de.STT_DOWNLOAD.snapshot()) == " DL STT 42% (42/100 MB)"
             bar.update(58_000_000)
