@@ -9,6 +9,7 @@ Usage:
 
 import sys
 import argparse
+import threading
 import customtkinter as ctk
 
 from debora_whisper.dictation_engine import (
@@ -120,10 +121,6 @@ class GUIApp:
 
     def _new_engine(self) -> DictationApp:
         engine = DictationApp(self._config)
-        previous = getattr(self, "_engine", None)
-        if previous is not None:
-            engine.restore_history(previous)
-            engine.warm_voice_chat = previous.warm_voice_chat
         engine.add_callback(self._on_state_change)
         engine.on_voice_chat_toggle = self._toggle_voice_chat
         return engine
@@ -412,8 +409,7 @@ class GUIApp:
 
     # Settings that only take effect in a newly built engine.
     _REBUILD_KEYS = ("model_size", "device", "hotkey", "voice_chat_hotkey",
-                     "beep_on_start", "sample_rate", "max_record_seconds",
-                     "tts_backend", "tts_voice")
+                     "beep_on_start", "sample_rate", "max_record_seconds")
 
     def _on_settings_apply(self, new_config: dict):
         try:
@@ -467,6 +463,22 @@ class GUIApp:
         if voice_chat_changed and not (rebuild and not failure):
             # A rebuilt engine starts voice chat itself; this one switches now.
             self._engine.set_voice_chat(bool(voice_chat))
+
+        if tts_changed and not rebuild:
+            from debora_whisper.dictation_engine import TTS_SERVER_LOG
+            from debora_whisper.voice_chat import ensure_tts_server
+
+            engine = self._engine
+            engine.voice_chat.interrupt()
+
+            def reconfigure_tts():
+                ensure_tts_server(
+                    self._config, log, TTS_SERVER_LOG,
+                    managed_only=not (self._config.get("voice_chat") or engine.warm_voice_chat),
+                )
+                engine.voice_chat.warm_tts()
+
+            threading.Thread(target=reconfigure_tts, daemon=True).start()
 
         # Update balloon settings immediately (no engine restart needed)
         self._overlay.set_voice_mode(bool(self._config.get("voice_chat")))

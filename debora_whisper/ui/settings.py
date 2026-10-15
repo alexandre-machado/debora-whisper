@@ -570,6 +570,12 @@ class SettingsWindow:
         from debora_whisper.dictation_engine import validate_config
         try:
             validate_config(new_config)
+            if (new_config.get("tts_backend") == "qwen3"
+                    and new_config.get("tts_voice") is None
+                    and not new_config.get("tts_server_command")):
+                raise ValueError("Qwen3 requires a reference voice (tts_voice); "
+                                 "select a WAV voice with a matching UTF-8 .txt transcript "
+                                 "instead of Chatterbox default.")
         except ValueError as e:
             self.update_status(str(e), "#FF453A")
             return

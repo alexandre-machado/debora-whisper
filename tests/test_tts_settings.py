@@ -73,6 +73,7 @@ def test_disabled_wide_dropdown_does_not_open():
 def managed_tts(monkeypatch):
     monkeypatch.setattr(vc, "_tts_process", None)
     monkeypatch.setattr(vc, "_tts_server_key", None)
+    monkeypatch.setattr(vc, "_tts_retiring_url", None)
     monkeypatch.setattr(vc, "_tts_stopping", threading.Event())
     monkeypatch.setattr(vc.shutil, "which", lambda name: "uv.exe")
     monkeypatch.setattr(vc, "tts_server_up", MagicMock(return_value=False))
@@ -133,6 +134,94 @@ def test_kokoro_ignores_voice_change(managed_tts):
     kill.assert_not_called()
 
 
+@pytest.mark.parametrize("backend", ["chatterbox", "qwen3", "kokoro"])
+def test_language_change_does_not_restart_managed_server(managed_tts, backend):
+    popen, kill, _ = managed_tts
+    config = {**de.DEFAULT_CONFIG, "tts_backend": backend, "language": "pt"}
+    vc.ensure_tts_server(config)
+    vc.ensure_tts_server({**config, "language": "en"})
+    popen.assert_called_once()
+    kill.assert_not_called()
+
+
+def test_chatterbox_voice_and_file_changes_do_not_restart_server(managed_tts, tmp_path):
+    popen, kill, _ = managed_tts
+    voice = tmp_path / "voice.wav"
+    config = {**de.DEFAULT_CONFIG, "tts_backend": "chatterbox", "tts_voice": None}
+    vc.ensure_tts_server(config)
+    config["tts_voice"] = str(voice)
+    vc.ensure_tts_server(config)
+    voice.touch()
+    assert "--voice" in vc.tts_command(config)
+    vc.ensure_tts_server(config)
+    voice.unlink()
+    assert "--voice" not in vc.tts_command(config)
+    vc.ensure_tts_server(config)
+    popen.assert_called_once()
+    kill.assert_not_called()
+
+
+@pytest.mark.parametrize("change", [
+    {"tts_server_command": ["custom-server", "--port", "9999"]},
+    {"tts_url": "http://127.0.0.1:9999"},
+])
+def test_process_settings_restart_managed_server(managed_tts, change):
+    popen, kill, processes = managed_tts
+    vc.ensure_tts_server(de.DEFAULT_CONFIG)
+    vc.ensure_tts_server({**de.DEFAULT_CONFIG, **change})
+    kill.assert_called_once_with(processes[0])
+    assert popen.call_count == 2
+
+
+@pytest.mark.parametrize("health", [True, vc.TTSStartupError("still stopping")])
+def test_restart_waits_for_child_to_stop_answering(managed_tts, monkeypatch, health):
+    popen, kill, processes = managed_tts
+    vc.ensure_tts_server(de.DEFAULT_CONFIG)
+    monkeypatch.setattr(vc.time, "sleep", MagicMock())
+    vc.tts_server_up.side_effect = [health, health, False, False]
+    vc.ensure_tts_server({**de.DEFAULT_CONFIG, "tts_backend": "kokoro"})
+    assert vc._tts_process is processes[1]
+    assert vc._tts_retiring_url is None
+    assert popen.call_count == 2
+    assert vc.time.sleep.call_count == 2
+
+
+def test_retiring_child_is_not_adopted_after_shutdown_timeout(managed_tts, monkeypatch):
+    popen, kill, processes = managed_tts
+    vc.ensure_tts_server(de.DEFAULT_CONFIG)
+    vc.tts_server_up.return_value = True
+    monkeypatch.setattr(vc.time, "monotonic", MagicMock(side_effect=[0, 6]))
+    config = {**de.DEFAULT_CONFIG, "tts_backend": "kokoro"}
+    vc.ensure_tts_server(config)
+    assert vc._tts_process is None and vc._tts_server_key is None
+    assert vc._tts_retiring_url == de.DEFAULT_CONFIG["tts_url"]
+    assert popen.call_count == 1
+    vc.time.monotonic.side_effect = [7]
+    vc.tts_server_up.return_value = False
+    vc.ensure_tts_server(config, managed_only=True)
+    assert vc._tts_process is processes[1]
+    assert vc._tts_retiring_url is None
+    kill.assert_called_once_with(processes[0])
+
+
+@pytest.mark.parametrize("command", [None, ["custom-server", "--voice", "own.wav"]])
+def test_qwen_null_voice_is_valid_at_startup(command):
+    de.validate_config({**de.DEFAULT_CONFIG, "tts_backend": "qwen3",
+                        "tts_voice": None, "tts_server_command": command})
+
+
+def test_qwen_custom_command_can_supply_its_own_voice_in_settings():
+    config = {**de.DEFAULT_CONFIG, "tts_backend": "qwen3", "tts_voice": None,
+              "tts_server_command": ["custom-server", "--voice", "own.wav"]}
+    window = SettingsWindow.__new__(SettingsWindow)
+    window._get_new_config = lambda: config
+    window._on_apply = MagicMock()
+    window.update_status = MagicMock()
+    window._apply()
+    window._on_apply.assert_called_once_with(config)
+    window.update_status.assert_not_called()
+
+
 def test_external_server_is_kept_and_backend_change_logged(managed_tts):
     popen, kill, _ = managed_tts
     vc.tts_server_up.return_value = True
@@ -174,24 +263,6 @@ def test_engine_loader_restarts_tts_off_the_calling_thread(managed_tts, monkeypa
     engine.voice_chat.warm_tts.assert_called_once()
 
 
-def test_restore_history_carries_dictation_and_conversation():
-    previous = de.DictationApp.__new__(de.DictationApp)
-    previous._history = [{"text": "ditado antigo"}]
-    previous.voice_chat = MagicMock(_history=[{"role": "user", "content": "oi"}], _last_turn=123.0)
-    engine = de.DictationApp.__new__(de.DictationApp)
-    engine.config = {**de.DEFAULT_CONFIG, "voice_chat": True}
-    engine._history = []
-    engine.voice_chat = MagicMock(_history=[], _last_turn=0.0)
-    engine.restore_history(previous)
-    assert engine.history == [{"text": "ditado antigo"}]
-    assert engine.voice_chat._history == [{"role": "user", "content": "oi"}]
-    assert engine.voice_chat._last_turn == 123.0
-    # Copies, so the stopped engine cannot change the new one.
-    previous._history.append({"text": "x"})
-    previous.voice_chat._history.append({"role": "user", "content": "y"})
-    assert len(engine.history) == 1 and len(engine.voice_chat._history) == 1
-
-
 @pytest.fixture
 def engine_startup():
     return de.DictationApp.start_background, de.DictationApp._warm_up_voice_chat
@@ -207,6 +278,7 @@ def settings_gui(monkeypatch, engine_startup):
     monkeypatch.setattr(de.DictationApp, "start_background", MagicMock())
     monkeypatch.setattr(de.DictationApp, "_warm_up_voice_chat", MagicMock())
     monkeypatch.setattr(vc.VoiceChat, "interrupt", MagicMock())
+    monkeypatch.setattr(vc.VoiceChat, "warm_tts", MagicMock())
     monkeypatch.setattr("keyboard.unhook_all", MagicMock())
     monkeypatch.setitem(GUIApp._on_settings_apply.__globals__, "save_config", MagicMock())
     gui = GUIApp.__new__(GUIApp)
@@ -221,7 +293,7 @@ def settings_gui(monkeypatch, engine_startup):
     assert not gui._engine._resource_thread.is_alive()
 
 
-def test_repeated_tts_changes_dispose_models_before_replacement(settings_gui, monkeypatch):
+def test_repeated_audio_changes_dispose_models_before_replacement(settings_gui, monkeypatch):
     """Exercise Apply with the real telemetry thread and idle shutdown path."""
     gui = settings_gui
     models, retired = [], []
@@ -240,8 +312,8 @@ def test_repeated_tts_changes_dispose_models_before_replacement(settings_gui, mo
     monkeypatch.setattr(de.DictationApp, "start_background", load)
     load(gui._engine)
     try:
-        for change in ({"tts_voice": "isabel"}, {"tts_backend": "kokoro"},
-                       {"tts_voice": "debora"}, {"tts_backend": "chatterbox"}):
+        for change in ({"sample_rate": 48000}, {"max_record_seconds": 30},
+                       {"sample_rate": 16000}, {"max_record_seconds": 60}):
             previous = gui._engine
             retired.append(previous)  # Keep engines alive like pending callbacks.
             assert previous._resource_thread.is_alive()
@@ -327,8 +399,9 @@ def test_apply_reconciles_managed_tts_in_dictation(
         for worker in workers:
             worker.join(5)
     assert all(not worker.is_alive() for worker in workers)
-    assert gui._engine is not previous
-    assert gui._engine.warm_voice_chat is warm_voice_chat
+    assert (gui._engine is not previous) is download
+    if not download:
+        assert gui._engine.warm_voice_chat is warm_voice_chat
     assert gui._config["voice_chat"] is False
     kill.assert_called_once_with(processes[0])
     assert len(stop_threads) == 1 and stop_threads[0] != threading.get_ident()
@@ -350,8 +423,67 @@ def test_managed_only_reconciliation_does_not_start_or_probe_unmanaged_tts(manag
     kill.assert_not_called()
 
 
-@pytest.mark.parametrize("interrupted", [False, True])
-def test_apply_waits_for_reply_finalization_before_rebuilding(settings_gui, monkeypatch, interrupted):
+@pytest.fixture
+def tts_updates(monkeypatch):
+    """Run real daemon workers, but never contact a server."""
+    monkeypatch.setattr(vc, "ensure_tts_server", MagicMock())
+    workers = []
+    thread_class = threading.Thread
+
+    def thread_factory(*args, **kwargs):
+        worker = thread_class(*args, **kwargs)
+        if getattr(kwargs.get("target"), "__name__", "") == "reconfigure_tts":
+            workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(threading, "Thread", thread_factory)
+    yield workers
+    for worker in workers:
+        worker.join(5)
+        assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("change", [{"tts_backend": "kokoro"}, {"tts_voice": "isabel"}])
+@pytest.mark.parametrize("busy", ["recording", "reply", "device_failure"])
+def test_tts_apply_keeps_engine_and_live_state(settings_gui, tts_updates, monkeypatch, change, busy):
+    gui = settings_gui
+    previous = gui._engine
+    model = previous.whisper = object()
+    previous.warm_voice_chat = True
+    previous._history = [{"text": "ditado antigo"}]
+    previous.voice_chat._history = [{"role": "user", "content": "oi"}]
+    if busy == "recording":
+        previous.is_recording = previous._continuous = True
+    elif busy == "reply":
+        previous._voice_worker = object()
+    else:
+        monkeypatch.setitem(gui._on_settings_apply.__globals__, "device_failure", lambda: {"device": "NPU"})
+    stop = MagicMock(side_effect=AssertionError("TTS must not stop the engine"))
+    monkeypatch.setattr(previous, "stop_if_idle", stop)
+    calls = []
+    vc.ensure_tts_server.side_effect = lambda *args, **kwargs: calls.append(("ensure", threading.get_ident()))
+    previous.voice_chat.warm_tts.side_effect = lambda: calls.append(("warm", threading.get_ident()))
+    gui._on_settings_apply({**gui._config, **change, "show_balloon": False})
+    worker = tts_updates[0]
+    worker.join(5)
+    assert not worker.is_alive() and worker.daemon
+    assert [name for name, _ in calls] == ["ensure", "warm"]
+    assert all(ident != threading.get_ident() for _, ident in calls)
+    vc.ensure_tts_server.assert_called_once_with(gui._config, de.log, de.TTS_SERVER_LOG, managed_only=False)
+    previous.voice_chat.interrupt.assert_called_once()
+    previous.start_background.assert_not_called()
+    assert gui._engine is previous and previous.whisper is model
+    assert previous.config is gui._config
+    assert previous.warm_voice_chat is True
+    assert not previous._stopping.is_set()
+    assert gui._config["show_balloon"] is False
+    assert all(gui._config[key] == value for key, value in change.items())
+    assert previous.history == [{"text": "ditado antigo"}]
+    assert previous.voice_chat._history == [{"role": "user", "content": "oi"}]
+    assert gui._settings_status.call_args.args[0] == "Settings saved."
+
+
+def test_tts_apply_during_reply_keeps_finalized_history(settings_gui, tts_updates, monkeypatch):
     gui = settings_gui
     previous = gui._engine
     spoken, finalize = threading.Event(), threading.Event()
@@ -370,36 +502,38 @@ def test_apply_waits_for_reply_finalization_before_rebuilding(settings_gui, monk
     monkeypatch.setattr(previous.voice_chat, "respond", respond)
     previous._voice_chat_turn("oi", [], True)
     worker = previous._voice_worker
-    changed = {**gui._config, "tts_backend": "kokoro"}
-    original = dict(gui._config)
     try:
         assert spoken.wait(5)
-        if interrupted:
-            previous._interrupt_voice_reply()
-        assert previous.busy_reason() == "voice reply"
-        gui._on_settings_apply(changed)
+        gui._on_settings_apply({**gui._config, "tts_backend": "kokoro"})
+        tts_updates[-1].join(5)
         assert gui._engine is previous
-        assert gui._config == original
+        assert gui._config["tts_backend"] == "kokoro"
         assert not previous._stopping.is_set()
-        assert "voice reply in progress" in gui._settings_status.call_args.args[0]
+        previous.voice_chat.interrupt.assert_called_once()
         previous.start_background.assert_not_called()
     finally:
         finalize.set()
         worker.join(5)
     assert not worker.is_alive()
 
-    gui._on_settings_apply(changed)
-    assert gui._engine is not previous
-    assert previous._stopping.is_set()
-    assert gui._config["tts_backend"] == "kokoro"
-    gui._engine.start_background.assert_called_once()
     assert gui._engine.history[-1]["text"] == "oi\n→ Tudo bem!"
     assert answer in gui._engine.voice_chat._messages("e você?")
-    assert gui._engine.voice_chat._last_turn == previous.voice_chat._last_turn
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_live_tts_in_dictation_uses_warm_policy(settings_gui, tts_updates, warm):
+    gui = settings_gui
+    gui._config["voice_chat"] = False
+    gui._engine.warm_voice_chat = warm
+    gui._on_settings_apply({**gui._config, "tts_backend": "kokoro"})
+    tts_updates[0].join(5)
+    vc.ensure_tts_server.assert_called_once_with(
+        gui._config, de.log, de.TTS_SERVER_LOG, managed_only=not warm)
+    gui._engine.voice_chat.warm_tts.assert_called_once()
 
 
 @pytest.mark.parametrize("rebuild", [False, True])
-def test_disabling_local_chat_forgets_conversation_with_tts_change(settings_gui, rebuild):
+def test_disabling_local_chat_forgets_conversation_with_tts_change(settings_gui, tts_updates, rebuild):
     gui = settings_gui
     previous = gui._engine
     previous._history = [{"text": "ditado antigo"}]
@@ -408,12 +542,14 @@ def test_disabling_local_chat_forgets_conversation_with_tts_change(settings_gui,
         {"role": "assistant", "content": "Tudo bem!"},
     ]
     previous.voice_chat._last_turn = time.time()
-    changed = {**gui._config, "voice_chat": False}
+    changed = {**gui._config, "voice_chat": False, "tts_backend": "kokoro"}
     if rebuild:
-        changed["tts_backend"] = "kokoro"
+        changed["sample_rate"] = 48000
     gui._on_settings_apply(changed)
     assert (gui._engine is not previous) is rebuild
-    assert gui._engine.history == [{"text": "ditado antigo"}]
+    if not rebuild:
+        tts_updates[0].join(5)
+        assert gui._engine.history == [{"text": "ditado antigo"}]
     assert gui._engine.voice_chat._history == []
 
     # Re-enabling immediately must not resume the conversation before timeout.

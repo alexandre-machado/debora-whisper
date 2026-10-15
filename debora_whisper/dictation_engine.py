@@ -430,10 +430,6 @@ def validate_config(config: dict):
     voice = config.get("tts_voice")
     if voice is not None and (not isinstance(voice, str) or not voice.strip()):
         raise ValueError(f"tts_voice must be null or a file path or name, got {voice!r}")
-    if config.get("tts_backend") == "qwen3" and voice is None:
-        raise ValueError("Qwen3 requires a reference voice (tts_voice); "
-                         "select a WAV voice with a matching UTF-8 .txt transcript "
-                         "instead of Chatterbox default.")
     url = config.get("tts_url", DEFAULT_CONFIG["tts_url"])
     if not is_http_url(url):
         raise ValueError(f"tts_url must be an http(s) URL, got {url!r}")
@@ -2694,18 +2690,6 @@ class DictationApp:
     def history(self) -> list[dict]:
         return list(self._history)
 
-    def restore_history(self, previous: "DictationApp"):
-        """Carry session history from a stopped engine into its replacement."""
-        self._history = previous.history
-        # Disabling local voice chat resets the conversation, including when
-        # the same Apply replaces the engine instead of calling set_voice_chat.
-        if (not self.config.get("voice_chat")
-                and self.config.get("voice_chat_backend", "local") == "local"):
-            return
-        self.voice_chat._history = list(previous.voice_chat._history)
-        # The next turn uses this timestamp to expire idle conversations.
-        self.voice_chat._last_turn = previous.voice_chat._last_turn
-
     # -- Model management -----------------------------------------------
 
     def ensure_model(self):
@@ -3835,8 +3819,8 @@ class DictationApp:
         threading.Thread(target=_continuous_consumer, daemon=True).start()
 
     def busy_reason(self) -> str | None:
-        """What recording, model or reply work is in flight, or None if idle."""
-        with self._audio_lifecycle_lock, self._voice_lock:
+        """What recording or model work is in flight, or None if idle."""
+        with self._audio_lifecycle_lock:
             return self._busy_reason_locked()
 
     def _busy_reason_locked(self) -> str | None:
@@ -3846,25 +3830,21 @@ class DictationApp:
             return "transcription"
         if self._loading:
             return "model loading"
-        if self._voice_worker is not None:
-            return "voice reply"
         return None
 
     def stop_if_idle(self) -> str | None:
-        """Stop only if no recording, transcription, model load or voice reply
+        """Stop only if no recording, transcription or model load
         is in flight. Returns the busy reason (engine left running) or None
         (engine stopped).
 
         The idle check and the stop flag are set under the locks every
-        start path (recording, loader or reply worker) takes, so no
+        start path (recording or loader) takes, so no
         new work can begin between the check and the stop. Used before a
         Settings rebuild so a new pipeline is never compiled while the old
         one may still be running on the same device. Never blocks on
         in-flight inference, which may be hung in a driver.
-        Reply workers must finish updating history before it can be copied
-        into the replacement, even after playback has been interrupted.
         """
-        with self._audio_lifecycle_lock, self._voice_lock:
+        with self._audio_lifecycle_lock:
             reason = self._busy_reason_locked()
             if reason is not None:
                 return reason

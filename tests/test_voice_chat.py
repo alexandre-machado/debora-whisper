@@ -1084,7 +1084,8 @@ def test_live_failed_tts_does_not_wait_again_on_repeated_turns(server, monkeypat
                          tts_server_command=["never-run"])
     # A managed process retains the settings it was started with.
     monkeypatch.setattr(vc, "_tts_server_key",
-                        (chat.config["tts_backend"], tuple(chat.config["tts_server_command"])))
+                        (chat.config["tts_backend"], tuple(chat.config["tts_server_command"]),
+                         urllib.parse.urlparse(chat.config["tts_url"]).port, None))
     chat.log = logs.append
     with patch.object(vc, "kill_tree") as kill_tree, \
             patch.object(vc.time, "sleep", side_effect=AssertionError("must not poll startup")):
