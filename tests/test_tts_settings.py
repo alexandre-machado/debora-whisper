@@ -76,7 +76,7 @@ def managed_tts(monkeypatch):
     monkeypatch.setattr(vc, "_tts_retiring_url", None)
     monkeypatch.setattr(vc, "_tts_stopping", threading.Event())
     monkeypatch.setattr(vc.shutil, "which", lambda name: "uv.exe")
-    monkeypatch.setattr(vc, "tts_server_up", MagicMock(return_value=False))
+    monkeypatch.setattr(vc, "_check_tts_health", MagicMock(return_value="unavailable"))
     monkeypatch.setattr(vc.atexit, "register", MagicMock())
     kill = MagicMock()
     monkeypatch.setattr(vc, "kill_tree", kill)
@@ -180,12 +180,12 @@ def test_process_settings_restart_managed_server(managed_tts, change):
     assert popen.call_count == 2
 
 
-@pytest.mark.parametrize("health", [True, vc.TTSStartupError("still stopping")])
+@pytest.mark.parametrize("health", ["ready", "loading", vc.TTSStartupError("still stopping")])
 def test_restart_waits_for_child_to_stop_answering(managed_tts, monkeypatch, health):
     popen, kill, processes = managed_tts
     vc.ensure_tts_server(de.DEFAULT_CONFIG)
     monkeypatch.setattr(vc.time, "sleep", MagicMock())
-    vc.tts_server_up.side_effect = [health, health, False, False]
+    vc._check_tts_health.side_effect = [health, health, "unavailable", "unavailable"]
     vc.ensure_tts_server({**de.DEFAULT_CONFIG, "tts_backend": "kokoro"})
     assert vc._tts_process is processes[1]
     assert vc._tts_retiring_url is None
@@ -196,7 +196,7 @@ def test_restart_waits_for_child_to_stop_answering(managed_tts, monkeypatch, hea
 def test_retiring_child_is_not_adopted_after_shutdown_timeout(managed_tts, monkeypatch):
     popen, kill, processes = managed_tts
     vc.ensure_tts_server(de.DEFAULT_CONFIG)
-    vc.tts_server_up.return_value = True
+    vc._check_tts_health.return_value = "ready"
     monkeypatch.setattr(vc.time, "monotonic", MagicMock(side_effect=[0, 6]))
     config = {**de.DEFAULT_CONFIG, "tts_backend": "kokoro"}
     vc.ensure_tts_server(config)
@@ -204,7 +204,7 @@ def test_retiring_child_is_not_adopted_after_shutdown_timeout(managed_tts, monke
     assert vc._tts_retiring_url == de.DEFAULT_CONFIG["tts_url"]
     assert popen.call_count == 1
     vc.time.monotonic.side_effect = [7]
-    vc.tts_server_up.return_value = False
+    vc._check_tts_health.return_value = "unavailable"
     vc.ensure_tts_server(config, managed_only=True)
     assert vc._tts_process is processes[1]
     assert vc._tts_retiring_url is None
@@ -231,7 +231,7 @@ def test_qwen_custom_command_can_supply_its_own_voice_in_settings():
 
 def test_external_server_is_kept_and_backend_change_logged(managed_tts):
     popen, kill, _ = managed_tts
-    vc.tts_server_up.return_value = True
+    vc._check_tts_health.return_value = "ready"
     logs = []
     vc.ensure_tts_server(de.DEFAULT_CONFIG, logs.append)
     vc.ensure_tts_server({**de.DEFAULT_CONFIG, "tts_backend": "kokoro"}, logs.append)
@@ -424,9 +424,9 @@ def test_apply_reconciles_managed_tts_in_dictation(
 @pytest.mark.parametrize("external", [False, True])
 def test_managed_only_reconciliation_does_not_start_or_probe_unmanaged_tts(managed_tts, external):
     popen, kill, _ = managed_tts
-    vc.tts_server_up.return_value = external
+    vc._check_tts_health.return_value = "ready" if external else "unavailable"
     vc.ensure_tts_server({**de.DEFAULT_CONFIG, "tts_backend": "kokoro"}, managed_only=True)
-    vc.tts_server_up.assert_not_called()
+    vc._check_tts_health.assert_not_called()
     popen.assert_not_called()
     kill.assert_not_called()
 

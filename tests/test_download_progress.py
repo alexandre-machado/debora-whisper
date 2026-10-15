@@ -156,33 +156,62 @@ def test_progress_cleared_and_hf_hooks_restored_after_failure():
     bar.close()
 
 
+@pytest.fixture(params=["requests", "httpx"], ids=["legacy-requests", "current-httpx"])
+def hub_http(monkeypatch, request):
+    """Exercise the installed Hub's real retry loop with its native responses."""
+    from huggingface_hub import file_download as hf
+    legacy = hasattr(hf, "_request_wrapper")
+    if (request.param == "requests") != legacy:
+        pytest.skip("Covered by the other Hub version in the CI matrix")
+
+    transport = Mock()
+    if legacy:
+        import requests as http
+        monkeypatch.setattr(hf, "_request_wrapper", transport)
+        monkeypatch.setattr(hf, "reset_sessions", Mock())
+        monkeypatch.setattr(hf.constants, "HF_HUB_ENABLE_HF_TRANSFER", False)
+        connection_error = http.ConnectionError
+    else:
+        # Hub 1.x uses httpx; Hub 2.x uses httpx2.
+        http = getattr(hf, "httpx2", None) or hf.httpx
+        monkeypatch.setattr(hf, "http_stream_backoff", transport)
+        connection_error = http.ConnectError
+    monkeypatch.setattr(hf.time, "sleep", lambda seconds: None)
+
+    def response(size, *, resumed=False, interrupted=False):
+        status = 206 if resumed else 200
+        headers = {"Content-Length": str(size)}
+        if resumed:
+            headers["Content-Range"] = "bytes 40-99/100"
+        if legacy:
+            result = http.Response()
+            result.status_code = status
+            result.headers.update(headers)
+        else:
+            result = http.Response(status, headers=headers,
+                                   request=http.Request("GET", "https://example.invalid/weights"))
+
+        def chunks(chunk_size):
+            yield b"a" * (40 if interrupted else size)
+            if interrupted:
+                raise connection_error("interrupted after 40 bytes")
+
+        setattr(result, "iter_content" if legacy else "iter_bytes", chunks)
+        return result if legacy else nullcontext(result)
+
+    return transport, response
+
+
 @pytest.mark.parametrize("resume", [True, False])
-def test_http_retry_replaces_attempt_even_when_server_ignores_range(monkeypatch, resume):
-    import requests
+def test_http_retry_replaces_attempt_even_when_server_ignores_range(hub_http, resume):
     from huggingface_hub import file_download as hf
     from huggingface_hub.utils import tqdm
 
     tracker, callback = DownloadProgress(), Mock()
     original_http_get = hf.http_get
-
-    def interrupted(chunk_size):
-        yield b"a" * 40
-        raise requests.ConnectionError("interrupted after 40 bytes")
-
-    first, second = requests.Response(), requests.Response()
-    first.status_code = 200
-    first.headers["Content-Length"] = "100"
-    first.iter_content = interrupted
-    second.status_code = 206 if resume else 200
-    second.headers["Content-Length"] = "60" if resume else "100"
-    if resume:
-        second.headers["Content-Range"] = "bytes 40-99/100"
-    second.iter_content = lambda chunk_size: iter([b"b" * (60 if resume else 100)])
-    request = Mock(side_effect=[first, second])
-    monkeypatch.setattr(hf, "_request_wrapper", request)
-    monkeypatch.setattr(hf, "reset_sessions", Mock())
-    monkeypatch.setattr(hf.time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(hf.constants, "HF_HUB_ENABLE_HF_TRANSFER", False)
+    request, response = hub_http
+    request.side_effect = [response(100, interrupted=True),
+                           response(60 if resume else 100, resumed=resume)]
     with track_hf_downloads(tracker, callback):
         with tqdm(total=20, initial=10, unit="B", disable=True) as other:
             callback.reset_mock()
@@ -198,11 +227,7 @@ def test_http_retry_replaces_attempt_even_when_server_ignores_range(monkeypatch,
             assert request.call_count == 2
             # A separate file with the same display name must still be counted.
             request.side_effect = None
-            third = requests.Response()
-            third.status_code = 200
-            third.headers["Content-Length"] = "100"
-            third.iter_content = lambda chunk_size: iter([b"c" * 100])
-            request.return_value = third
+            request.return_value = response(100)
             hf.http_get("https://example.invalid/other", io.BytesIO(),
                         displayed_filename="same-name.safetensors")
             assert tracker.snapshot()["total"] == 220
@@ -330,6 +355,86 @@ def test_external_loading_server_is_reused(loading_tts, monkeypatch):
     spawn.assert_not_called()
 
 
+def test_concurrent_loading_response_publishes_without_cache_gap(monkeypatch):
+    config = {"tts_url": "http://loading-test"}
+    health = {"ok": False, "state": "loading", "download": {"done": 1, "total": 10}}
+    monkeypatch.setattr(vc, "_tts_health_cache", {})
+    connection = Mock()
+    connection.getresponse.side_effect = lambda: nullcontext(SimpleNamespace(
+        status=503, read=lambda limit: json.dumps(health).encode()))
+    monkeypatch.setattr(vc.http.client, "HTTPConnection", Mock(return_value=connection))
+    monkeypatch.setattr(vc, "_DeadlineTimer", Mock())
+    assert not vc.tts_server_up(config)
+
+    publish = vc._cache_tts_health
+    published, release = threading.Event(), threading.Event()
+
+    def paused_publish(config, health=None):
+        publish(config, health)
+        published.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(vc, "_cache_tts_health", paused_publish)
+    with ThreadPoolExecutor(1) as pool:
+        poll = pool.submit(vc.tts_server_up, config)
+        try:
+            assert published.wait(5)
+            # A second loading response must replace the snapshot in one write.
+            assert vc.tts_download_progress(config) == health["download"]
+        finally:
+            release.set()
+        assert not poll.result(timeout=5)
+
+
+@pytest.mark.parametrize("poll_state", ["loading", "unavailable", "ready"])
+def test_wait_uses_own_loading_response_during_concurrent_poll(monkeypatch, poll_state):
+    config = {"tts_url": "http://loading-test"}
+    monkeypatch.setattr(vc, "_tts_process", None)
+    monkeypatch.setattr(vc, "_tts_health_cache", {})
+    monkeypatch.setattr(vc, "_start_tts_health_poll", Mock())
+    monkeypatch.setattr(vc, "_DeadlineTimer", Mock())
+    waiter_thread = threading.get_ident()
+    published, polled, ready = threading.Event(), threading.Event(), threading.Event()
+
+    def response():
+        state = ("ready" if ready.is_set() else "loading") if (
+            threading.get_ident() == waiter_thread) else poll_state
+        return nullcontext(SimpleNamespace(
+            status={"ready": 200, "loading": 503, "unavailable": 500}[state],
+            read=lambda limit: b'{"ok": false, "state": "loading"}'))
+
+    connection = Mock(getresponse=Mock(side_effect=response))
+    monkeypatch.setattr(vc.http.client, "HTTPConnection", Mock(return_value=connection))
+    publish = vc._cache_tts_health
+
+    def interleaved_publish(config, health=None):
+        publish(config, health)
+        if threading.get_ident() == waiter_thread and health is not None:
+            published.set()
+            assert polled.wait(5)
+
+    monkeypatch.setattr(vc, "_cache_tts_health", interleaved_publish)
+    # Advance readiness only once the waiter decides to keep waiting.
+    monkeypatch.setattr(vc, "time", SimpleNamespace(
+        time=vc.time.time, monotonic=vc.time.monotonic, sleep=lambda seconds: ready.set()))
+
+    def poll():
+        assert published.wait(5)
+        try:
+            return vc.tts_server_up(config)
+        finally:
+            polled.set()
+
+    with ThreadPoolExecutor(1) as pool:
+        concurrent_poll = pool.submit(poll)
+        try:
+            assert vc.wait_tts_server(config, timeout=5)
+            assert ready.is_set()
+        finally:
+            published.set()
+        assert concurrent_poll.result(timeout=5) == (poll_state == "ready")
+
+
 def test_cached_progress_expires_without_polling(monkeypatch):
     monkeypatch.setattr(vc, "_tts_health_cache", {})
     config = {"tts_url": "http://unused"}
@@ -361,7 +466,7 @@ def test_tts_poll_outlives_startup_deadline(monkeypatch, managed, ending):
         if finish.is_set():
             if ending == "failed":
                 raise vc.TTSStartupError("failed")
-            return ending == "ready"
+            return "ready" if ending == "ready" else "unavailable"
         calls.append(None)
         # Each response consumes more than the startup budget and cache TTL.
         now[0] += vc.TTS_STARTUP_SECONDS + 1
@@ -369,9 +474,9 @@ def test_tts_poll_outlives_startup_deadline(monkeypatch, managed, ending):
             "done": len(calls), "total": 100}})
         if len(calls) > 1:
             refreshed.set()
-        return False
+        return "loading"
 
-    monkeypatch.setattr(vc, "tts_server_up", health)
+    monkeypatch.setattr(vc, "_check_tts_health", health)
     worker = None
     try:
         assert not vc.wait_tts_server(config)
@@ -407,9 +512,9 @@ def test_stopping_tts_discards_inflight_health_response(monkeypatch):
         started.set()
         assert release.wait(3)
         vc._cache_tts_health(config, {"download": {"done": 1, "total": 2}})
-        return False
+        return "loading"
 
-    monkeypatch.setattr(vc, "tts_server_up", health)
+    monkeypatch.setattr(vc, "_check_tts_health", health)
     vc._start_tts_health_poll(config)
     worker = vc._tts_health_polls[config["tts_url"]][1]
     try:

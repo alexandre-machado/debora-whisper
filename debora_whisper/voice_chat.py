@@ -731,9 +731,10 @@ def _start_tts_health_poll(config, process=None):
                 while not cancelled.wait(0.5):
                     if process is not None and process.poll() is not None:
                         break
-                    if tts_server_up(config):
+                    state = _check_tts_health(config)
+                    if state == "ready":
                         break
-                    if process is None and not _tts_loading_health(config):
+                    if process is None and state != "loading":
                         break
             except TTSStartupError:
                 pass  # Individual waiters still receive the terminal error.
@@ -752,6 +753,15 @@ def _start_tts_health_poll(config, process=None):
 def tts_server_up(config: dict) -> bool:
     """True if /health answers 200; TTSStartupError if the server reports
     a terminal startup error (503 with {"ok": false, "error": ...})."""
+    return _check_tts_health(config) == "ready"
+
+
+def _check_tts_health(config: dict) -> str:
+    """Return this request's state and atomically publish loading telemetry.
+
+    Startup callers must use the returned state: another poll may replace the
+    shared telemetry as soon as this request publishes it.
+    """
     connection = timer = None
     try:
         target = urllib.parse.urlsplit(config["tts_url"].rstrip("/") + "/health")
@@ -769,24 +779,26 @@ def tts_server_up(config: dict) -> bool:
         with connection.getresponse() as response:
             if response.status != 503:
                 _cache_tts_health(config)
-                return response.status == 200
+                return "ready" if response.status == 200 else "unavailable"
             raw = response.read(TTS_HEALTH_MAX_BYTES + 1)
         health = json.loads(raw) if len(raw) <= TTS_HEALTH_MAX_BYTES else None
     except Exception:
         _cache_tts_health(config)
-        return False
+        return "unavailable"
     finally:
         if timer is not None:
             timer.cancel()
         if connection is not None:
             connection.close()
-    _cache_tts_health(config)
     if (isinstance(health, dict) and health.get("ok") is False
             and isinstance(health.get("error"), str) and health["error"]):
+        _cache_tts_health(config)
         raise TTSStartupError(health["error"])
     if isinstance(health, dict) and health.get("state") == "loading" and health.get("ok") is False:
         _cache_tts_health(config, health)
-    return False
+        return "loading"
+    _cache_tts_health(config)
+    return "unavailable"
 
 
 def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=False):
@@ -817,8 +829,7 @@ def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=Fa
             deadline = time.monotonic() + 5.0
             while True:
                 try:
-                    if (not tts_server_up({"tts_url": _tts_retiring_url})
-                            and not _tts_loading_health({"tts_url": _tts_retiring_url})):
+                    if _check_tts_health({"tts_url": _tts_retiring_url}) == "unavailable":
                         _tts_retiring_url = None
                         break
                 except TTSStartupError:
@@ -837,8 +848,9 @@ def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=Fa
                     f"see {log_path or 'its output'}. Restart the app after fixing it.")
             return
         try:
-            if tts_server_up(config) or _tts_loading_health(config):
-                if _tts_loading_health(config):
+            state = _check_tts_health(config)
+            if state in ("ready", "loading"):
+                if state == "loading":
                     _start_tts_health_poll(config)
                 if _tts_server_key is not None and _tts_server_key != key:
                     log(f"Voice chat: configured TTS backend/command changed to {key[0]}; "
@@ -878,10 +890,11 @@ def wait_tts_server(config: dict, timeout=TTS_STARTUP_SECONDS) -> bool:
     Raise TTSStartupError on terminal failure."""
     deadline = time.time() + timeout
     while True:
-        if tts_server_up(config):
+        state = _check_tts_health(config)
+        if state == "ready":
             return True
         process = _tts_process
-        if ((process is None and not _tts_loading_health(config))
+        if ((process is None and state != "loading")
                 or (process is not None and process.poll() is not None)):
             _cache_tts_health(config)
             return False
