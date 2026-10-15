@@ -560,6 +560,9 @@ class RestartRequiredError(RuntimeError):
 
 _device_failure_lock = threading.Lock()
 _device_failure: dict | None = None
+# Failed pipelines must outlive their engine, including its telemetry thread.
+# Their destructors can call into a lost driver and crash the process.
+_quarantined_models: list = []
 
 # Held by a transcription and by the LLM's compile (in its own process, on
 # the Arc iGPU): both times that compile overlapped an NPU inference, the
@@ -2644,8 +2647,9 @@ class DictationApp:
         try:
             import psutil
             process = psutil.Process()
-            while True:
-                cpu = psutil.cpu_percent(interval=5.0)
+            psutil.cpu_percent(interval=None)  # Prime the per-thread sample.
+            while not self._stopping.wait(5.0):
+                cpu = psutil.cpu_percent(interval=None)
                 mem = process.memory_info().rss / (1024 * 1024)
                 sys_mem = psutil.virtual_memory().percent
                 
@@ -2710,6 +2714,7 @@ class DictationApp:
             self._lost_device = self.config["device"]
             if self.whisper is not None:
                 self._quarantined_models.append(self.whisper)
+                _quarantined_models.append(self.whisper)
                 self.whisper = None
                 log(f"Quarantined model on lost {self._lost_device}: it will not "
                     f"be called or released again in this process.")
@@ -2730,6 +2735,7 @@ class DictationApp:
             return {"error": str(exc)}
         cause = f"{type(exc).__name__}: {exc}"
         if kind == "LATCHED":
+            self._quarantine_lost_model()
             failure = device_failure()
             self._load_error = failure["message"]
             self._model_ready.set()
@@ -3630,7 +3636,7 @@ class DictationApp:
 
     # -- Lifecycle -------------------------------------------------------
 
-    def start_background(self):
+    def start_background(self, *, reconcile_tts: bool = False):
         """Register hotkey and start model loading without blocking.
 
         Use this from GUI mode instead of ``run()`` — does NOT call
@@ -3647,6 +3653,14 @@ class DictationApp:
         self._start_loader()
         if self.config.get("voice_chat") or self.warm_voice_chat:
             self._warm_up_voice_chat()
+        elif reconcile_tts:
+            # Apply must switch a previously started TTS server even while
+            # dictating. Shutdown may wait on the process; keep it off Tk.
+            threading.Thread(
+                target=ensure_tts_server,
+                args=(self.config, log, TTS_SERVER_LOG),
+                kwargs={"managed_only": True}, daemon=True,
+            ).start()
         self._start_segment_consumer()
 
     def _register_voice_chat_hotkey(self, keyboard):
@@ -3805,7 +3819,7 @@ class DictationApp:
         threading.Thread(target=_continuous_consumer, daemon=True).start()
 
     def busy_reason(self) -> str | None:
-        """What accelerator/microphone work is in flight, or None if idle."""
+        """What recording or model work is in flight, or None if idle."""
         with self._audio_lifecycle_lock:
             return self._busy_reason_locked()
 
@@ -3819,12 +3833,12 @@ class DictationApp:
         return None
 
     def stop_if_idle(self) -> str | None:
-        """Stop this engine only if no recording, transcription or model load
+        """Stop only if no recording, transcription or model load
         is in flight. Returns the busy reason (engine left running) or None
         (engine stopped).
 
-        The idle check and the stop flag are set under the same lock every
-        start path (hotkey start, timer/user stop, loader spawn) takes, so no
+        The idle check and the stop flag are set under the locks every
+        start path (recording or loader) takes, so no
         new work can begin between the check and the stop. Used before a
         Settings rebuild so a new pipeline is never compiled while the old
         one may still be running on the same device. Never blocks on
@@ -3836,6 +3850,16 @@ class DictationApp:
                 return reason
             self._stopping.set()
         self.stop()
+        # No work can start after the idle reservation above. Release the
+        # healthy pipeline before Settings constructs/loads its replacement;
+        # the old engine may still be referenced by callbacks or history.
+        # A failed driver must never be entered, even by a destructor.
+        if not device_failure():
+            with self._model_lock:
+                self.whisper = None
+                self._model_ready.clear()
+            import gc
+            gc.collect()
         return None
 
     def stop(self):

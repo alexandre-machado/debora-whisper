@@ -9,6 +9,7 @@ Usage:
 
 import sys
 import argparse
+import threading
 import customtkinter as ctk
 
 from debora_whisper.dictation_engine import (
@@ -419,6 +420,10 @@ class GUIApp:
         model_changed = new_config["model_size"] != self._config["model_size"]
         voice_chat = new_config.get("voice_chat", self._config.get("voice_chat"))
         voice_chat_changed = bool(voice_chat) != bool(self._config.get("voice_chat"))
+        tts_changed = any(
+            new_config.get(key, self._config.get(key)) != self._config.get(key)
+            for key in ("tts_backend", "tts_voice")
+        )
         harness_changed = any(
             new_config.get(key, self._config.get(key)) != self._config.get(key)
             for key in ("voice_chat_backend", "harness_cwd", "harness_model",
@@ -458,6 +463,22 @@ class GUIApp:
         if voice_chat_changed and not (rebuild and not failure):
             # A rebuilt engine starts voice chat itself; this one switches now.
             self._engine.set_voice_chat(bool(voice_chat))
+
+        if tts_changed and not rebuild:
+            from debora_whisper.dictation_engine import TTS_SERVER_LOG
+            from debora_whisper.voice_chat import ensure_tts_server
+
+            engine = self._engine
+            engine.voice_chat.interrupt()
+
+            def reconfigure_tts():
+                ensure_tts_server(
+                    self._config, log, TTS_SERVER_LOG,
+                    managed_only=not (self._config.get("voice_chat") or engine.warm_voice_chat),
+                )
+                engine.voice_chat.warm_tts()
+
+            threading.Thread(target=reconfigure_tts, daemon=True).start()
 
         # Update balloon settings immediately (no engine restart needed)
         self._overlay.set_voice_mode(bool(self._config.get("voice_chat")))
@@ -499,12 +520,12 @@ class GUIApp:
                 def _on_download_done():
                     self._settings_status("Loading model...", "#FF9F0A")
                     self._engine = self._new_engine()
-                    self._engine.start_background()
+                    self._engine.start_background(reconcile_tts=tts_changed)
                 onboarding = OnboardingWindow(self._root, self._config, on_done=_on_download_done)
                 onboarding.show()
             else:
                 self._engine = self._new_engine()
-                self._engine.start_background()
+                self._engine.start_background(reconcile_tts=tts_changed)
         else:
             self._settings_status("Settings saved.", "#30D158")
 
