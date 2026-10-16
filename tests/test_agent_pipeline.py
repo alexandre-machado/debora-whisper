@@ -4,6 +4,7 @@ No real codex, claude or gh runs here: the loop is driven through a fake Task.
 """
 import importlib.util
 import json
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -286,6 +287,34 @@ def test_leftovers_outside_add_paths_are_not_dirty(tmp_path):
     assert not t.dirty()
     (tmp_path / "tests" / "test_a.py").write_text("x = 1\n")
     assert t.dirty()
+
+
+def test_unexpected_error_still_prints_result(tmp_path):
+    t = _task(tmp_path, cls=FakeTask).setup([PASS])
+    t.prompt = tmp_path / "missing.md"  # mistyped --prompt
+    assert t.run() == task.EXIT_ERROR
+    assert t.lines[-1].startswith("RESULT demo exit=6") and "FileNotFoundError" in t.lines[-1]
+
+
+def test_codex_reviewer_crash_never_reuses_an_old_report(tmp_path, monkeypatch):
+    class Crashed:
+        returncode = 1
+
+    monkeypatch.setattr(task.subprocess, "run", lambda cmd, **kw: Crashed())
+    monkeypatch.setattr(task, "which", lambda name: name)
+    t = _task(tmp_path, reviewer="codex")
+    t.file("review-rev.out").write_text(PASS["rev"])  # previous round
+    v = t.review("rev", "abc")
+    assert not v.ok and "codex exit 1" in v.error
+
+
+def test_which_ignores_the_current_folder(tmp_path, monkeypatch):
+    for fake in ("git.bat", "git.cmd", "git.exe", "git"):
+        (tmp_path / fake).write_text("")
+    (tmp_path / "git").chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", os.pathsep.join([".", "", os.environ["PATH"]]))
+    assert Path(task.which("git")).parent != tmp_path
 
 
 # ---- suite runner ----------------------------------------------------------

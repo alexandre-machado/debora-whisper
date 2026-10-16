@@ -180,12 +180,18 @@ def default_python(repo: Path) -> str:
 
 
 def which(name: str) -> str:
-    """Absolute path from PATH only: on Windows a bare name is otherwise
-    looked up in the current folder first, which may be a Codex worktree."""
-    path = shutil.which(name, path=os.environ.get("PATH", ""))
-    if not path:
-        raise TaskError(f"{name} not found on PATH")
-    return path
+    """Absolute path from the absolute PATH entries only. shutil.which and
+    CreateProcess on Windows look in the current folder first, which may be a
+    worktree where Codex dropped a git.bat."""
+    exts = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if os.name == "nt" else [""]
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if not folder or not os.path.isabs(folder):
+            continue
+        for ext in exts:
+            p = os.path.join(folder, name + ext)
+            if os.path.isfile(p) and (os.name == "nt" or os.access(p, os.X_OK)):
+                return p
+    raise TaskError(f"{name} not found on PATH")
 
 
 def lower_priority_kwargs() -> dict:
@@ -231,7 +237,7 @@ class Task:
                            text=True, encoding="utf-8", errors="replace")
         if check and r.returncode:
             raise TaskError(f"git {' '.join(args[:2])} failed: {r.stderr.strip()[-300:]}")
-        return r.stdout.strip()
+        return r.stdout.rstrip()  # keep the leading space of porcelain lines
 
     def gh(self, *args: str, check: bool = True) -> str:
         r = subprocess.run([which("gh"), *args], cwd=self.worktree, capture_output=True, text=True,
@@ -265,6 +271,7 @@ class Task:
         prompt_file.write_text(prompt_text + "\n" + CODEX_RULES.format(focused=self.focused_cmd()),
                                encoding="utf-8")
         out, log = self.file(f"{step}.out"), self.file(f"{step}.log")
+        out.unlink(missing_ok=True)  # never read a previous round's message
         started = time.monotonic()
         code: int | str
         with open(prompt_file, encoding="utf-8") as stdin, open(log, "w", encoding="utf-8") as lf:
@@ -343,12 +350,14 @@ class Task:
         self.git("push", "-q", "-u", "origin", f"HEAD:refs/heads/{self.branch}")
 
     def ensure_pr(self) -> str:
-        pr = self.gh("pr", "view", self.branch, "--json", "number", "-q", ".number", check=False)
+        pr = self.gh("pr", "list", "--head", self.branch, "--state", "open", "--json", "number",
+                     "-q", ".[0].number", check=False)
         if not pr:
             args = ["pr", "create", "--base", "main", "--head", self.branch, "--title", self.title]
             args += ["--body-file", str(self.body)] if self.body else ["--body", ""]
             self.gh(*args)
-            pr = self.gh("pr", "view", self.branch, "--json", "number", "-q", ".number")
+            pr = self.gh("pr", "list", "--head", self.branch, "--state", "open", "--json",
+                         "number", "-q", ".[0].number")
         return pr
 
     def write_diff(self) -> Path:
@@ -411,6 +420,7 @@ class Task:
                 return v
         else:
             out, log = self.file(f"{step}.out"), self.file(f"{step}.log")
+            out.unlink(missing_ok=True)  # a crash must not leave the last round's verdict
             with open(log, "w", encoding="utf-8") as lf:
                 try:
                     code = subprocess.run(cmd, input=prompt, stdout=lf, stderr=subprocess.STDOUT,
@@ -425,7 +435,9 @@ class Task:
             limit = codex_limit_message(logtext)
             if limit:
                 raise CodexLimit(limit)
-            text = out.read_text(encoding="utf-8", errors="replace") if out.exists() else ""
+            if code != 0 or not out.exists():
+                return Verdict(kind=kind, error=f"codex exit {code}, no report")
+            text = out.read_text(encoding="utf-8", errors="replace")
         self.file(f"{step}.md").write_text(text, encoding="utf-8")
         return parse_verdict(kind, text)
 
@@ -545,6 +557,8 @@ class Task:
             return self.finish(EXIT_LIMIT, pr, sha, verdicts)
         except TaskError as e:
             return self.finish(EXIT_ERROR, pr, sha, verdicts, error=str(e))
+        except Exception as e:  # e.g. a mistyped --prompt path: still one RESULT line
+            return self.finish(EXIT_ERROR, pr, sha, verdicts, error=f"{type(e).__name__}: {e}")
 
     def finish(self, code: int, pr: str, sha: str, verdicts: list[Verdict], error: str = "") -> int:
         reviews = " ".join(v.short() for v in verdicts) or "reviews=none"
