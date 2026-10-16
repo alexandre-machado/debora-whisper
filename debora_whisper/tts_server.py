@@ -275,11 +275,15 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                  "precision": getattr(model, "precision", "unknown") if adapter else "unknown"}
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def _reply(self, code, body: bytes, content_type="application/json"):
+            self.close_connection = True
             try:
                 self.send_response(code)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
             except OSError:
@@ -295,9 +299,52 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                 return self._reply(503, json.dumps({"ok": False, "error": error,
                                                    "inventory": inventory}).encode())
             self._reply(200, json.dumps({"ok": True, "sample_rate": model.sr,
+                                        "stream": callable(getattr(model, "generate_stream", None)),
                                         "inventory": inventory}).encode())
 
+        def _stream(self, text, language, start):
+            import numpy as np
+            chunks = model.generate_stream(text, language_id=language)
+            total = 0
+            first = None
+            try:
+                for chunk in chunks:
+                    check_connection(self.connection)
+                    if hasattr(chunk, "cpu"):
+                        chunk = chunk.float().cpu().numpy()
+                    samples = np.asarray(chunk).reshape(-1)
+                    if not len(samples):
+                        continue
+                    pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+                    if first is None:
+                        first = time.time() - start
+                        self.stream_headers = True
+                        try:
+                            self.send_response(200)
+                            self.send_header("Content-Type", f"audio/L16; rate={model.sr}; channels=1")
+                            self.send_header("X-Sample-Rate", str(model.sr))
+                            self.send_header("Transfer-Encoding", "chunked")
+                            self.send_header("Connection", "close")
+                            self.end_headers()
+                        except OSError as e:
+                            raise SynthesisCancelled() from e
+                    try:
+                        self.wfile.write(f"{len(pcm):X}\r\n".encode() + pcm + b"\r\n")
+                        self.wfile.flush()
+                    except OSError as e:
+                        raise SynthesisCancelled() from e
+                    total += len(samples)
+                if first is None:
+                    raise ValueError("generation returned no audio")
+            finally:
+                if hasattr(chunks, "close"):
+                    chunks.close()
+            log(f"{total / model.sr:.1f}s of audio in {time.time() - start:.1f}s "
+                f"(first chunk {first:.3f}s): {text[:300]!r}")
+
         def do_POST(self):
+            self.close_connection = True
+            self.stream_headers = False
             if self.path != "/tts":
                 return self._error(404, "not found")
             try:
@@ -347,7 +394,19 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                         # Reference encoding also needs cancellation on new voices.
                         if adapter:
                             model.prepare_voice()
-                        wav = model.generate(text, language_id=language)
+                        streaming = (request.get("stream") is True
+                                     and callable(getattr(model, "generate_stream", None)))
+                        if streaming:
+                            self._stream(text, language, start)
+                        else:
+                            wav = model.generate(text, language_id=language)
+                    if streaming:
+                        try:
+                            self.wfile.write(b"0\r\n\r\n")
+                            self.wfile.flush()
+                        except OSError as e:
+                            raise SynthesisCancelled() from e
+                        return
                 except SynthesisCancelled:
                     log(f"Cancelled synthesis after {time.time() - start:.1f}s (client disconnected)")
                     return
@@ -355,7 +414,9 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                     # Chatterbox fails on text too short to speak ("OK").
                     log(f"Failed after {time.time() - start:.1f}s on {text[:300]!r}: "
                         f"{type(e).__name__}: {e}")
-                    return self._error(500, f"generation failed: {e}")
+                    if not self.stream_headers:
+                        self._error(500, f"generation failed: {e}")
+                    return
             samples = wav.squeeze(0).float().cpu().numpy()
             log(f"{len(samples) / model.sr:.1f}s of audio in {time.time() - start:.1f}s: "
                 f"{text[:300]!r}")

@@ -46,7 +46,7 @@ when comparing runs and record competing STT/LLM activity.
 
 Each sentence reports full HTTP **time to response**, WAV duration and RTF
 (response seconds / audio seconds); p50/p90 use linear interpolation. This is
-one complete WAV per request, **not time to a streaming chunk**, nor voice-to-voice
+one complete WAV per request, **not time to a [streaming chunk](../../TTS-PROTOCOL.md)**, nor voice-to-voice
 latency. Startup/model loading is excluded. The tool writes numbered WAVs,
 `sentences.csv` and `summary.json` (including server inventory) into a unique run
 directory under `--out`, defaulting to the system temporary directory. Output

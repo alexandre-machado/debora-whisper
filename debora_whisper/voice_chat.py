@@ -563,15 +563,35 @@ class TTSCancellation:
                     sock.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
+                # HTTPResponse owns a makefile reference: socket.close() alone
+                # defers closing its handle. On Windows shutdown alone also
+                # leaves a timed read blocked in select until the server writes.
+                handle = sock.detach()
+                if handle != -1:
+                    try:
+                        socket.close(handle)
+                    except OSError:
+                        pass
 
 
 def synthesize(text: str, config: dict):
     """(float32 samples, sample rate) for text from config["tts_url"]."""
+    return next(_synthesize(text, config, stream=False))
+
+
+def synthesize_stream(text: str, config: dict):
+    """Yield PCM chunks as they arrive, or one WAV from an older server."""
+    yield from _synthesize(text, config, stream=True)
+
+
+def _synthesize(text, config, *, stream):
     import numpy as np
     url = config["tts_url"]
     if not is_http_url(url):
         raise ValueError(f"tts_url {url!r} is not an http(s) URL")
     body = {"text": text}
+    if stream:
+        body["stream"] = True
     if config.get("language") and config["language"] != "auto":
         body["language"] = config["language"]
     # Sent on every request, so a voice picked in Settings speaks the next
@@ -604,6 +624,35 @@ def synthesize(text: str, config: dict):
                 except Exception:
                     message = response.reason
                 raise TTSRejected(f"HTTP {response.status}: {message}")
+            if stream and response.getheader("Content-Type", "").split(";")[0].lower() == "audio/l16":
+                rate = int(response.getheader("X-Sample-Rate"))
+                if not 0 < rate <= 384000:
+                    raise ValueError("invalid TTS sample rate")
+                size = max(2, int(rate * 0.1) * 2)
+                pending = bytearray()
+                total = 0
+                while True:
+                    raw = response.read1(min(size, TTS_MAX_RESPONSE_BYTES - total + 1))
+                    if cancellation and cancellation.cancelled:
+                        raise TTSRejected("cancelled")
+                    if not raw:
+                        break
+                    total += len(raw)
+                    if total > TTS_MAX_RESPONSE_BYTES:
+                        raise ValueError(f"TTS response larger than {TTS_MAX_RESPONSE_BYTES} bytes")
+                    pending.extend(raw)
+                    if len(pending) >= size:
+                        count = len(pending) // 2 * 2
+                        samples = np.frombuffer(bytes(pending[:count]), dtype="<i2")
+                        del pending[:count]
+                        yield samples.astype(np.float32) / 32768.0, rate
+                if len(pending) % 2:
+                    raise ValueError("odd byte count in TTS PCM response")
+                if response.length not in (None, 0):
+                    raise ValueError("truncated TTS PCM response")
+                if pending:
+                    yield np.frombuffer(bytes(pending), dtype="<i2").astype(np.float32) / 32768.0, rate
+                return
             raw = response.read(TTS_MAX_RESPONSE_BYTES + 1)
     finally:
         if cancellation and sock is not None:
@@ -616,7 +665,7 @@ def synthesize(text: str, config: dict):
             raise ValueError("TTS server must return 16-bit PCM WAV")
         samples = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
         samples = samples.reshape(-1, w.getnchannels())[:, 0]
-        return samples.astype(np.float32) / 32768.0, w.getframerate()
+        yield samples.astype(np.float32) / 32768.0, w.getframerate()
 
 
 def resolve_voice(voice) -> Path | None:
@@ -1271,7 +1320,10 @@ class VoiceChat:
                 self._playback.notify_all()
 
         def hold(timing):
-            if not prebuffer or timing.get("feedback") or timing.get("cached"):
+            # Whole-sentence estimates would defeat streaming's first audio
+            # and stall continuations whenever the network queue empties.
+            if (not prebuffer or timing.get("feedback") or timing.get("cached")
+                    or timing.get("streamed")):
                 return
             began = None
             snapshot = None
@@ -1303,6 +1355,7 @@ class VoiceChat:
         def wake_on_stop():
             # An externally supplied Event cannot notify our condition.
             stop.wait()
+            cancellation.cancel()
             with self._playback:
                 self._playback.notify_all()
 
@@ -1310,15 +1363,18 @@ class VoiceChat:
             with timing_lock:
                 if timing.get("logged"):
                     return
+                if timing.get("streamed") and "synth_end" not in timing:
+                    return
                 timing["logged"] = True
                 fields = " ".join(f"{key}={timing[key]:.3f}s" if key in timing else f"{key}=-"
-                                  for key in ("enqueued", "synth_start", "synth_end", "audio", "play"))
+                                  for key in ("enqueued", "synth_start", "first_chunk", "synth_end", "audio", "play"))
                 self.log(f"Voice chat: TTS turn={turn} chunk={timing['chunk']} {fields}"
                          + (" cached" if timing.get("cached") else ""))
 
         shown = []
 
         def show(timing, audible=False):
+            timing = timing.get("sentence", timing)
             # Her words enter the balloon together with her voice, and with
             # how long that voice lasts.
             if timing.get("shown") and on_reply:
@@ -1333,13 +1389,17 @@ class VoiceChat:
 
         def playback_started(timing):
             nonlocal first_audio
+            timing = timing.get("sentence", timing)
             with self._playback:
                 if self._clip_stop.is_set():
                     return
-                timing["play"] = time.perf_counter() - started
                 self._show_audio(True)
+                if timing.get("streamed") and "play" in timing:
+                    return
+                timing["play"] = time.perf_counter() - started
                 show(timing, audible=True)
-                self._remember_spoken(timing["spoken"], timing["audio"])
+                duration = timing["seconds"] if timing.get("streamed") else timing["audio"]
+                self._remember_spoken(timing["spoken"], duration)
                 if first_audio is None:
                     first_audio = timing["play"]
                 log_timing(timing)
@@ -1437,6 +1497,62 @@ class VoiceChat:
                 with self._playback:
                     self._playback.notify_all()
 
+        def render_stream(spoken, config, timing):
+            nonlocal buffered
+            timing["streamed"] = True
+            timing["audio"] = 0.0
+            timing["seconds"] = self._synthesis_model.predict(spoken)[1]
+            seconds = 0.0
+            held = None
+            stream = synthesize_stream(spoken, config)
+
+            def put(samples, rate, *, last=False):
+                nonlocal buffered, seconds
+                first = not timing.get("stream_queued")
+                samples = trim_silence(samples, rate, leading=first, trailing=last)
+                if not len(samples):
+                    return
+                duration = len(samples) / rate
+                with self._playback:
+                    if stop.is_set() or cancellation.cancelled:
+                        return
+                    seconds += duration
+                    buffered += duration
+                    # A sentence leaves pending at its first playable chunk;
+                    # buffered counts only audio actually queued, not predictions.
+                    pending.pop(timing["chunk"], None)
+                    clips.put((samples, rate, {"sentence": timing, "streamed": True,
+                                              "continuation": not first, "last": last,
+                                              "seconds": duration}))
+                    timing["stream_queued"] = True
+                    self._playback.notify_all()
+
+            try:
+                for samples, rate in stream:
+                    if stop.is_set() or cancellation.cancelled:
+                        return
+                    timing.setdefault("first_chunk", time.perf_counter() - started)
+                    timing["audio"] += len(samples) / rate
+                    if held is None:
+                        # Start on the first chunk. Retain a small suffix so
+                        # even a one-chunk stream can have its final silence cut.
+                        retain = min(int(rate * 0.05), len(samples) // 2)
+                        # Retain a longer quiet ending too. It may be a pause
+                        # (released with the next chunk) or the sentence's end.
+                        split = min(len(samples) - retain,
+                                    len(trim_silence(samples, rate, leading=False)))
+                        put(samples[:split], rate)
+                        held = samples[split:], rate
+                    else:
+                        put(*held)
+                        held = samples, rate
+                if held is not None:
+                    put(*held, last=True)
+            finally:
+                if hasattr(stream, "close"):
+                    stream.close()
+                timing["seconds"] = seconds
+
         def render():
             nonlocal buffered
             tts_ok = None  # unknown until the first sentence
@@ -1484,11 +1600,27 @@ class VoiceChat:
                                     timing["synth_start"] = time.perf_counter() - started
                                     self._playback.notify_all()
                                 try:
-                                    audio = synthesize(spoken, config)
+                                    if (config.get("tts_stream", True)
+                                            and _tts_loading_health(config).get("stream") is True):
+                                        render_stream(spoken, config, timing)
+                                    else:
+                                        audio = synthesize(spoken, config)
                                 finally:
                                     timing["synth_end"] = time.perf_counter() - started
+                                if (timing.get("streamed") and not stop.is_set()
+                                        and not cancellation.cancelled):
+                                    # Learn from complete sentences only; a failed
+                                    # stream's partial duration would bias the model.
+                                    with self._playback:
+                                        self._synthesis_model.update(
+                                            spoken, timing["synth_end"] - timing["synth_start"],
+                                            timing["audio"], timing["seconds"])
                         except TTSRejected as e:
-                            self.log(f"Voice chat: TTS skipped {spoken[:40]!r} ({e})")
+                            if timing.get("stream_queued"):
+                                if not stop.is_set():
+                                    self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
+                            else:
+                                self.log(f"Voice chat: TTS skipped {spoken[:40]!r} ({e})")
                         except Exception as e:
                             # Keep showing the text even without a voice.
                             tts_ok = False
@@ -1496,6 +1628,10 @@ class VoiceChat:
                                 self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
                     if stop.is_set():
                         return
+                    if timing.get("stream_queued"):
+                        if "play" in timing:
+                            log_timing(timing)
+                        continue
                     if audio is not None:
                         timing["audio"] = len(audio[0]) / audio[1]
                         timing["spoken"] = spoken
@@ -1526,8 +1662,8 @@ class VoiceChat:
 
         writer = threading.Thread(target=write, daemon=True)
         renderer = threading.Thread(target=render, daemon=True)
-        if prebuffer:
-            threading.Thread(target=wake_on_stop, daemon=True).start()
+        stop_watcher = threading.Thread(target=wake_on_stop, daemon=True)
+        stop_watcher.start()
         if timer:
             timer.daemon = True
             timer.start()
@@ -1572,13 +1708,17 @@ class VoiceChat:
                             clip_stop = self._clip_stop = PlaybackStop(stop)
                         if stop.is_set():
                             break
+                        on_start = (lambda: self._show_audio(True)) if clip[2].get("continuation") else (
+                            lambda timing=clip[2]: playback_started(timing))
                         if self._play is None:
                             play(clip[0], clip[1], clip_stop,
-                                 on_start=lambda timing=clip[2]: playback_started(timing),
-                                 wait_for_tail=(self.config.get("voice_chat_pause_on_speech", True)
+                                 continuation=clip[2].get("continuation", False),
+                                 on_start=on_start,
+                                 wait_for_tail=((not clip[2].get("streamed") or clip[2].get("last"))
+                                                and self.config.get("voice_chat_pause_on_speech", True)
                                                 and self.config.get("voice_chat_barge_in", True)))
                         else:
-                            playback_started(clip[2])
+                            on_start()
                             play(clip[0], clip[1], clip_stop)
                         with self._playback:
                             cut = clip_stop.is_set()
@@ -1603,6 +1743,11 @@ class VoiceChat:
                 # Drain Claude's result / local cancellation before the next
                 # turn. In particular, never clear its stop event early.
                 writer.join()
+                if any(timing.get("streamed") for timing in timings):
+                    renderer.join()
+                stop_watcher.join()
+                if timer:
+                    timer.join()
                 with self._spoken_lock:
                     now = time.monotonic()
                     self._spoken = [(begin, min(end, now), words)
@@ -1638,15 +1783,16 @@ SENTENCE_GAP_SECONDS = 0.15
 _SILENCE_LEVEL = 10 ** (-45 / 20)  # -45 dBFS
 
 
-def trim_silence(samples, sample_rate: int, keep_seconds=0.05):
+def trim_silence(samples, sample_rate: int, keep_seconds=0.05, *, leading=True, trailing=True):
     """samples without the silence the TTS leaves before and after speech."""
     import numpy as np
     loud = np.flatnonzero(np.abs(samples) > _SILENCE_LEVEL)
     if len(loud) == 0:
-        return samples[:0]
+        return samples[:0] if leading or trailing else samples
     keep = int(sample_rate * keep_seconds)
-    samples = samples[max(loud[0] - keep, 0):loud[-1] + keep + 1]
-    return _without_trailing_hiss(samples, sample_rate, keep)
+    samples = samples[max(loud[0] - keep, 0) if leading else 0:
+                      loud[-1] + keep + 1 if trailing else len(samples)]
+    return _without_trailing_hiss(samples, sample_rate, keep) if trailing else samples
 
 
 # Chatterbox sometimes adds a faint hiss after a pause once the speech is
@@ -1692,7 +1838,7 @@ class StreamPlayer:
         self._rate = None
 
     def __call__(self, samples, sample_rate: int, stop: threading.Event, on_start=None,
-                 wait_for_tail=False):
+                 wait_for_tail=False, continuation=False):
         import numpy as np
         import sounddevice as sd
         gap = 0
@@ -1702,7 +1848,7 @@ class StreamPlayer:
             self._stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32")
             self._stream.start()
             self._rate = sample_rate
-        else:
+        elif not continuation:
             gap = int(sample_rate * SENTENCE_GAP_SECONDS)
             samples = np.concatenate([np.zeros(gap, dtype=np.float32), samples])
         data = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1, 1)

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import wave
 from contextlib import nullcontext
+from http.server import ThreadingHTTPServer
 
 import numpy as np
 import pytest
@@ -27,6 +28,149 @@ from debora_whisper import voice_chat as vc
 from debora_whisper.dictation_engine import DEFAULT_CONFIG, validate_config
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture
+def streaming_server(fake_torch):
+    running = []
+
+    def start(chunks=None):
+        backend = SimpleNamespace(sr=24000, package="fake-tts", model_id="fake",
+                                  cancel_modules=[], use=Mock(), prepare_voice=Mock(),
+                                  generate=lambda *a, **kw: FakeTensor([[0.25, -0.25]]))
+        if chunks is not None:
+            backend.generate_stream = chunks
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.make_handler(backend, "pt", adapter=True))
+        srv.daemon_threads = False
+        worker = threading.Thread(target=srv.serve_forever)
+        worker.start()
+        running.append((srv, worker))
+        return srv, backend
+
+    yield start
+    for srv, worker in running:
+        srv.shutdown()
+        srv.server_close()
+        worker.join()
+
+
+def test_streaming_http_contract(streaming_server):
+    chunks = [np.array([0.25, -0.25]), np.array([1.0, -1.0, 0.0])]
+    srv, backend = streaming_server(lambda *a, **kw: iter(chunks))
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=3)
+    try:
+        conn.request("GET", "/health")
+        health = conn.getresponse()
+        assert json.loads(health.read())["stream"] is True
+        conn.request("POST", "/tts", json.dumps({"text": "Olá.", "stream": True}),
+                     {"Content-Type": "application/json"})
+        reply = conn.getresponse()
+        assert reply.status == 200 and reply.chunked
+        assert reply.getheader("Content-Type") == "audio/L16; rate=24000; channels=1"
+        assert reply.getheader("X-Sample-Rate") == "24000"
+        # Inspect framing too: exactly one HTTP chunk per generated chunk.
+        for samples in chunks:
+            pcm = (samples * 32767).astype("<i2").tobytes()
+            assert reply.fp.readline() == f"{len(pcm):X}\r\n".encode()
+            assert reply.fp.read(len(pcm) + 2) == pcm + b"\r\n"
+        assert reply.fp.read() == b"0\r\n\r\n"
+        reply.close()
+        backend.use.assert_called_once_with(None)
+        backend.prepare_voice.assert_called_once()
+    finally:
+        conn.close()
+
+
+def test_stream_flag_falls_back_to_wav(streaming_server):
+    srv, _ = streaming_server()
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=3)
+    try:
+        conn.request("GET", "/health")
+        assert json.loads(conn.getresponse().read())["stream"] is False
+        conn.request("POST", "/tts", '{"text":"Olá", "stream":true}'.encode(),
+                     {"Content-Type": "application/json"})
+        reply = conn.getresponse()
+        assert reply.status == 200 and reply.getheader("Content-Type") == "audio/wav"
+        with wave.open(io.BytesIO(reply.read())) as wav:
+            assert wav.getnframes() == 2
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("after_first", [False, True])
+def test_stream_generation_error_framing(streaming_server, after_first):
+    def chunks(*args, **kwargs):
+        if after_first:
+            yield np.ones(100)
+        raise ValueError("broken generation")
+
+    srv, _ = streaming_server(chunks)
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=3)
+    try:
+        conn.request("POST", "/tts", '{"text":"Hello", "stream":true}',
+                     {"Content-Type": "application/json"})
+        reply = conn.getresponse()
+        if after_first:
+            assert reply.status == 200
+            with pytest.raises(http.client.IncompleteRead):
+                reply.read()
+        else:
+            assert reply.status == 500
+            assert "broken generation" in json.loads(reply.read())["error"]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("headers", [{"Origin": "null"}, {"Content-Type": "text/plain"}])
+def test_stream_keeps_origin_and_content_type_checks(streaming_server, headers):
+    chunks = Mock()
+    srv, _ = streaming_server(chunks)
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=3)
+    try:
+        conn.request("POST", "/tts", '{"text":"Hello", "stream":true}',
+                     {"Content-Type": "application/json", **headers})
+        reply = conn.getresponse()
+        assert reply.status == 403
+        reply.read()
+        chunks.assert_not_called()
+    finally:
+        conn.close()
+
+
+def test_stream_disconnect_closes_generator(streaming_server, monkeypatch):
+    resume, closed = threading.Event(), threading.Event()
+    produced, logs = [], []
+    monkeypatch.setattr(server, "log", logs.append)
+
+    def chunks(*args, **kwargs):
+        try:
+            for index in range(100):
+                produced.append(index)
+                yield np.ones(2400)
+                assert resume.wait(3)
+        finally:
+            closed.set()
+
+    srv, _ = streaming_server(chunks)
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=3)
+    try:
+        conn.connect()
+        sock = conn.sock
+        conn.request("POST", "/tts", '{"text":"Hello", "stream":true}',
+                     {"Content-Type": "application/json"})
+        reply = conn.getresponse()
+        assert reply.read1(4800)
+        sock.shutdown(socket.SHUT_RDWR)
+        reply.close()
+    finally:
+        conn.close()
+        resume.set()
+    assert closed.wait(3)
+    assert len(produced) < 100
+    # server_close in the fixture joins the request thread.
+    srv.shutdown()
+    srv.server_close()
+    assert any("Cancelled synthesis" in line for line in logs)
 
 
 class FakeTensor:
@@ -491,6 +635,28 @@ def test_xtts_keeps_short_final_word_after_comma_pause(xtts_model, monkeypatch):
     assert logs == []
     # Without the comma the same audio is the artifact and is cut at the gap.
     assert backend.generate("Pode ser sim.", "pt").shape[1] - int(SR * 1.2) in range(0, SR // 100)
+
+
+@pytest.mark.parametrize("text", ["Pode ser sim.", "Pode ser, sim."])
+@pytest.mark.parametrize("audio", [
+    np.concatenate([tone(1.213), silence(0.2), tone(0.35)]),
+    np.concatenate([tone(0.2), silence(0.2), tone(0.3)]),
+    tone(0.005),
+])
+def test_xtts_stream_matches_whole_audio(xtts_model, monkeypatch, text, audio):
+    backend, model, _, _, _ = xtts_model
+    logs = []
+    monkeypatch.setattr(server, "log", logs.append)
+    model.inference.return_value = {"wav": audio}
+    model.inference_stream.return_value = (FakeTensor(audio[i:i + 4321])
+                                           for i in range(0, len(audio), 4321))
+    whole = backend.generate(text, "pt-BR").numpy().reshape(-1)
+    streamed = np.concatenate(list(backend.generate_stream(text, "pt-BR")))
+    np.testing.assert_array_equal(streamed, whole)
+    assert model.inference_stream.call_args == model.inference.call_args
+    assert model.inference_stream.call_args.kwargs == {
+        "temperature": xtts.TEMPERATURE, "enable_text_splitting": False}
+    assert len(logs) == (2 if len(whole) < len(audio) else 0)
 
 
 def test_xtts_states_license_at_startup_and_in_help(monkeypatch, tmp_path, fake_torch, capsys):

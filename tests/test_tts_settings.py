@@ -573,3 +573,15 @@ def test_disabling_local_chat_forgets_conversation_with_tts_change(settings_gui,
     assert [m for m in messages if m["role"] != "system"] == [
         {"role": "user", "content": "nova conversa"},
     ]
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_tts_stream_bool_config(value):
+    assert de.DEFAULT_CONFIG["tts_stream"] is True
+    de.validate_config({**de.DEFAULT_CONFIG, "tts_stream": value})
+
+
+@pytest.mark.parametrize("value", [0, 1, None, "true", "false", []])
+def test_tts_stream_rejects_non_bool(value):
+    with pytest.raises(ValueError, match="tts_stream must be a bool"):
+        de.validate_config({**de.DEFAULT_CONFIG, "tts_stream": value})
