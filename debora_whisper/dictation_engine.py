@@ -118,6 +118,7 @@ DEFAULT_CONFIG = {
     # chatterbox, qwen3 (clone), kokoro (pf_dora), xtts (clone, non-commercial)
     "tts_backend": "chatterbox",
     "tts_voice": "debora_v2",
+    "tts_stream": True,
     "tts_url": "http://127.0.0.1:8765",
     "tts_timeout_seconds": 60,
     # Command that starts the TTS server when nothing answers at tts_url.
@@ -406,6 +407,8 @@ def validate_config(config: dict):
         raise ValueError("voice_chat_pause_on_speech must be a bool")
     if not isinstance(config.get("voice_chat_prebuffer", True), bool):
         raise ValueError("voice_chat_prebuffer must be a bool")
+    if not isinstance(config.get("tts_stream", True), bool):
+        raise ValueError("tts_stream must be a bool")
     if not isinstance(config.get("harness_new_session_on_start", False), bool):
         raise ValueError("harness_new_session_on_start must be a bool")
     from debora_whisper.harness import validate_session_name

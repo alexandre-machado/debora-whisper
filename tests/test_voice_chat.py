@@ -1,6 +1,7 @@
 """config["voice_chat"]: the final text goes to a local LLM and its reply is
 spoken by a local TTS server instead of being typed."""
 import io
+import http.client
 import json
 import re
 import sys
@@ -43,9 +44,9 @@ def server():
             if srv.health_error:
                 return self._send(json.dumps({"ok": False, "error": srv.health_error}).encode(),
                                   "application/json", status=503)
-            if self.path != "/health" or srv.health_status != 200:
-                return self.send_error(503)
-            self._send(b'{"ok": true}', "application/json")
+            if self.path != "/health":
+                return self.send_error(404)
+            self._send(srv.health_body, "application/json", status=srv.health_status)
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -69,12 +70,153 @@ def server():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     srv.requests, srv.tts_status, srv.health_status = [], 200, 200
     srv.health_error, srv.health_requests = None, 0
+    srv.health_body = b'{"ok": true}'
     srv.tts_url = f"http://127.0.0.1:{srv.server_port}"
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     yield srv
     srv.shutdown()
     srv.server_close()
+    thread.join()
+
+
+@pytest.fixture
+def pcm_server():
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            body = b'{"ok": true, "stream": true}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            srv.body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/L16; rate=24000; channels=1")
+            self.send_header("X-Sample-Rate", srv.rate)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                for chunk in srv.chunks:
+                    self.wfile.write(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
+                    self.wfile.flush()
+                    if srv.gate:
+                        srv.sent.set()
+                        if not srv.gate.wait(5):
+                            return
+                self.wfile.write(srv.ending)
+            except OSError:
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = False
+    srv.tts_url = f"http://127.0.0.1:{srv.server_port}"
+    raw = np.arange(7200, dtype="<i2").tobytes()
+    srv.chunks = [raw[:1], raw[1:6000], raw[6000:]]
+    srv.ending = b"0\r\n\r\n"
+    srv.rate = "24000"
+    srv.gate, srv.sent = None, threading.Event()
+    thread = threading.Thread(target=srv.serve_forever)
+    thread.start()
+    try:
+        yield srv
+    finally:
+        if srv.gate:
+            srv.gate.set()
+        srv.shutdown()
+        srv.server_close()
+        thread.join()
+
+
+def test_synthesize_stream_pcm(pcm_server):
+    chunks = list(vc.synthesize_stream("Olá", _cfg(pcm_server, tts_voice=None, language="pt")))
+    assert len(chunks) >= 2
+    assert all(rate == 24000 and samples.dtype == np.float32 for samples, rate in chunks)
+    assert all(len(samples) >= 2400 for samples, _ in chunks[:-1])
+    np.testing.assert_array_equal(np.concatenate([s for s, _ in chunks]),
+                                  np.arange(7200, dtype=np.float32) / 32768)
+    assert pcm_server.body == {"text": "Olá", "language": "pt", "voice": "", "stream": True}
+
+
+def test_synthesize_stream_wav_fallback(server):
+    chunks = list(vc.synthesize_stream("Olá", _cfg(server)))
+    assert len(chunks) == 1 and chunks[0][1] == 24000
+    assert len(chunks[0][0]) == 2400
+    assert server.requests[0][1]["stream"] is True
+
+
+def test_synthesize_stream_rejected(server):
+    server.tts_status = 503
+    with pytest.raises(vc.TTSRejected, match="HTTP 503"):
+        list(vc.synthesize_stream("Olá", _cfg(server)))
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_synthesize_stream_bounds_total_bytes(pcm_server, server, monkeypatch, fallback):
+    monkeypatch.setattr(vc, "TTS_MAX_RESPONSE_BYTES", 5000 if not fallback else 100)
+    with pytest.raises(ValueError, match="larger than"):
+        list(vc.synthesize_stream("Olá", _cfg(server if fallback else pcm_server)))
+
+
+@pytest.mark.parametrize("ending", [b"", b"10\r\nabc"])
+def test_synthesize_stream_rejects_truncated_chunked_body(pcm_server, ending):
+    pcm_server.ending = ending
+    with pytest.raises(http.client.IncompleteRead):
+        list(vc.synthesize_stream("Olá", _cfg(pcm_server)))
+
+
+@pytest.mark.parametrize("rate", ["1", "7999", "192001"])
+def test_synthesize_stream_rejects_absurd_sample_rate(pcm_server, rate):
+    pcm_server.rate = rate
+    with pytest.raises(ValueError, match="sample rate"):
+        list(vc.synthesize_stream("Olá", _cfg(pcm_server)))
+
+
+def test_synthesize_stream_rejects_odd_pcm(pcm_server):
+    pcm_server.chunks = [b"abc"]
+    with pytest.raises(ValueError, match="odd byte"):
+        list(vc.synthesize_stream("Olá", _cfg(pcm_server)))
+
+
+def test_synthesize_stream_cancellation_closes_connection(pcm_server):
+    pcm_server.chunks = [b"\x00\x10" * 2400] * 2
+    pcm_server.gate = threading.Event()
+    cancellation = vc.TTSCancellation()
+    stream = vc.synthesize_stream("Olá", _cfg(pcm_server, _tts_cancellation=cancellation))
+    assert len(next(stream)[0]) == 2400
+    errors = []
+
+    def read():
+        try:
+            next(stream)
+        except Exception as e:
+            errors.append(e)
+
+    worker = threading.Thread(target=read)
+    worker.start()
+    try:
+        cancellation.cancel()
+        worker.join(3)
+        assert not worker.is_alive() and errors
+        assert not cancellation._sockets
+    finally:
+        pcm_server.gate.set()
+        worker.join(3)
+        stream.close()
+
+
+@pytest.mark.parametrize("url", ["file:///tmp/voice", "ftp://localhost/tts"])
+def test_synthesize_stream_rejects_non_http_url(url):
+    with pytest.raises(ValueError, match="http\\(s\\)"):
+        list(vc.synthesize_stream("Olá", {**DEFAULT_CONFIG, "tts_url": url}))
 
 
 class FakeLLM:
@@ -1036,6 +1178,53 @@ def test_tts_server_up_needs_a_healthy_answer(server):
     assert not vc.tts_server_up(config)
 
 
+def test_ready_capabilities_survive_loading_poll_cleanup(no_tts_process, server):
+    config = _cfg(server)
+    vc._cache_tts_health(config, {"ok": False, "state": "loading", "download": {"done": 1}})
+    server.health_body = b'{"ok": true, "stream": true}'
+    vc._start_tts_health_poll(config)
+    with vc._tts_health_cache_lock:
+        worker = vc._tts_health_polls[server.tts_url][1]
+    worker.join(3)
+    assert not worker.is_alive()
+    assert vc.tts_download_progress(config) is None
+    assert vc._tts_loading_health(config) == {}
+    assert vc._tts_capabilities(config)["stream"] is True
+    assert vc._tts_capabilities({"tts_url": server.tts_url + "/"})["stream"] is True
+    assert vc._tts_capabilities({"tts_url": server.tts_url + "/other"}) == {}
+
+
+@pytest.mark.parametrize("state", ["loading", "unavailable", "error", "wav", "stop"])
+def test_ready_capabilities_invalidated(no_tts_process, server, state):
+    config = _cfg(server)
+    server.health_body = b'{"ok": true, "stream": true}'
+    assert vc.tts_server_up(config)
+    assert vc._tts_capabilities(config)["stream"] is True
+    if state == "stop":
+        vc.stop_tts_server()
+    elif state == "error":
+        server.health_error = "failed startup"
+        with pytest.raises(vc.TTSStartupError):
+            vc.tts_server_up(config)
+    else:
+        server.health_body = b'{"ok": false, "state": "loading"}' if state == "loading" else b'{"ok": true}'
+        server.health_status = {"loading": 503, "unavailable": 500, "wav": 200}[state]
+        assert vc._check_tts_health(config) == {"wav": "ready"}.get(state, state)
+    assert not vc._tts_capabilities(config).get("stream")
+
+
+@pytest.mark.parametrize("body", [b"", b"invalid", b"[]", b'{"stream": "true"}',
+                                  b"x" * (vc.TTS_HEALTH_MAX_BYTES + 1)],
+                         ids=["empty", "invalid", "array", "string-flag", "oversized"])
+def test_invalid_ready_capabilities_fall_back_to_wav(server, body):
+    config = _cfg(server)
+    server.health_body = b'{"ok": true, "stream": true}'
+    assert vc.tts_server_up(config)
+    server.health_body = body
+    assert vc.tts_server_up(config)
+    assert not vc._tts_capabilities(config).get("stream")
+
+
 @pytest.mark.parametrize("status", [200, 503])
 def test_trickling_health_answer_cannot_stall_the_check(status):
     # Each byte arrives before the socket timeout, so only an absolute
@@ -1897,6 +2086,235 @@ def test_clips_of_a_reply_share_one_stream_with_a_pause_between(stream):
     gap = int(24000 * vc.SENTENCE_GAP_SECONDS)
     assert sum(stream[0].written) == 2 * 24000 + gap
     assert stream[0].ended == "drained"  # the last clip plays to its end
+
+
+def test_stream_continuations_have_no_sentence_gap(stream):
+    player, stop = vc.StreamPlayer(), threading.Event()
+    try:
+        for continuation in [False, True, True, False, True]:
+            player(np.ones(2400, np.float32), 24000, stop, continuation=continuation)
+    finally:
+        player.close(interrupted=False)
+    assert sum(stream[0].written) == 5 * 2400 + int(24000 * vc.SENTENCE_GAP_SECONDS)
+
+
+@pytest.fixture
+def streaming_chat(server, monkeypatch):
+    server.health_body = b'{"ok": true, "stream": true}'
+    monkeypatch.setitem(DEFAULT_CONFIG, "tts_url", server.tts_url)
+    monkeypatch.setattr(vc, "synthesize", MagicMock(side_effect=AssertionError("whole WAV requested")))
+
+
+def test_stream_playback_starts_before_generation_ends(streaming_chat, stream, monkeypatch):
+    began = threading.Event()
+    ended, requests, shown, logs = [], [], [], []
+    original_write = FakeStream.write
+
+    def write(output, data):
+        original_write(output, data)
+        began.set()
+
+    def synth(text, config):
+        requests.append(text)
+        began.clear()
+        yield np.full(2400, 0.2, np.float32), 24000
+        assert began.wait(3), "first audio waited for the stream to end"
+        yield np.full(4800, 0.2, np.float32), 24000
+        ended.append(text)
+
+    monkeypatch.setattr(FakeStream, "write", write)
+    monkeypatch.setattr(vc, "synthesize_stream", synth)
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), log=logs.append,
+                        llm=FakeLLM(["Primeira frase longa. Segunda frase longa."]))
+    chat._remember_spoken = MagicMock(wraps=chat._remember_spoken)
+    chat._synthesis_model.update = MagicMock(wraps=chat._synthesis_model.update)
+    chat.respond("oi", on_reply=lambda *args: shown.append(args))
+    assert requests == ended == ["Primeira frase longa.", "Segunda frase longa."]
+    assert len(shown) == 2
+    assert chat._remember_spoken.call_count == 6  # every clip, including continuations
+    assert sum(call.args[1] for call in chat._remember_spoken.call_args_list) == pytest.approx(0.6)
+    assert chat._synthesis_model.update.call_count == 2
+    for call in chat._synthesis_model.update.call_args_list:
+        assert call.args[2:] == pytest.approx((0.3, 0.3))
+    assert sum(stream[0].written) == 14400 + int(24000 * vc.SENTENCE_GAP_SECONDS)
+    assert not any("prebuffer held" in line for line in logs)
+    timings = [line for line in logs if " chunk=" in line]
+    assert len(timings) == 2
+    for line in timings:
+        times = {key: float(value) for key, value in re.findall(r"(\w+)=(\d+\.\d+)s", line)}
+        assert times["synth_start"] <= times["first_chunk"] <= times["play"] <= times["synth_end"]
+        assert times["audio"] == pytest.approx(0.3)
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_stream_failure_or_stop_does_not_replay(streaming_chat, monkeypatch, interrupt):
+    began, closed = threading.Event(), threading.Event()
+    played, requests, logs, shown = [], [], [], []
+
+    def synth(text, config):
+        requests.append(text)
+        try:
+            yield np.full(2400, 0.2, np.float32), 24000
+            assert began.wait(3)
+            if interrupt:
+                yield np.full(2400, 0.3, np.float32), 24000
+            else:
+                raise OSError("stream broke")
+        finally:
+            closed.set()
+
+    def play(samples, rate, stop):
+        played.append(samples.copy())
+        if interrupt:
+            chat.interrupt()
+        began.set()
+
+    monkeypatch.setattr(vc, "synthesize_stream", synth)
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=play, log=logs.append,
+                        llm=FakeLLM(["Primeira frase longa."]))
+    chat.respond("oi", on_reply=lambda *args: shown.append(args))
+    assert closed.is_set() and len(requests) == len(played) == len(shown) == 1
+    if interrupt:
+        assert chat._tts_cancellation.cancelled
+    else:
+        assert any("Voice chat: TTS failed" in line for line in logs)
+
+
+@pytest.mark.parametrize("enabled,advertised", [
+    (True, True), (False, True), (True, False), (False, False), (True, None), (True, "true")])
+def test_stream_requires_config_and_health(server, monkeypatch, enabled, advertised):
+    server.health_body = json.dumps({"ok": True, "stream": advertised}).encode()
+    whole = MagicMock(return_value=(np.full(2400, 0.2, np.float32), 24000))
+    streaming = MagicMock(return_value=iter([(np.full(2400, 0.2, np.float32), 24000)]))
+    monkeypatch.setattr(vc, "synthesize", whole)
+    monkeypatch.setattr(vc, "synthesize_stream", streaming)
+    chat = vc.VoiceChat(_cfg(server, tts_stream=enabled), play=lambda *a: None,
+                        llm=FakeLLM(["Primeira frase longa."]), log=lambda *a: None)
+    chat.respond("oi")
+    assert server.health_requests >= 1
+    assert vc._tts_loading_health(chat.config) == {}
+    assert streaming.call_count == int(enabled and advertised is True)
+    assert whole.call_count == int(not (enabled and advertised is True))
+
+
+@pytest.mark.parametrize("paused_clip", [0, 1])
+def test_stream_pause_resume_restores_echo_intervals(streaming_chat, monkeypatch, paused_clip):
+    clock = [100.0]
+    # Replace only voice_chat's clock so thread/event deadlines still use real time.
+    from types import SimpleNamespace
+    monkeypatch.setattr(vc, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: clock[0]}))
+    monkeypatch.setattr(vc, "synthesize_stream", lambda *a: iter([
+        (np.full(1000, 0.2, np.float32), 1000),
+        (np.full(1000, 0.3, np.float32), 1000)]))
+    spoken = "Primeira frase longa."
+    calls, shown, logs = [], [], []
+    paused = False
+
+    def play(samples, rate, stop):
+        nonlocal paused
+        calls.append(samples.copy())
+        begin = clock[0]
+        # A one-word echo requires coverage throughout the capture, avoiding
+        # a false pass from the two-second room tail of an earlier interval.
+        assert chat.is_echo("Primeira", begin + 0.01, begin + len(samples) / rate)
+        if len(calls) - 1 == paused_clip and not paused:
+            clock[0] += 0.01
+            assert chat.pause()
+            assert stop.is_set()
+            assert all(end <= clock[0] for _, end, _ in chat._spoken)
+            clock[0] += 5  # beyond any echo tail from before the pause
+            assert not chat.is_echo(spoken, clock[0], clock[0] + 0.01)
+            assert chat.resume()
+            paused = True
+        else:
+            clock[0] += len(samples) / rate
+
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=play, log=logs.append, llm=FakeLLM([spoken]))
+    chat.respond("oi", on_reply=lambda *args: shown.append(args))
+    assert paused and len(calls) == 4  # three clips plus the replay
+    np.testing.assert_array_equal(calls[paused_clip], calls[paused_clip + 1])
+    assert len(shown) == 1
+    assert sum(" chunk=" in line for line in logs) == 1
+
+
+def test_stream_trims_only_sentence_edges(streaming_chat, monkeypatch):
+    # Silence at chunk boundaries is an intentional pause, including an
+    # entirely silent middle chunk; only the sentence edges are trimmed.
+    chunks = [np.r_[np.zeros(100), np.full(100, 0.2), np.zeros(100)].astype(np.float32),
+              np.zeros(100, np.float32),
+              np.r_[np.zeros(100), np.full(100, 0.2), np.zeros(100)].astype(np.float32)]
+    monkeypatch.setattr(vc, "synthesize_stream", lambda *a: iter((c, 1000) for c in chunks))
+    played = []
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=lambda samples, *a: played.append(samples),
+                        llm=FakeLLM(["Primeira frase longa."]), log=lambda *a: None)
+    chat.respond("oi")
+    expected = np.concatenate(chunks)[50:-50]
+    np.testing.assert_array_equal(np.concatenate(played), expected)
+
+
+def test_stream_single_chunk_trims_long_final_silence(streaming_chat, monkeypatch):
+    samples = np.r_[np.zeros(100), np.full(200, 0.2), np.zeros(300)].astype(np.float32)
+    monkeypatch.setattr(vc, "synthesize_stream", lambda *a: iter([(samples, 1000)]))
+    played = []
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=lambda samples, *a: played.append(samples),
+                        llm=FakeLLM(["Primeira frase longa."]), log=lambda *a: None)
+    chat.respond("oi")
+    np.testing.assert_array_equal(np.concatenate(played), vc.trim_silence(samples, 1000))
+
+
+def test_stream_trims_final_silence_spanning_chunks_like_whole_wav(streaming_chat, monkeypatch):
+    # XTTS sends its held tail last, so the final silence spans many chunks;
+    # a pause inside the sentence spanning chunks is still played.
+    whole = np.r_[np.full(250, 0.2), np.zeros(300), np.full(250, 0.2),
+                  np.zeros(400)].astype(np.float32)
+    chunks = [whole[i:i + 100] for i in range(0, len(whole), 100)]
+    monkeypatch.setattr(vc, "synthesize_stream", lambda *a: iter((c, 1000) for c in chunks))
+    played = []
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=lambda samples, *a: played.append(samples),
+                        llm=FakeLLM(["Primeira frase longa."]), log=lambda *a: None)
+    chat._synthesis_model.update = MagicMock(wraps=chat._synthesis_model.update)
+    chat.respond("oi")
+    expected = vc.trim_silence(whole, 1000)
+    np.testing.assert_array_equal(np.concatenate(played), expected)
+    assert chat._synthesis_model.update.call_args.args[3] == pytest.approx(len(expected) / 1000)
+
+
+def test_streamed_sentence_counts_once_for_echo(streaming_chat, monkeypatch):
+    # Ten clips of one sentence must not multiply her "não" past the user's.
+    monkeypatch.setattr(vc, "synthesize_stream", lambda *a: iter(
+        [(np.full(100, 0.2, np.float32), 1000)] * 10))
+    heard = []
+
+    def play(samples, rate, stop):
+        now = time.monotonic()
+        heard.append((chat.is_echo("não não não", now, now),
+                      chat.is_echo("não sei a resposta", now, now)))
+
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=play, log=lambda *a: None,
+                        llm=FakeLLM(["Não sei a resposta agora."]))
+    chat.respond("oi")
+    assert len(heard) >= 10
+    assert heard[-1] == (False, True)
+    assert len(chat._spoken) == 1
+
+
+def test_stream_external_stop_closes_inflight_http(streaming_chat, pcm_server):
+    pcm_server.chunks = [b"\x00\x10" * 2400] * 2
+    pcm_server.gate = threading.Event()
+    stop = threading.Event()
+    played = []
+
+    def play(samples, rate, clip_stop):
+        played.append(samples)
+        stop.set()
+
+    chat = vc.VoiceChat(_cfg(pcm_server, tts_timeout_seconds=2), play=play,
+                        llm=FakeLLM(["Primeira frase longa."]), log=lambda *a: None)
+    began = time.monotonic()
+    chat.respond("oi", stop=stop)
+    assert time.monotonic() - began < 1.5
+    assert len(played) == 1 and chat._tts_cancellation.cancelled
+    assert not chat._tts_cancellation._sockets
 
 
 def test_interrupt_drops_the_queued_audio(stream):

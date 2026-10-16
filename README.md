@@ -420,6 +420,7 @@ loaded until the app exits, so switching back is instant.
   "llm_prompt": null,
   "tts_backend": "chatterbox",
   "tts_voice": "debora_v2",
+  "tts_stream": true,
   "tts_url": "http://127.0.0.1:8765",
   "tts_timeout_seconds": 60,
   "tts_server_command": null
@@ -504,6 +505,14 @@ downloads about 1.8 GB to `%LOCALAPPDATA%\tts`. On every start, `coqui-tts`
 also fetches the model's `config.json` from Hugging Face and downloads the
 whole model again if it changed upstream; without network access it keeps the
 local copy.
+
+`tts_stream` (boolean, default `true`) plays XTTS audio as it is generated when
+the server's cached `/health` advertises `stream: true`. Set it to `false` for
+whole-sentence WAV playback. Kokoro, Qwen3, Chatterbox and older servers retain
+WAV playback. Streaming retains the final second for the artifact check above;
+first-audio latency depends on hardware and voice, and ~0.5 s is a target, not
+a measured guarantee. Warm-up and the waiting announcement still use WAV.
+See the [TTS HTTP protocol](docs/TTS-PROTOCOL.md) for framing and cancellation.
 
 For Chatterbox, Qwen and XTTS-v2, `tts_voice` clones a voice from clean speech: a WAV path, or a name
 looked up as `<name>.wav` in the voices folder (see File Paths), then among

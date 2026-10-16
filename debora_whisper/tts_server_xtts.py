@@ -198,19 +198,48 @@ class XttsBackend:
         self.cache[key] = latents  # Reinsert: the least recently used goes first.
         self.latents = latents
 
-    def generate(self, text, language_id):
-        import torch
-        language = xtts_language(language_id)
+    def _inference_args(self, text, language_id):
         gpt_cond_latent, speaker_embedding = self.latents
         spoken = speakable_text(text)
-        out = self.model.inference(spoken, language, gpt_cond_latent,
-                                   speaker_embedding, temperature=TEMPERATURE,
-                                   enable_text_splitting=False)
-        raw = out["wav"].reshape(-1)
+        return (spoken, xtts_language(language_id), gpt_cond_latent, speaker_embedding)
+
+    def _trim_tail(self, raw, spoken):
         samples = raw if pauses_before_last_word(spoken) else trim_trailing_artifact(raw)
         if len(samples) < len(raw):
             server.log(f"Trimmed {(len(raw) - len(samples)) / self.sr:.2f}s of trailing noise")
+        return samples
+
+    def _infer(self, method, args):
+        return method(*args, temperature=TEMPERATURE, enable_text_splitting=False)
+
+    def generate(self, text, language_id):
+        import torch
+        args = self._inference_args(text, language_id)
+        out = self._infer(self.model.inference, args)
+        samples = self._trim_tail(out["wav"].reshape(-1), args[0])
         return torch.as_tensor(samples).reshape(1, -1)
+
+    def generate_stream(self, text, language_id):
+        import numpy as np
+        args = self._inference_args(text, language_id)
+        tail = np.empty(0, dtype=np.float32)
+        retain = int(self.sr * TAIL_SECONDS)
+        # coqui-tts 0.27.5 defaults: stream_chunk_size=20, overlap_wav_len=1024.
+        chunks = self._infer(self.model.inference_stream, args)
+        try:
+            for chunk in chunks:
+                if hasattr(chunk, "cpu"):
+                    chunk = chunk.float().cpu().numpy()
+                tail = np.concatenate((tail, np.asarray(chunk).reshape(-1)))
+                if len(tail) > retain:
+                    yield tail[:-retain]
+                    tail = tail[-retain:]
+            tail = self._trim_tail(tail, args[0])
+            if len(tail):
+                yield tail
+        finally:
+            if hasattr(chunks, "close"):
+                chunks.close()
 
 
 if __name__ == "__main__":

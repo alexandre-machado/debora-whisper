@@ -59,6 +59,8 @@ else:  # uv run --script: sibling modules are available without the app.
 
 MAX_TEXT_CHARS = 1000
 MAX_BODY_BYTES = 64_000
+STREAM_WRITE_TIMEOUT_SECONDS = 5.0
+STREAM_DEADLINE_SECONDS = 120.0
 VOICE_SUFFIXES = (".wav", ".flac", ".mp3", ".ogg")
 # Prepared voices kept in memory (a few MB each on the GPU).
 MAX_CACHED_VOICES = 8
@@ -275,11 +277,15 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                  "precision": getattr(model, "precision", "unknown") if adapter else "unknown"}
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def _reply(self, code, body: bytes, content_type="application/json"):
+            self.close_connection = True
             try:
                 self.send_response(code)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
             except OSError:
@@ -295,9 +301,89 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                 return self._reply(503, json.dumps({"ok": False, "error": error,
                                                    "inventory": inventory}).encode())
             self._reply(200, json.dumps({"ok": True, "sample_rate": model.sr,
+                                        "stream": callable(getattr(model, "generate_stream", None)),
                                         "inventory": inventory}).encode())
 
+        def _stream(self, text, language, start):
+            import numpy as np
+            # Bound both a stalled write and a peer that reads just fast enough
+            # to avoid individual write timeouts while holding the GPU lock.
+            deadline = time.monotonic() + STREAM_DEADLINE_SECONDS
+
+            def bound_write():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SynthesisCancelled()
+                # On Windows, shutdown from another thread may not wake the
+                # select inside sendall; its own timeout must obey the deadline.
+                self.connection.settimeout(min(STREAM_WRITE_TIMEOUT_SECONDS, remaining))
+
+            def shutdown():
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+            timer = threading.Timer(STREAM_DEADLINE_SECONDS, shutdown)
+            timer.daemon = True
+            timer.start()
+            chunks = None
+            total = 0
+            first = None
+            try:
+                bound_write()
+                chunks = model.generate_stream(text, language_id=language)
+                for chunk in chunks:
+                    if time.monotonic() >= deadline:
+                        raise SynthesisCancelled()
+                    check_connection(self.connection)
+                    if hasattr(chunk, "cpu"):
+                        chunk = chunk.float().cpu().numpy()
+                    samples = np.asarray(chunk).reshape(-1)
+                    if not len(samples):
+                        continue
+                    pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+                    bound_write()
+                    if first is None:
+                        first = time.time() - start
+                        self.stream_headers = True
+                        try:
+                            self.send_response(200)
+                            self.send_header("Content-Type", f"audio/L16; rate={model.sr}; channels=1")
+                            self.send_header("X-Sample-Rate", str(model.sr))
+                            self.send_header("Transfer-Encoding", "chunked")
+                            self.send_header("Connection", "close")
+                            self.end_headers()
+                        except OSError as e:
+                            raise SynthesisCancelled() from e
+                    try:
+                        bound_write()
+                        self.wfile.write(f"{len(pcm):X}\r\n".encode() + pcm + b"\r\n")
+                        self.wfile.flush()
+                    except OSError as e:
+                        raise SynthesisCancelled() from e
+                    total += len(samples)
+                if first is None:
+                    raise ValueError("generation returned no audio")
+                bound_write()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (OSError, SynthesisCancelled) as e:
+                shutdown()
+                raise SynthesisCancelled() from e
+            finally:
+                try:
+                    if hasattr(chunks, "close"):
+                        chunks.close()
+                finally:
+                    timer.cancel()
+                    timer.join()
+            log(f"{total / model.sr:.1f}s of audio in {time.time() - start:.1f}s "
+                f"(first chunk {first:.3f}s): {text[:300]!r}")
+
         def do_POST(self):
+            self.close_connection = True
+            self.stream_headers = False
             if self.path != "/tts":
                 return self._error(404, "not found")
             try:
@@ -347,15 +433,25 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                         # Reference encoding also needs cancellation on new voices.
                         if adapter:
                             model.prepare_voice()
-                        wav = model.generate(text, language_id=language)
+                        streaming = (request.get("stream") is True
+                                     and callable(getattr(model, "generate_stream", None)))
+                        if streaming:
+                            self._stream(text, language, start)
+                        else:
+                            wav = model.generate(text, language_id=language)
+                    if streaming:
+                        return
                 except SynthesisCancelled:
-                    log(f"Cancelled synthesis after {time.time() - start:.1f}s (client disconnected)")
+                    log(f"Cancelled synthesis after {time.time() - start:.1f}s "
+                        "(client disconnected or stream timed out)")
                     return
                 except Exception as e:
                     # Chatterbox fails on text too short to speak ("OK").
                     log(f"Failed after {time.time() - start:.1f}s on {text[:300]!r}: "
                         f"{type(e).__name__}: {e}")
-                    return self._error(500, f"generation failed: {e}")
+                    if not self.stream_headers:
+                        self._error(500, f"generation failed: {e}")
+                    return
             samples = wav.squeeze(0).float().cpu().numpy()
             log(f"{len(samples) / model.sr:.1f}s of audio in {time.time() - start:.1f}s: "
                 f"{text[:300]!r}")
