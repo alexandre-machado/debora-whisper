@@ -173,6 +173,92 @@ def test_stream_disconnect_closes_generator(streaming_server, monkeypatch):
     assert any("Cancelled synthesis" in line for line in logs)
 
 
+@pytest.mark.parametrize("limit", ["write", "deadline"])
+def test_stalled_stream_releases_synthesis_lock(streaming_server, monkeypatch, limit):
+    monkeypatch.setattr(server, "STREAM_WRITE_TIMEOUT_SECONDS", 0.2 if limit == "write" else 10)
+    monkeypatch.setattr(server, "STREAM_DEADLINE_SECONDS", 10 if limit == "write" else 0.2)
+    began, closed, cleanup = threading.Event(), threading.Event(), threading.Event()
+
+    def chunks(*args, **kwargs):
+        try:
+            samples = np.ones(512 * 1024, dtype=np.float32)
+            while not cleanup.is_set():
+                began.set()
+                yield samples
+        finally:
+            closed.set()
+
+    srv, _ = streaming_server(chunks)
+    setup = srv.RequestHandlerClass.setup
+
+    def small_buffer(handler):
+        setup(handler)
+        handler.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+
+    monkeypatch.setattr(srv.RequestHandlerClass, "setup", small_buffer)
+    stalled = socket.socket()
+    stalled.settimeout(3)
+    stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    next_request = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=3)
+    try:
+        stalled.connect(("127.0.0.1", srv.server_port))
+        body = b'{"text":"Hello", "stream":true}'
+        stalled.sendall((f"POST /tts HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+                         f"Content-Length: {len(body)}\r\n\r\n").encode() + body)
+        assert began.wait(3)
+        next_request.request("POST", "/tts", '{"text":"Next"}', {"Content-Type": "application/json"})
+        # The first peer remains connected and never reads, even headers.
+        assert closed.wait(3), "stalled socket retained the generator and synthesis lock"
+        reply = next_request.getresponse()
+        assert reply.status == 200 and reply.read().startswith(b"RIFF")
+        # Expiry must close the first connection without a successful chunk terminator.
+        received = bytearray()
+        while data := stalled.recv(65536):
+            received.extend(data)
+        assert received and not received.endswith(b"0\r\n\r\n")
+    finally:
+        cleanup.set()
+        stalled.close()
+        next_request.close()
+
+
+def test_stream_deadline_bounds_continuous_progress(streaming_server, monkeypatch):
+    monkeypatch.setattr(server, "STREAM_WRITE_TIMEOUT_SECONDS", 10)
+    monkeypatch.setattr(server, "STREAM_DEADLINE_SECONDS", 0.3)
+    closed, cleanup = threading.Event(), threading.Event()
+
+    def chunks(*args, **kwargs):
+        try:
+            while not cleanup.is_set():
+                yield np.ones(2400, dtype=np.float32)
+                cleanup.wait(0.02)
+        finally:
+            closed.set()
+
+    srv, _ = streaming_server(chunks)
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=3)
+    reply = None
+    try:
+        began = time.monotonic()
+        conn.request("POST", "/tts", '{"text":"Hello", "stream":true}',
+                     {"Content-Type": "application/json"})
+        reply = conn.getresponse()
+        assert reply.status == 200
+        with pytest.raises(http.client.IncompleteRead) as error:
+            reply.read()  # Keep draining: no individual write should time out.
+        assert error.value.partial
+        assert closed.wait(3)
+        assert time.monotonic() - began < 3
+        conn.request("POST", "/tts", '{"text":"Next"}', {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        assert response.status == 200 and response.read().startswith(b"RIFF")
+    finally:
+        cleanup.set()
+        if reply is not None:
+            reply.close()
+        conn.close()
+
+
 class FakeTensor:
     def __init__(self, values):
         self.values = np.asarray(values)

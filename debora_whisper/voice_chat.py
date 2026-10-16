@@ -739,6 +739,7 @@ def _shutdown_socket(sock):
 
 # Filled by startup checks and background polling, never by telemetry itself.
 _tts_health_cache = {}
+_tts_capabilities_cache = {}  # Ready capabilities outlive loading telemetry/polls.
 _tts_health_cache_lock = threading.Lock()
 _tts_health_polls = {}
 _tts_health_poll_context = threading.local()
@@ -750,10 +751,17 @@ def _cache_tts_health(config, health=None):
         if cancelled is not None and cancelled.is_set():
             return  # An in-flight check must not repopulate the cache after stop.
         url = config.get("tts_url", "").rstrip("/")
-        if health is None:
-            _tts_health_cache.pop(url, None)
-        else:
+        _tts_health_cache.pop(url, None)
+        _tts_capabilities_cache.pop(url, None)
+        if health is not None and health.get("ok") is True:
+            _tts_capabilities_cache[url] = health
+        elif health is not None:
             _tts_health_cache[url] = (time.monotonic(), health)
+
+
+def _tts_capabilities(config):
+    with _tts_health_cache_lock:
+        return _tts_capabilities_cache.get(config.get("tts_url", "").rstrip("/"), {}).copy()
 
 
 def _tts_loading_health(config):
@@ -810,7 +818,7 @@ def tts_server_up(config: dict) -> bool:
 
 
 def _check_tts_health(config: dict) -> str:
-    """Return this request's state and atomically publish loading telemetry.
+    """Return this request's state and publish telemetry or ready capabilities.
 
     Startup callers must use the returned state: another poll may replace the
     shared telemetry as soon as this request publishes it.
@@ -830,11 +838,15 @@ def _check_tts_health(config: dict) -> str:
         timer.start()
         connection.request("GET", urllib.parse.urlunsplit(("", "", target.path, target.query, "")))
         with connection.getresponse() as response:
-            if response.status != 503:
+            status = response.status
+            if status not in (200, 503):
                 _cache_tts_health(config)
-                return "ready" if response.status == 200 else "unavailable"
+                return "unavailable"
             raw = response.read(TTS_HEALTH_MAX_BYTES + 1)
-        health = json.loads(raw) if len(raw) <= TTS_HEALTH_MAX_BYTES else None
+        try:
+            health = json.loads(raw) if len(raw) <= TTS_HEALTH_MAX_BYTES else None
+        except (ValueError, UnicodeError):
+            health = None
     except Exception:
         _cache_tts_health(config)
         return "unavailable"
@@ -843,6 +855,10 @@ def _check_tts_health(config: dict) -> str:
             timer.cancel()
         if connection is not None:
             connection.close()
+    if status == 200:
+        _cache_tts_health(config, {"ok": True, "stream": (
+            isinstance(health, dict) and health.get("stream") is True)})
+        return "ready"
     if (isinstance(health, dict) and health.get("ok") is False
             and isinstance(health.get("error"), str) and health["error"]):
         _cache_tts_health(config)
@@ -968,6 +984,7 @@ def stop_tts_server():
                 cancelled.set()
             _tts_health_polls.clear()
             _tts_health_cache.clear()
+            _tts_capabilities_cache.clear()
         process, _tts_process = _tts_process, None
         _tts_server_key = None
     if process is None:
@@ -1389,17 +1406,19 @@ class VoiceChat:
 
         def playback_started(timing):
             nonlocal first_audio
+            duration = timing["seconds"] if timing.get("streamed") else timing["audio"]
             timing = timing.get("sentence", timing)
             with self._playback:
                 if self._clip_stop.is_set():
                     return
                 self._show_audio(True)
+                # Every clip (including a replay after pause) needs a fresh
+                # capture interval; captions and timing are once per sentence.
+                self._remember_spoken(timing["spoken"], duration)
                 if timing.get("streamed") and "play" in timing:
                     return
                 timing["play"] = time.perf_counter() - started
                 show(timing, audible=True)
-                duration = timing["seconds"] if timing.get("streamed") else timing["audio"]
-                self._remember_spoken(timing["spoken"], duration)
                 if first_audio is None:
                     first_audio = timing["play"]
                 log_timing(timing)
@@ -1601,7 +1620,7 @@ class VoiceChat:
                                     self._playback.notify_all()
                                 try:
                                     if (config.get("tts_stream", True)
-                                            and _tts_loading_health(config).get("stream") is True):
+                                            and _tts_capabilities(config).get("stream") is True):
                                         render_stream(spoken, config, timing)
                                     else:
                                         audio = synthesize(spoken, config)
@@ -1708,8 +1727,7 @@ class VoiceChat:
                             clip_stop = self._clip_stop = PlaybackStop(stop)
                         if stop.is_set():
                             break
-                        on_start = (lambda: self._show_audio(True)) if clip[2].get("continuation") else (
-                            lambda timing=clip[2]: playback_started(timing))
+                        on_start = lambda timing=clip[2]: playback_started(timing)
                         if self._play is None:
                             play(clip[0], clip[1], clip_stop,
                                  continuation=clip[2].get("continuation", False),

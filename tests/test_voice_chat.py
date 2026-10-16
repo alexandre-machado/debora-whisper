@@ -44,9 +44,9 @@ def server():
             if srv.health_error:
                 return self._send(json.dumps({"ok": False, "error": srv.health_error}).encode(),
                                   "application/json", status=503)
-            if self.path != "/health" or srv.health_status != 200:
-                return self.send_error(503)
-            self._send(b'{"ok": true}', "application/json")
+            if self.path != "/health":
+                return self.send_error(404)
+            self._send(srv.health_body, "application/json", status=srv.health_status)
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -70,6 +70,7 @@ def server():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     srv.requests, srv.tts_status, srv.health_status = [], 200, 200
     srv.health_error, srv.health_requests = None, 0
+    srv.health_body = b'{"ok": true}'
     srv.tts_url = f"http://127.0.0.1:{srv.server_port}"
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
@@ -83,6 +84,13 @@ def server():
 def pcm_server():
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            body = b'{"ok": true, "stream": true}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self):
             srv.body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -1162,6 +1170,53 @@ def test_tts_server_up_needs_a_healthy_answer(server):
     assert not vc.tts_server_up(config)
 
 
+def test_ready_capabilities_survive_loading_poll_cleanup(no_tts_process, server):
+    config = _cfg(server)
+    vc._cache_tts_health(config, {"ok": False, "state": "loading", "download": {"done": 1}})
+    server.health_body = b'{"ok": true, "stream": true}'
+    vc._start_tts_health_poll(config)
+    with vc._tts_health_cache_lock:
+        worker = vc._tts_health_polls[server.tts_url][1]
+    worker.join(3)
+    assert not worker.is_alive()
+    assert vc.tts_download_progress(config) is None
+    assert vc._tts_loading_health(config) == {}
+    assert vc._tts_capabilities(config)["stream"] is True
+    assert vc._tts_capabilities({"tts_url": server.tts_url + "/"})["stream"] is True
+    assert vc._tts_capabilities({"tts_url": server.tts_url + "/other"}) == {}
+
+
+@pytest.mark.parametrize("state", ["loading", "unavailable", "error", "wav", "stop"])
+def test_ready_capabilities_invalidated(no_tts_process, server, state):
+    config = _cfg(server)
+    server.health_body = b'{"ok": true, "stream": true}'
+    assert vc.tts_server_up(config)
+    assert vc._tts_capabilities(config)["stream"] is True
+    if state == "stop":
+        vc.stop_tts_server()
+    elif state == "error":
+        server.health_error = "failed startup"
+        with pytest.raises(vc.TTSStartupError):
+            vc.tts_server_up(config)
+    else:
+        server.health_body = b'{"ok": false, "state": "loading"}' if state == "loading" else b'{"ok": true}'
+        server.health_status = {"loading": 503, "unavailable": 500, "wav": 200}[state]
+        assert vc._check_tts_health(config) == {"wav": "ready"}.get(state, state)
+    assert not vc._tts_capabilities(config).get("stream")
+
+
+@pytest.mark.parametrize("body", [b"", b"invalid", b"[]", b'{"stream": "true"}',
+                                  b"x" * (vc.TTS_HEALTH_MAX_BYTES + 1)],
+                         ids=["empty", "invalid", "array", "string-flag", "oversized"])
+def test_invalid_ready_capabilities_fall_back_to_wav(server, body):
+    config = _cfg(server)
+    server.health_body = b'{"ok": true, "stream": true}'
+    assert vc.tts_server_up(config)
+    server.health_body = body
+    assert vc.tts_server_up(config)
+    assert not vc._tts_capabilities(config).get("stream")
+
+
 @pytest.mark.parametrize("status", [200, 503])
 def test_trickling_health_answer_cannot_stall_the_check(status):
     # Each byte arrives before the socket timeout, so only an absolute
@@ -2036,10 +2091,9 @@ def test_stream_continuations_have_no_sentence_gap(stream):
 
 
 @pytest.fixture
-def streaming_chat(monkeypatch):
-    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
-    monkeypatch.setattr(vc, "wait_tts_server", lambda *a: True)
-    monkeypatch.setattr(vc, "_tts_loading_health", lambda config: {"stream": True})
+def streaming_chat(server, monkeypatch):
+    server.health_body = b'{"ok": true, "stream": true}'
+    monkeypatch.setitem(DEFAULT_CONFIG, "tts_url", server.tts_url)
     monkeypatch.setattr(vc, "synthesize", MagicMock(side_effect=AssertionError("whole WAV requested")))
 
 
@@ -2068,7 +2122,9 @@ def test_stream_playback_starts_before_generation_ends(streaming_chat, stream, m
     chat._synthesis_model.update = MagicMock(wraps=chat._synthesis_model.update)
     chat.respond("oi", on_reply=lambda *args: shown.append(args))
     assert requests == ended == ["Primeira frase longa.", "Segunda frase longa."]
-    assert len(shown) == chat._remember_spoken.call_count == 2
+    assert len(shown) == 2
+    assert chat._remember_spoken.call_count == 6  # every clip, including continuations
+    assert sum(call.args[1] for call in chat._remember_spoken.call_args_list) == pytest.approx(0.6)
     assert chat._synthesis_model.update.call_count == 2
     for call in chat._synthesis_model.update.call_args_list:
         assert call.args[2:] == pytest.approx((0.3, 0.3))
@@ -2116,18 +2172,61 @@ def test_stream_failure_or_stop_does_not_replay(streaming_chat, monkeypatch, int
         assert any("Voice chat: TTS failed" in line for line in logs)
 
 
-@pytest.mark.parametrize("enabled,advertised", [(False, True), (True, False), (False, False)])
-def test_stream_requires_config_and_health(streaming_chat, monkeypatch, enabled, advertised):
-    monkeypatch.setattr(vc, "_tts_loading_health", lambda config: {"stream": advertised})
+@pytest.mark.parametrize("enabled,advertised", [
+    (True, True), (False, True), (True, False), (False, False), (True, None), (True, "true")])
+def test_stream_requires_config_and_health(server, monkeypatch, enabled, advertised):
+    server.health_body = json.dumps({"ok": True, "stream": advertised}).encode()
     whole = MagicMock(return_value=(np.full(2400, 0.2, np.float32), 24000))
-    streaming = MagicMock(side_effect=AssertionError("stream requested"))
+    streaming = MagicMock(return_value=iter([(np.full(2400, 0.2, np.float32), 24000)]))
     monkeypatch.setattr(vc, "synthesize", whole)
     monkeypatch.setattr(vc, "synthesize_stream", streaming)
-    chat = vc.VoiceChat({**DEFAULT_CONFIG, "tts_stream": enabled}, play=lambda *a: None,
+    chat = vc.VoiceChat(_cfg(server, tts_stream=enabled), play=lambda *a: None,
                         llm=FakeLLM(["Primeira frase longa."]), log=lambda *a: None)
     chat.respond("oi")
-    whole.assert_called_once()
-    streaming.assert_not_called()
+    assert server.health_requests >= 1
+    assert vc._tts_loading_health(chat.config) == {}
+    assert streaming.call_count == int(enabled and advertised is True)
+    assert whole.call_count == int(not (enabled and advertised is True))
+
+
+@pytest.mark.parametrize("paused_clip", [0, 1])
+def test_stream_pause_resume_restores_echo_intervals(streaming_chat, monkeypatch, paused_clip):
+    clock = [100.0]
+    # Replace only voice_chat's clock so thread/event deadlines still use real time.
+    from types import SimpleNamespace
+    monkeypatch.setattr(vc, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: clock[0]}))
+    monkeypatch.setattr(vc, "synthesize_stream", lambda *a: iter([
+        (np.full(1000, 0.2, np.float32), 1000),
+        (np.full(1000, 0.3, np.float32), 1000)]))
+    spoken = "Primeira frase longa."
+    calls, shown, logs = [], [], []
+    paused = False
+
+    def play(samples, rate, stop):
+        nonlocal paused
+        calls.append(samples.copy())
+        begin = clock[0]
+        # A one-word echo requires coverage throughout the capture, avoiding
+        # a false pass from the two-second room tail of an earlier interval.
+        assert chat.is_echo("Primeira", begin + 0.01, begin + len(samples) / rate)
+        if len(calls) - 1 == paused_clip and not paused:
+            clock[0] += 0.01
+            assert chat.pause()
+            assert stop.is_set()
+            assert all(end <= clock[0] for _, end, _ in chat._spoken)
+            clock[0] += 5  # beyond any echo tail from before the pause
+            assert not chat.is_echo(spoken, clock[0], clock[0] + 0.01)
+            assert chat.resume()
+            paused = True
+        else:
+            clock[0] += len(samples) / rate
+
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=play, log=logs.append, llm=FakeLLM([spoken]))
+    chat.respond("oi", on_reply=lambda *args: shown.append(args))
+    assert paused and len(calls) == 4  # three clips plus the replay
+    np.testing.assert_array_equal(calls[paused_clip], calls[paused_clip + 1])
+    assert len(shown) == 1
+    assert sum(" chunk=" in line for line in logs) == 1
 
 
 def test_stream_trims_only_sentence_edges(streaming_chat, monkeypatch):
