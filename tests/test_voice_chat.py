@@ -2111,10 +2111,8 @@ def test_first_sentence_is_whole_only_when_streaming(server, monkeypatch, enable
     audio = np.full(2400, 0.2, np.float32), 24000
     whole = MagicMock(return_value=audio)
     streaming = MagicMock(side_effect=lambda *a: iter([audio]))
-    decision = MagicMock(wraps=vc._streams_tts)
     monkeypatch.setattr(vc, "synthesize", whole)
     monkeypatch.setattr(vc, "synthesize_stream", streaming)
-    monkeypatch.setattr(vc, "_streams_tts", decision)
     head = "Eu posso explicar isso,"
     tail = " com todos os detalhes necessários."
     following = "Depois seguimos para outro assunto."
@@ -2122,13 +2120,70 @@ def test_first_sentence_is_whole_only_when_streaming(server, monkeypatch, enable
                         llm=FakeLLM([head + " ", tail.lstrip(), " " + following]),
                         log=lambda *a: None)
     chat.respond("oi")
-    decision.assert_called_once_with(chat.config)
     if enabled and advertised:
         assert [call.args[0] for call in streaming.call_args_list] == [head + tail, following]
         whole.assert_not_called()
     else:
         assert [call.args[0] for call in whole.call_args_list] == [head, tail.lstrip(), following]
         streaming.assert_not_called()
+
+
+def test_cold_reply_streams_after_loading_health_becomes_ready(server, no_tts_process, monkeypatch):
+    server.health_status = 503
+    server.health_body = b'{"ok": false, "state": "loading"}'
+    # Control readiness at the render wait, without a competing health poll.
+    monkeypatch.setattr(vc, "_start_tts_health_poll", lambda *a: None)
+    wait = vc.wait_tts_server
+
+    def become_ready(config):
+        assert server.health_requests == 1
+        assert vc._tts_capabilities(config) == {}
+        assert vc._tts_loading_health(config)["state"] == "loading"
+        server.health_body = b'{"ok": true, "stream": true}'
+        server.health_status = 200
+        return wait(config)
+
+    monkeypatch.setattr(vc, "wait_tts_server", become_ready)
+    audio = np.full(2400, 0.2, np.float32), 24000
+    streaming = MagicMock(side_effect=lambda *a: iter([audio]))
+    whole = MagicMock(return_value=audio)
+    monkeypatch.setattr(vc, "synthesize_stream", streaming)
+    monkeypatch.setattr(vc, "synthesize", whole)
+    head = "Eu posso explicar isso,"
+    tail = "com todos os detalhes necessários."
+    following = "Depois seguimos para outro assunto."
+    chat, played = _chat(server, FakeLLM([head + " ", tail, " " + following]), tts_stream=True)
+    assert chat.respond("oi") == f"{head} {tail} {following}"
+    assert server.health_requests == 2
+    assert [call.args[0] for call in streaming.call_args_list] == [head, tail, following]
+    whole.assert_not_called()
+    assert played
+
+
+def test_reply_uses_whole_wav_when_server_loses_streaming(server, monkeypatch):
+    server.health_body = b'{"ok": true, "stream": true}'
+    audio = np.full(2400, 0.2, np.float32), 24000
+
+    def stream_then_restart(text, config):
+        yield audio
+        # A replacement server has completed its health check between sentences.
+        server.health_body = b'{"ok": true, "stream": false}'
+        assert vc._check_tts_health(config) == "ready"
+
+    streaming = MagicMock(side_effect=stream_then_restart)
+    whole = MagicMock(return_value=audio)
+    monkeypatch.setattr(vc, "synthesize_stream", streaming)
+    monkeypatch.setattr(vc, "synthesize", whole)
+    first = "Eu posso explicar isso, com todos os detalhes necessários."
+    following = "Depois seguimos para outro assunto."
+    chat, played = _chat(server, FakeLLM([first + " ", following]), tts_stream=True)
+    assert chat.respond("oi") == f"{first} {following}"
+    assert [call.args[0] for call in streaming.call_args_list] == [first]
+    assert [call.args[0] for call in whole.call_args_list] == [following]
+    # Streaming plays the first chunk and its retained tail separately.
+    assert sum(length for length, rate in played[:-1]) == len(audio[0])
+    assert all(rate == audio[1] for length, rate in played)
+    assert played[-1] == (len(audio[0]), audio[1])
 
 
 def test_stream_playback_starts_before_generation_ends(streaming_chat, stream, monkeypatch):

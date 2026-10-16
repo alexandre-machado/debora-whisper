@@ -1453,6 +1453,8 @@ class VoiceChat:
             self._paused = False
         # Voice chat may have been switched on in Settings since startup.
         ensure_tts_server(self.config, self.log, self.tts_log_path)
+        # Snapshot only for splitting; readiness and capabilities can change
+        # before synthesis (cold startup or a settings-triggered restart).
         streams_tts = _streams_tts(self.config)
         messages = self._messages(text)
         claude = self.config.get("voice_chat_backend", "local") == "claude"
@@ -1644,7 +1646,7 @@ class VoiceChat:
                                     timing["synth_start"] = time.perf_counter() - started
                                     self._playback.notify_all()
                                 try:
-                                    if streams_tts:
+                                    if _streams_tts(config):
                                         render_stream(spoken, config, timing)
                                     else:
                                         audio = synthesize(spoken, config)
