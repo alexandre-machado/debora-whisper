@@ -91,7 +91,7 @@ Issues = "https://github.com/alexandre-machado/debora-whisper/issues"
 path = "debora_whisper/__init__.py"
 
 [tool.hatch.build.targets.sdist]
-include = ["debora_whisper", "tests", "README.md", "pyproject.toml"]
+include = ["debora_whisper", "tests", "scripts/agents", "README.md", "pyproject.toml"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["debora_whisper"]

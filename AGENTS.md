@@ -20,3 +20,15 @@ Débora Whisper (`debora-whisper`, formerly `npu-whisper`) is a local voice-to-t
 - Run focused tests for the affected behavior, then the full suite when appropriate or required. Repeat checks only after relevant changes, failures, or unresolved concerns; avoid redundant builds and test runs.
 - For long-running tests and CI, use completion notifications or reasonably spaced status checks. Keep progress updates useful without repeatedly querying unchanged status.
 - Preserve required validation and correctness. Reduce redundant context and operations rather than skipping necessary investigation or checks.
+
+## Agent Pipeline (Codex implements, Claude Code reviews)
+- Run each task with `python scripts/agents/task.py <name> <branch> --prompt P.md --title T.txt --body B.md --commit-msg M.txt`. It owns the whole loop (Codex implementation, full suite, commit/push/PR, headless `@rev` + `@sec` reviews posted on the PR, Codex fix rounds) and prints a few status lines plus one `RESULT` line. The exit code says what happened; see the script's docstring.
+- Reviews default to Claude Code headless (`claude -p --agent marc:review|marc:security`, no shell, reads only a clean checkout of the commit and the diff file, user settings only). Use `--reviewer codex` only when Claude is unavailable.
+- The full suite runs Codex-written code outside the Codex sandbox, with your rights and your `gh`/git credentials: the `.github` and credential checks only cover what this script commits and pushes, not what that code could do itself. Run it only on tasks you would run by hand.
+- Prompts, outputs and full reports live in the run folder (`../dw-runs` by default). Read a specific file when a result needs it; never paste whole reports into the operator's context.
+- Measure with `python scripts/agents/usage.py` (per task) or `--codex-history <worktree>...` (tasks run before the ledger).
+
+## Tech-Lead Operator Sessions
+- **One session per work item or small batch.** The queue and its state live in the issue/board or the queue file, not in the conversation. Start a new session when the item ships, or once the context passes ~100k tokens: every tool call re-reads the whole context, and a six-day operator session cost more than all the dispatched work.
+- **The operator does not do engineering work.** Code investigation, edits, test runs and log digging go to the Codex task or a specialist; the operator writes specs, reads `RESULT` lines and verdicts, and decides. Do not search old session transcripts from the operator session.
+- **Wait without polling.** Run `task.py` in the background and act on its completion notification. No `sleep`/`tail` loops or cron checks on a running task.
