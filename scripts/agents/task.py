@@ -82,8 +82,9 @@ CLAUDE_AGENT = {"rev": "marc:review", "sec": "marc:security"}
 CLAUDE_REVIEW_DENIED = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
                         "Read(**/.env*)"]
 # Not posted on the PR if the report looks like it quotes a credential.
-SECRET_RE = re.compile(r"gh[opsu]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|pypi-[A-Za-z0-9_-]{20,}"
-                       r"|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|sk-[A-Za-z0-9_-]{20,}")
+# Whole tokens with a digit in them: "task-runner-retry-on-timeout" is not a key.
+SECRET_RE = re.compile(r"(?<![\w-])(?:gh[opsu]_|github_pat_|pypi-|sk-)(?=[\w-]*\d)[\w-]{20,}"
+                       r"|(?<!\w)AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY")
 
 VERDICT_RE = re.compile(
     r"^[\s`*_]*@(rev|sec) verdict:\s*(PASS|ADVISE|BLOCK)\s*;\s*high=(\d+)\s+medium=(\d+)\s+low=(\d+)"

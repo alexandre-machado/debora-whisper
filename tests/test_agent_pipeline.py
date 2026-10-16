@@ -331,6 +331,13 @@ def test_which_ignores_the_current_folder(tmp_path, monkeypatch):
     assert Path(task.which("git")).parent != tmp_path
 
 
+def test_secret_pattern_needs_a_whole_token():
+    assert not task.SECRET_RE.search("see the task-runner-retry-on-timeout branch")
+    assert not task.SECRET_RE.search("ask-for-a-very-long-hyphenated-name-here")
+    assert task.SECRET_RE.search("key sk-ant-api03-" + "Ab1" * 10)
+    assert task.SECRET_RE.search("token=ghp_" + "a1" * 18)
+
+
 def test_unpushed_commits_are_pushed_before_review(tmp_path):
     t = _task(tmp_path, cls=FakeTask).setup([PASS])
     t.commits = 1  # rerun after a failed push: ahead, clean tree
@@ -346,7 +353,7 @@ def test_report_quoting_a_token_is_not_posted(tmp_path, monkeypatch):
     monkeypatch.setattr(t, "checkout_for_review", lambda sha: None)
     monkeypatch.setattr(t, "review_cmd", lambda kind: [])
     monkeypatch.setattr(t, "post_review", lambda pr, v, sha: posted.append(v.kind))
-    leak = "found it: ghp_" + "a" * 36 + "\n"
+    leak = "found it: ghp_" + "a1" * 18 + "\n"
     monkeypatch.setattr(t, "review", lambda kind, sha: task.parse_verdict(
         kind, (leak if kind == "sec" else "") + PASS[kind]))
     rev, sec = t.reviews("1", "abc")
