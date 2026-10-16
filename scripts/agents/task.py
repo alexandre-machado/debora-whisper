@@ -10,7 +10,7 @@ lines and one RESULT line; prompts, outputs and full reviews stay in the run
 folder and on the PR.
 
 Reviewers default to Claude Code headless (`claude -p --agent marc:review` and
-`marc:security`, Read/Grep/Glob only, the diff handed over as a file), which
+`marc:security`, no shell, reading only a clean checkout and the diff), which
 keeps the Codex budget for writing code and keeps the review independent of
 the vendor that wrote it.
 
@@ -73,13 +73,17 @@ REVIEW_FOCUS = {
            "privilege issues",
 }
 CLAUDE_AGENT = {"rev": "marc:review", "sec": "marc:security"}
-# Read-only and no shell: git/rg arguments such as `--output=`, `--ext-diff`
-# or `rg --pre` write files or run programs, so this script writes the diff
-# to a file and the reviewer only reads. This script posts the report.
-CLAUDE_REVIEW_ALLOWED = ["Read", "Grep", "Glob"]
+# No shell: git/rg arguments such as `--output=`, `--ext-diff` or `rg --pre`
+# write files or run programs, so this script writes the diff to a file. No
+# allow rules either: in -p mode Read/Grep/Glob then work only inside the
+# working folders (a clean checkout + the run folder) and anything outside is
+# denied. Only user settings load, so files Codex left in the worktree
+# (CLAUDE.md, .claude/, .mcp.json) can't add hooks or instructions.
 CLAUDE_REVIEW_DENIED = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
-                        "Read(~/.ssh/**)", "Read(~/.codex/**)", "Read(~/.claude/**)",
-                        "Read(~/.config/**)", "Read(**/.env*)"]
+                        "Read(**/.env*)"]
+# Not posted on the PR if the report looks like it quotes a credential.
+SECRET_RE = re.compile(r"gh[opsu]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|pypi-[A-Za-z0-9_-]{20,}"
+                       r"|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|sk-[A-Za-z0-9_-]{20,}")
 
 VERDICT_RE = re.compile(
     r"^[\s`*_]*@(rev|sec) verdict:\s*(PASS|ADVISE|BLOCK)\s*;\s*high=(\d+)\s+medium=(\d+)\s+low=(\d+)"
@@ -134,8 +138,22 @@ def parse_verdict(kind: str, text: str) -> Verdict:
 
 
 def codex_limit_message(text: str) -> str | None:
-    m = LIMIT_RE.search(text or "")
-    return m.group(0) if m else None
+    """Only Codex's own errors count: the log also holds file contents and
+    command output, which may contain the same words."""
+    for line in (text or "").splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            candidate = line  # Codex's own stderr
+        else:
+            if not isinstance(ev, dict) or ev.get("type") not in ("error", "turn.failed"):
+                continue
+            err = ev.get("error")
+            candidate = str(ev.get("message") or (err.get("message") if isinstance(err, dict) else err) or "")
+        m = LIMIT_RE.search(candidate)
+        if m:
+            return m.group(0)
+    return None
 
 
 def codex_usage(events_text: str) -> dict:
@@ -335,7 +353,7 @@ class Task:
         self.file("tests.txt").write_text("\n".join(failures + [summary]) + "\n", encoding="utf-8")
         return failed == 0, summary
 
-    def commit_and_push(self, message: str) -> None:
+    def commit(self, message: str) -> None:
         self.git("add", "-A", "--", *[p for p in self.add_paths if (self.worktree / p).exists()])
         # unstaged or untracked: the index column is " " or "?"
         left = [l[3:] for l in self.git("status", "--porcelain").splitlines() if l[:1] in " ?"]
@@ -347,6 +365,10 @@ class Task:
         msg_file = self.file("commit.txt")
         msg_file.write_text(message, encoding="utf-8")
         self.git("commit", "-q", "-F", str(msg_file))
+
+    def push(self) -> None:
+        """Every round, not only after a commit: a rerun after a failed push
+        must not review (or pass) a HEAD that isn't on GitHub."""
         self.git("push", "-q", "-u", "origin", f"HEAD:refs/heads/{self.branch}")
 
     def ensure_pr(self) -> str:
@@ -382,14 +404,29 @@ class Task:
             f"line: `@{kind} verdict: <PASS|ADVISE|BLOCK>; high=<n> medium=<n> low=<n>`."
         )
 
+    @property
+    def review_dir(self) -> Path:
+        return self.run_dir / f"{self.name}-review"
+
+    def checkout_for_review(self, sha: str) -> None:
+        """A clean detached checkout of the commit: untracked files Codex left
+        in the worktree are invisible on the PR, so the reviewer never sees them."""
+        self.drop_review_checkout()
+        self.git("worktree", "add", "-q", "--detach", str(self.review_dir), sha)
+
+    def drop_review_checkout(self) -> None:
+        if self.review_dir.exists():
+            self.git("worktree", "remove", "--force", str(self.review_dir), check=False)
+            shutil.rmtree(self.review_dir, ignore_errors=True)
+        self.git("worktree", "prune", check=False)
+
     def review_cmd(self, kind: str) -> list[str]:
         if self.reviewer == "claude":
             return [which("claude"), "-p", "--agent", CLAUDE_AGENT[kind], "--output-format", "json",
-                    "--permission-mode", "default", "--add-dir", str(self.run_dir),
-                    "--allowedTools", *CLAUDE_REVIEW_ALLOWED,
-                    "--disallowedTools", *CLAUDE_REVIEW_DENIED]
+                    "--permission-mode", "default", "--setting-sources", "user",
+                    "--add-dir", str(self.run_dir), "--disallowedTools", *CLAUDE_REVIEW_DENIED]
         return [which("codex"), "exec", "--json", "-c", "model_reasoning_effort=medium",
-                "--sandbox", "read-only", "-C", str(self.worktree),
+                "--sandbox", "read-only", "-C", str(self.review_dir),
                 "-o", str(self.file(f"review-{kind}.out")), "-"]
 
     def review(self, kind: str, sha: str) -> Verdict:
@@ -400,7 +437,7 @@ class Task:
         cmd = self.review_cmd(kind)
         if self.reviewer == "claude":
             try:
-                r = subprocess.run(cmd, input=prompt, cwd=self.worktree, capture_output=True,
+                r = subprocess.run(cmd, input=prompt, cwd=self.review_dir, capture_output=True,
                                    text=True, encoding="utf-8", errors="replace",
                                    timeout=AGENT_TIMEOUT)
             except subprocess.TimeoutExpired:
@@ -456,6 +493,7 @@ class Task:
         self.write_diff()
         for kind in ("rev", "sec"):
             self.review_cmd(kind)  # a missing CLI fails here, before the threads
+        self.checkout_for_review(sha)
 
         def run(kind: str) -> None:
             try:
@@ -470,10 +508,13 @@ class Task:
             t.start()
         for t in threads:
             t.join()
+        self.drop_review_checkout()
         verdicts = [results.get(k) or Verdict(kind=k, error="review thread died")
                     for k in ("rev", "sec")]
         for v in verdicts:
-            if v.report or v.ok:
+            if SECRET_RE.search(v.report):
+                v.ok, v.error = False, "report looks like it quotes a credential; not posted"
+            elif v.report or v.ok:
                 self.post_review(pr, v, sha)
         return verdicts
 
@@ -527,7 +568,7 @@ class Task:
                         first_commit = False
                     else:
                         message = self.fix_commit_message(fix_summary)
-                    self.commit_and_push(message)
+                    self.commit(message)
                 if not self.ahead():
                     self.say("no commits ahead of origin/main")
                     return self.finish(EXIT_NO_CHANGES, pr, sha, verdicts)
@@ -536,6 +577,7 @@ class Task:
                     self.say("codex fix changed nothing; not re-reviewing the same commit")
                     return self.finish(EXIT_FINDINGS, pr, sha, verdicts)
                 reviewed_sha = sha
+                self.push()
                 pr = self.ensure_pr()
                 self.say(f"PR #{pr} at {sha}; reviewing ({self.reviewer})")
                 verdicts = self.reviews(pr, sha)

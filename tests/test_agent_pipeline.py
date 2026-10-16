@@ -67,6 +67,13 @@ def test_codex_limit_detected_in_json_events():
     assert task.codex_limit_message('{"type":"turn.completed"}') is None
 
 
+def test_limit_words_in_command_output_are_not_a_limit():
+    item = {"type": "item.completed", "item": {"type": "command_execution",
+            "aggregated_output": 'LIMIT_RE = re.compile(r"try again at ...")'}}
+    assert task.codex_limit_message(json.dumps(item)) is None
+    assert task.codex_limit_message(json.dumps({"type": "error", "message": "try again at 3 PM."}))
+
+
 def test_codex_usage_sums_turns():
     events = "\n".join([
         '{"type":"thread.started","thread_id":"abc"}',
@@ -112,11 +119,13 @@ def test_claude_reviewer_is_headless_and_read_only(tmp_path, monkeypatch):
     cmd, kw = calls[0]
     assert v.clean and v.verdict == "PASS"
     assert cmd[:4] == ["claude", "-p", "--agent", "marc:security"]
-    allowed = cmd[cmd.index("--allowedTools") + 1:cmd.index("--disallowedTools")]
     denied = cmd[cmd.index("--disallowedTools") + 1:]
-    assert set(allowed) == {"Read", "Grep", "Glob"}  # no shell: git/rg flags can write or exec
-    assert {"Bash", "Edit", "Write", "Read(~/.ssh/**)"} <= set(denied)
+    # no allow rules: reads outside the working folders are denied in -p mode
+    assert "--allowedTools" not in cmd
+    assert {"Bash", "Edit", "Write"} <= set(denied)  # no shell: git/rg flags can write or exec
     assert cmd[cmd.index("--permission-mode") + 1] == "default"
+    assert cmd[cmd.index("--setting-sources") + 1] == "user"  # ignore worktree .claude/
+    assert kw["cwd"] == t.review_dir
     assert "--dangerously-skip-permissions" not in cmd
     assert "abc123" in kw["input"] and "abc123" not in " ".join(cmd)  # prompt on stdin
     ledger = [json.loads(l) for l in (t.run_dir / "usage.jsonl").read_text().splitlines()]
@@ -133,7 +142,7 @@ class FakeTask(task.Task):
         self.fix_changes = fix_changes
         self.impl_limit = impl_limit
         self.codex_steps, self.reviewed = [], []
-        self.commits, self.changed = 0, False
+        self.commits, self.changed, self.pushes = 0, False, 0
         return self
 
     def ensure_worktree(self):
@@ -160,9 +169,12 @@ class FakeTask(task.Task):
     def run_suite(self):
         return True, "10 passed"
 
-    def commit_and_push(self, message):
+    def commit(self, message):
         self.commits += 1
         self.changed = False
+
+    def push(self):
+        self.pushes += 1
 
     def ensure_pr(self):
         return "77"
@@ -225,7 +237,7 @@ def test_codex_limit_exits_2(tmp_path):
 
 def test_git_failure_reports_exit_6_with_result_line(tmp_path):
     class PushFails(FakeTask):
-        def commit_and_push(self, message):
+        def push(self):
             raise task.TaskError("git push failed: rejected")
 
     t = _task(tmp_path, cls=PushFails).setup([PASS])
@@ -239,6 +251,8 @@ def test_git_failure_reports_exit_6_with_result_line(tmp_path):
 def test_a_crashing_review_thread_is_a_reviewer_failure(tmp_path, monkeypatch):
     t = _task(tmp_path)
     monkeypatch.setattr(t, "write_diff", lambda: None)
+    monkeypatch.setattr(t, "checkout_for_review", lambda sha: None)
+    monkeypatch.setattr(t, "drop_review_checkout", lambda: None)
     monkeypatch.setattr(t, "review_cmd", lambda kind: [])
     monkeypatch.setattr(t, "post_review", lambda *a: None)
 
@@ -315,6 +329,28 @@ def test_which_ignores_the_current_folder(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PATH", os.pathsep.join([".", "", os.environ["PATH"]]))
     assert Path(task.which("git")).parent != tmp_path
+
+
+def test_unpushed_commits_are_pushed_before_review(tmp_path):
+    t = _task(tmp_path, cls=FakeTask).setup([PASS])
+    t.commits = 1  # rerun after a failed push: ahead, clean tree
+    assert t.run() == task.EXIT_OK
+    assert t.pushes == 1 and t.codex_steps == []
+
+
+def test_report_quoting_a_token_is_not_posted(tmp_path, monkeypatch):
+    t = _task(tmp_path)
+    posted = []
+    for name in ("write_diff", "drop_review_checkout"):
+        monkeypatch.setattr(t, name, lambda: None)
+    monkeypatch.setattr(t, "checkout_for_review", lambda sha: None)
+    monkeypatch.setattr(t, "review_cmd", lambda kind: [])
+    monkeypatch.setattr(t, "post_review", lambda pr, v, sha: posted.append(v.kind))
+    leak = "found it: ghp_" + "a" * 36 + "\n"
+    monkeypatch.setattr(t, "review", lambda kind, sha: task.parse_verdict(
+        kind, (leak if kind == "sec" else "") + PASS[kind]))
+    rev, sec = t.reviews("1", "abc")
+    assert posted == ["rev"] and not sec.ok and "credential" in sec.error
 
 
 # ---- suite runner ----------------------------------------------------------
