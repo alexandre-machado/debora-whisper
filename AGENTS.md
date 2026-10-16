@@ -24,7 +24,7 @@ Débora Whisper (`debora-whisper`, formerly `npu-whisper`) is a local voice-to-t
 ## Agent Pipeline (Codex implements, Claude Code reviews)
 - Run each task with `python scripts/agents/task.py <name> <branch> --prompt P.md --title T.txt --body B.md --commit-msg M.txt`. It owns the whole loop (Codex implementation, full suite, commit/push/PR, headless `@rev` + `@sec` reviews posted on the PR, Codex fix rounds) and prints a few status lines plus one `RESULT` line. The exit code says what happened; see the script's docstring.
 - Reviews default to Claude Code headless (`claude -p --agent marc:review|marc:security`, no shell, reads only a clean checkout of the commit and the diff file, user settings only). Use `--reviewer codex` only when Claude is unavailable.
-- The full suite runs Codex-written code outside the Codex sandbox, with your rights. The script never commits `.github`; workflow changes go through a normal PR.
+- The full suite runs Codex-written code outside the Codex sandbox, with your rights and your `gh`/git credentials: the `.github` and credential checks only cover what this script commits and pushes, not what that code could do itself. Run it only on tasks you would run by hand.
 - Prompts, outputs and full reports live in the run folder (`../dw-runs` by default). Read a specific file when a result needs it; never paste whole reports into the operator's context.
 - Measure with `python scripts/agents/usage.py` (per task) or `--codex-history <worktree>...` (tasks run before the ledger).
 

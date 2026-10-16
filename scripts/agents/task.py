@@ -80,7 +80,7 @@ CLAUDE_AGENT = {"rev": "marc:review", "sec": "marc:security"}
 # denied. Only user settings load, so files Codex left in the worktree
 # (CLAUDE.md, .claude/, .mcp.json) can't add hooks or instructions.
 CLAUDE_REVIEW_DENIED = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
-                        "Read(**/.env*)"]
+                        "Skill", "Task", "Agent", "Read(**/.env*)"]
 # Not posted on the PR if the report looks like it quotes a credential.
 # Whole tokens with a digit in them: "task-runner-retry-on-timeout" is not a key.
 SECRET_RE = re.compile(r"(?<![\w-])(?:gh[opsu]_|github_pat_|pypi-|sk-)(?=[\w-]*\d)[\w-]{20,}"
@@ -215,6 +215,38 @@ def which(name: str) -> str:
     raise TaskError(f"{name} not found on PATH")
 
 
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the process and everything it started: an npm .cmd shim or a test
+    that spawns a server would otherwise outlive the timeout."""
+    if os.name == "nt":
+        taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+        subprocess.run([taskkill, "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        try:
+            os.killpg(proc.pid, 9)
+        except OSError:
+            proc.kill()
+
+
+def run_to_file(cmd: list[str], *, stdin: Path | None, out: Path, err: Path | None = None,
+                cwd: Path | None = None, timeout: int, **kw) -> int | str:
+    """Run with output in files (no pipes a grandchild could hold open) and a
+    timeout that kills the whole tree. Returns the exit code or "timeout"."""
+    if os.name != "nt":
+        kw.setdefault("start_new_session", True)
+    with open(stdin if stdin else os.devnull, encoding="utf-8") as fin, \
+            open(out, "w", encoding="utf-8") as fout, \
+            open(err if err else os.devnull, "w", encoding="utf-8") as ferr:
+        proc = subprocess.Popen(cmd, stdin=fin, stdout=fout,
+                                stderr=ferr if err else subprocess.STDOUT, cwd=cwd, **kw)
+        try:
+            return proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            proc.wait()
+            return "timeout"
+
+
 def lower_priority_kwargs() -> dict:
     """Child processes (and theirs) inherit the priority: the full suite
     otherwise makes typing lag across Windows."""
@@ -254,7 +286,9 @@ class Task:
             f.write(json.dumps(entry) + "\n")
 
     def git(self, *args: str, cwd: Path | None = None, check: bool = True) -> str:
-        r = subprocess.run([which("git"), *args], cwd=cwd or self.worktree, capture_output=True,
+        # Test code runs unsandboxed and could set core.fsmonitor/hooksPath in .git/config.
+        safe = ["-c", "core.fsmonitor=false", "-c", f"core.hooksPath={self.run_dir / 'no-hooks'}"]
+        r = subprocess.run([which("git"), *safe, *args], cwd=cwd or self.worktree, capture_output=True,
                            text=True, encoding="utf-8", errors="replace")
         if check and r.returncode:
             raise TaskError(f"git {' '.join(args[:2])} failed: {r.stderr.strip()[-300:]}")
@@ -307,17 +341,12 @@ class Task:
                                encoding="utf-8")
         out, log = self.file(f"{step}.out"), self.file(f"{step}.log")
         out.unlink(missing_ok=True)  # never read a previous round's message
+        head = self.git("rev-parse", "HEAD")
         started = time.monotonic()
-        code: int | str
-        with open(prompt_file, encoding="utf-8") as stdin, open(log, "w", encoding="utf-8") as lf:
-            try:
-                code = subprocess.run([which("codex"), "exec", "--json", "-c",
-                                       f"model_reasoning_effort={effort}", "--sandbox",
-                                       "workspace-write", "-C", str(self.worktree), "-o", str(out),
-                                       "-"], stdin=stdin, stdout=lf, stderr=subprocess.STDOUT,
-                                      timeout=AGENT_TIMEOUT).returncode
-            except subprocess.TimeoutExpired:
-                code = "timeout"
+        code = run_to_file([which("codex"), "exec", "--json", "-c",
+                            f"model_reasoning_effort={effort}", "--sandbox", "workspace-write",
+                            "-C", str(self.worktree), "-o", str(out), "-"],
+                           stdin=prompt_file, out=log, timeout=AGENT_TIMEOUT)
         text = log.read_text(encoding="utf-8", errors="replace")
         self.record({"step": step, "harness": "codex", "effort": effort,
                      "seconds": round(time.monotonic() - started), "exit": code,
@@ -327,6 +356,9 @@ class Task:
             raise CodexLimit(limit)
         if code != 0:
             raise TaskError(f"codex {step} exit {code}: {text.strip()[-200:]}")
+        if self.git("rev-parse", "HEAD") != head:
+            # its commit would skip the suite (the tree is clean afterwards)
+            raise TaskError(f"codex {step} committed although told not to; reset or review by hand")
         return out.read_text(encoding="utf-8", errors="replace") if out.exists() else ""
 
     def clean_scratch(self) -> None:
@@ -343,17 +375,16 @@ class Task:
         passed = failed = 0
         failures: list[str] = []
         for test in sorted((self.worktree / "tests").glob("test_*.py")):
-            try:
-                r = subprocess.run([self.python, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-                                    f"tests/{test.name}", "--basetemp", str(base / test.stem)],
-                                   cwd=self.worktree, capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace", timeout=TEST_FILE_TIMEOUT,
-                                   **lower_priority_kwargs())
-            except subprocess.TimeoutExpired:
+            log = base / f"{test.stem}.log"
+            code = run_to_file([self.python, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                                f"tests/{test.name}", "--basetemp", str(base / test.stem)],
+                               stdin=None, out=log, cwd=self.worktree, timeout=TEST_FILE_TIMEOUT,
+                               **lower_priority_kwargs())
+            if code == "timeout":
                 failed += 1
                 failures.append(f"ERROR tests/{test.name} (timeout {TEST_FILE_TIMEOUT}s)")
                 continue
-            text = r.stdout + r.stderr
+            text = log.read_text(encoding="utf-8", errors="replace")
             # pytest's last line, e.g. "1 failed, 2 passed in 0.1s"; tracebacks may
             # contain the same words, so only that line counts
             lines = [l for l in text.splitlines() if re.search(r" in [\d.]+s", l)]
@@ -361,10 +392,10 @@ class Task:
             m = re.search(r"(\d+) passed", last)
             passed += int(m.group(1)) if m else 0
             bad = sum(int(n) for n in re.findall(r"(\d+) (?:failed|errors?)\b", last))
-            if r.returncode not in (0, 5):  # 5 = no tests collected
+            if code not in (0, 5):  # 5 = no tests collected
                 failed += bad or 1
                 if not bad:
-                    failures.append(f"ERROR tests/{test.name} (exit {r.returncode})")
+                    failures.append(f"ERROR tests/{test.name} (exit {code})")
             failures += [l for l in text.splitlines() if l.startswith(("FAILED ", "ERROR "))]
         summary = f"{failed} failed, {passed} passed" if failed else f"{passed} passed"
         self.file("tests.txt").write_text("\n".join(failures + [summary]) + "\n", encoding="utf-8")
@@ -474,8 +505,14 @@ class Task:
         if self.reviewer == "claude":
             return [which("claude"), "-p", "--agent", CLAUDE_AGENT[kind], "--output-format", "json",
                     "--permission-mode", "default", "--setting-sources", "user",
-                    "--add-dir", str(self.review_input), "--disallowedTools", *CLAUDE_REVIEW_DENIED]
+                    "--add-dir", str(self.review_input),
+                    # no MCP servers: their read tools could pull private data into a public report
+                    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                    "--disallowedTools", *CLAUDE_REVIEW_DENIED]
+        # project_doc_max_bytes=0: the reviewed branch's AGENTS.md was written by
+        # the implementer and must not instruct its reviewer
         return [which("codex"), "exec", "--json", "-c", "model_reasoning_effort=medium",
+                "-c", "project_doc_max_bytes=0",
                 "--sandbox", "read-only", "-C", str(self.review_dir),
                 "-o", str(self.file(f"review-{kind}.out")), "-"]
 
@@ -485,20 +522,21 @@ class Task:
         self.file(f"{step}.prompt").write_text(prompt, encoding="utf-8")
         started = time.monotonic()
         cmd = self.review_cmd(kind)
+        prompt_file = self.file(f"{step}.prompt")
         if self.reviewer == "claude":
-            try:
-                r = subprocess.run(cmd, input=prompt, cwd=self.review_dir, capture_output=True,
-                                   text=True, encoding="utf-8", errors="replace",
-                                   timeout=AGENT_TIMEOUT)
-            except subprocess.TimeoutExpired:
+            out = self.file(f"{step}.json")
+            code = run_to_file(cmd, stdin=prompt_file, out=out, err=self.file(f"{step}.log"),
+                               cwd=self.review_dir, timeout=AGENT_TIMEOUT)
+            if code == "timeout":
                 return Verdict(kind=kind, error=f"claude timeout {AGENT_TIMEOUT}s")
-            self.file(f"{step}.log").write_text(r.stdout + r.stderr, encoding="utf-8")
             try:
-                result = json.loads(r.stdout)
+                result = json.loads(out.read_text(encoding="utf-8", errors="replace"))
             except ValueError:
-                return Verdict(kind=kind, error=f"claude exit {r.returncode}, no JSON")
+                return Verdict(kind=kind, error=f"claude exit {code}, no JSON")
+            if not isinstance(result, dict):
+                return Verdict(kind=kind, error=f"claude exit {code}, unexpected JSON")
             self.record({"step": step, "harness": "claude", "agent": CLAUDE_AGENT[kind],
-                         "seconds": round(time.monotonic() - started), "exit": r.returncode,
+                         "seconds": round(time.monotonic() - started), "exit": code,
                          **claude_usage(result)})
             text = result.get("result") or ""
             if result.get("is_error"):
@@ -508,13 +546,9 @@ class Task:
         else:
             out, log = self.file(f"{step}.out"), self.file(f"{step}.log")
             out.unlink(missing_ok=True)  # a crash must not leave the last round's verdict
-            with open(log, "w", encoding="utf-8") as lf:
-                try:
-                    code = subprocess.run(cmd, input=prompt, stdout=lf, stderr=subprocess.STDOUT,
-                                          text=True, encoding="utf-8",
-                                          timeout=AGENT_TIMEOUT).returncode
-                except subprocess.TimeoutExpired:
-                    return Verdict(kind=kind, error=f"codex timeout {AGENT_TIMEOUT}s")
+            code = run_to_file(cmd, stdin=prompt_file, out=log, timeout=AGENT_TIMEOUT)
+            if code == "timeout":
+                return Verdict(kind=kind, error=f"codex timeout {AGENT_TIMEOUT}s")
             logtext = log.read_text(encoding="utf-8", errors="replace")
             self.record({"step": step, "harness": "codex", "effort": "medium",
                          "seconds": round(time.monotonic() - started), "exit": code,

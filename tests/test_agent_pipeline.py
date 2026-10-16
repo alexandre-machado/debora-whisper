@@ -101,18 +101,15 @@ def _task(tmp_path, cls=None, **kw):
 def test_claude_reviewer_is_headless_and_read_only(tmp_path, monkeypatch):
     calls = []
 
-    class Done:
-        returncode = 0
-        stderr = ""
-        stdout = json.dumps({"result": "## @sec review\n@sec verdict: PASS; high=0 medium=0 low=0",
-                             "usage": {"cache_read_input_tokens": 10, "output_tokens": 3},
-                             "num_turns": 2, "total_cost_usd": 0.01, "is_error": False})
-
     def fake_run(cmd, **kw):
         calls.append((cmd, kw))
-        return Done()
+        kw["out"].write_text(json.dumps({
+            "result": "## @sec review\n@sec verdict: PASS; high=0 medium=0 low=0",
+            "usage": {"cache_read_input_tokens": 10, "output_tokens": 3},
+            "num_turns": 2, "total_cost_usd": 0.01, "is_error": False}))
+        return 0
 
-    monkeypatch.setattr(task.subprocess, "run", fake_run)
+    monkeypatch.setattr(task, "run_to_file", fake_run)
     monkeypatch.setattr(task, "which", lambda name: name)
     t = _task(tmp_path)
     v = t.review("sec", "abc123")
@@ -127,7 +124,8 @@ def test_claude_reviewer_is_headless_and_read_only(tmp_path, monkeypatch):
     assert cmd[cmd.index("--setting-sources") + 1] == "user"  # ignore worktree .claude/
     assert kw["cwd"] == t.review_dir
     assert "--dangerously-skip-permissions" not in cmd
-    assert "abc123" in kw["input"] and "abc123" not in " ".join(cmd)  # prompt on stdin
+    assert "abc123" in kw["stdin"].read_text() and "abc123" not in " ".join(cmd)  # prompt on stdin
+    assert "--strict-mcp-config" in cmd and {"Skill", "Task", "Agent"} <= set(denied)
     ledger = [json.loads(l) for l in (t.run_dir / "usage.jsonl").read_text().splitlines()]
     assert ledger[0]["harness"] == "claude" and ledger[0]["cache_read_input_tokens"] == 10
 
@@ -267,18 +265,49 @@ def test_a_crashing_review_thread_is_a_reviewer_failure(tmp_path, monkeypatch):
 
 
 def test_codex_crash_is_an_error_not_no_changes(tmp_path, monkeypatch):
-    class Crashed:
-        returncode = 1
+    def fake_run(cmd, **kw):
+        kw["out"].write_text('{"type":"error","message":"stream disconnected"}\n')
+        return 1
 
-    def fake_run(cmd, stdout=None, **kw):
-        stdout.write('{"type":"error","message":"stream disconnected"}\n')
-        return Crashed()
-
-    monkeypatch.setattr(task.subprocess, "run", fake_run)
+    monkeypatch.setattr(task, "run_to_file", fake_run)
     monkeypatch.setattr(task, "which", lambda name: name)
     t = _task(tmp_path)
+    monkeypatch.setattr(t, "git", lambda *a, **kw: "sha1")
     with pytest.raises(task.TaskError, match="exit 1"):
         t.codex("low", "x", "impl")
+
+
+def test_a_codex_commit_is_refused(tmp_path, monkeypatch):
+    def fake_run(cmd, **kw):
+        kw["out"].write_text("")
+        heads.pop(0)
+        return 0
+
+    heads = ["before", "after"]
+    monkeypatch.setattr(task, "run_to_file", fake_run)
+    monkeypatch.setattr(task, "which", lambda name: name)
+    t = _task(tmp_path)
+    monkeypatch.setattr(t, "git", lambda *a, **kw: heads[0])
+    with pytest.raises(task.TaskError, match="committed"):
+        t.codex("low", "x", "fix-1")
+
+
+def test_timeout_kills_the_whole_process_tree(tmp_path):
+    # the child starts a grandchild that would keep running (and keep pipes open)
+    child = tmp_path / "child.py"
+    child.write_text("import subprocess, sys, time\n"
+                     "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                     "time.sleep(60)\n")
+    started = task.time.monotonic()
+    code = task.run_to_file([sys.executable, str(child)], stdin=None, out=tmp_path / "o.log",
+                            timeout=2)
+    assert code == "timeout" and task.time.monotonic() - started < 30
+
+
+def test_codex_reviewer_ignores_the_branch_agents_md(tmp_path, monkeypatch):
+    monkeypatch.setattr(task, "which", lambda name: name)
+    cmd = _task(tmp_path, reviewer="codex").review_cmd("sec")
+    assert "project_doc_max_bytes=0" in cmd
 
 
 @pytest.mark.parametrize("argv", [["demo", "--force"], ["demo", "a/../b"], ["demo"], ["a b", "x"]])
@@ -311,10 +340,7 @@ def test_unexpected_error_still_prints_result(tmp_path):
 
 
 def test_codex_reviewer_crash_never_reuses_an_old_report(tmp_path, monkeypatch):
-    class Crashed:
-        returncode = 1
-
-    monkeypatch.setattr(task.subprocess, "run", lambda cmd, **kw: Crashed())
+    monkeypatch.setattr(task, "run_to_file", lambda cmd, **kw: kw["out"].write_text("") and 1 or 1)
     monkeypatch.setattr(task, "which", lambda name: name)
     t = _task(tmp_path, reviewer="codex")
     t.file("review-rev.out").write_text(PASS["rev"])  # previous round
