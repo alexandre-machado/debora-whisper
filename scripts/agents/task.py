@@ -423,7 +423,7 @@ class Task:
         bad = [n for n in names if not self.allowed_path(n)]
         if bad:
             raise TaskError(f"branch touches paths this script never commits: {' '.join(bad)[:300]}")
-        diff = self.git("diff", "--no-ext-diff", "--no-textconv", "origin/main...HEAD")
+        diff = self.git("diff", "--text", "--no-ext-diff", "--no-textconv", "origin/main...HEAD")
         added = "\n".join(l for l in diff.splitlines() if l.startswith("+"))
         m = SECRET_RE.search(added)
         if m:
@@ -465,7 +465,7 @@ class Task:
     def write_diff(self) -> Path:
         self.review_input.mkdir(parents=True, exist_ok=True)
         diff = self.review_input / "review.diff"
-        diff.write_text(self.git("diff", "--no-ext-diff", "--no-textconv", "origin/main...HEAD"),
+        diff.write_text(self.git("diff", "--text", "--no-ext-diff", "--no-textconv", "origin/main...HEAD"),
                         encoding="utf-8")
         return diff
 
@@ -730,6 +730,15 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
     wt_root = a.worktree_root or Path(os.environ.get("AGENT_WORKTREE_ROOT", repo.parent / "dw-wt"))
     run_dir = a.run_dir or Path(os.environ.get("AGENT_RUN_DIR", repo.parent / "dw-runs"))
+    # Absolute, and checked now: git/gh run in the worktree, and a missing body
+    # file would otherwise only fail after the push.
+    for opt in ("prompt", "body", "commit_msg", "fix"):
+        value = getattr(a, opt)
+        if value is not None:
+            if not value.is_file():
+                print(f"--{opt.replace('_', '-')} {value}: no such file", file=sys.stderr)
+                return EXIT_ERROR
+            setattr(a, opt, value.resolve())
     task = Task(name=a.name, branch=a.branch, prompt=a.prompt, title=read_text_arg(a.title),
                 body=a.body, commit_msg=a.commit_msg, worktree=wt_root / a.name, run_dir=run_dir,
                 repo=repo, python=a.python or default_python(repo), reviewer=a.reviewer,

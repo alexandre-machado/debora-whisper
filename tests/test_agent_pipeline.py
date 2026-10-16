@@ -447,6 +447,19 @@ def test_branch_with_workflow_or_secret_is_not_pushed(tmp_path):
         t.check_branch()
 
 
+def test_gitattributes_cannot_hide_a_secret_as_binary(tmp_path):
+    t, git = _repo(tmp_path)
+    (tmp_path / "tests" / ".gitattributes").write_text("*.py binary\n")
+    (tmp_path / "tests" / "test_a.py").write_text("TOKEN = 'ghp_" + "c3" * 18 + "'\n")
+    _commit_all(git, "tests")
+    with pytest.raises(task.TaskError, match="credential"):
+        t.check_branch()
+
+
+def test_missing_option_file_fails_before_any_work(tmp_path):
+    assert task.main(["demo", "feat/demo", "--body", str(tmp_path / "nope.md")]) == task.EXIT_ERROR
+
+
 def test_existing_worktree_on_another_branch_is_refused(tmp_path, monkeypatch):
     t, git = _repo(tmp_path)
     monkeypatch.setattr(t, "git", lambda *a, cwd=None, check=True:
