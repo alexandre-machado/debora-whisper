@@ -45,6 +45,16 @@ def test_missing_verdict_is_never_clean():
     assert not v.ok and not v.clean
 
 
+def test_block_is_never_clean():
+    # @rev has a "critical" severity the counters have no slot for
+    assert not task.parse_verdict("rev", "@rev verdict: BLOCK; high=0 medium=0 low=0").clean
+
+
+def test_verdict_line_may_be_quoted_or_bold():
+    assert task.parse_verdict("rev", "`@rev verdict: PASS; high=0 medium=0 low=2`").clean
+    assert task.parse_verdict("sec", "**@sec verdict: PASS; high=0 medium=0 low=0**").clean
+
+
 def test_low_only_findings_are_clean():
     assert task.parse_verdict("sec", "@sec verdict: ADVISE; high=0 medium=0 low=4").clean
 
@@ -103,8 +113,9 @@ def test_claude_reviewer_is_headless_and_read_only(tmp_path, monkeypatch):
     assert cmd[:4] == ["claude", "-p", "--agent", "marc:security"]
     allowed = cmd[cmd.index("--allowedTools") + 1:cmd.index("--disallowedTools")]
     denied = cmd[cmd.index("--disallowedTools") + 1:]
-    assert not {"Edit", "Write", "Bash"} & set(allowed)
-    assert {"Edit", "Write", "Bash(gh:*)"} <= set(denied)
+    assert set(allowed) == {"Read", "Grep", "Glob"}  # no shell: git/rg flags can write or exec
+    assert {"Bash", "Edit", "Write", "Read(~/.ssh/**)"} <= set(denied)
+    assert cmd[cmd.index("--permission-mode") + 1] == "default"
     assert "--dangerously-skip-permissions" not in cmd
     assert "abc123" in kw["input"] and "abc123" not in " ".join(cmd)  # prompt on stdin
     ledger = [json.loads(l) for l in (t.run_dir / "usage.jsonl").read_text().splitlines()]
@@ -121,7 +132,7 @@ class FakeTask(task.Task):
         self.fix_changes = fix_changes
         self.impl_limit = impl_limit
         self.codex_steps, self.reviewed = [], []
-        self.commits, self.dirty = 0, False
+        self.commits, self.changed = 0, False
         return self
 
     def ensure_worktree(self):
@@ -132,12 +143,13 @@ class FakeTask(task.Task):
         if step == "impl" and self.impl_limit:
             raise task.CodexLimit("try again at 1:59 AM")
         if step == "impl" or self.fix_changes:
-            self.dirty = True
+            self.changed = True
         return "summary of " + step
 
+    def dirty(self):
+        return self.changed
+
     def git(self, *args, cwd=None, check=True):
-        if args[0] == "status":
-            return " M file.py" if self.dirty else ""
         if args[0] == "log":
             return "c1 x" if self.commits else ""
         if args[0] == "rev-parse":
@@ -149,7 +161,7 @@ class FakeTask(task.Task):
 
     def commit_and_push(self, message):
         self.commits += 1
-        self.dirty = False
+        self.changed = False
 
     def ensure_pr(self):
         return "77"
@@ -208,6 +220,72 @@ def test_codex_limit_exits_2(tmp_path):
     t, code = _run(tmp_path, PASS, impl_limit=True)
     assert code == task.EXIT_LIMIT
     assert t.reviewed == []
+
+
+def test_git_failure_reports_exit_6_with_result_line(tmp_path):
+    class PushFails(FakeTask):
+        def commit_and_push(self, message):
+            raise task.TaskError("git push failed: rejected")
+
+    t = _task(tmp_path, cls=PushFails).setup([PASS])
+    t.prompt, t.commit_msg = tmp_path / "p.md", tmp_path / "m.txt"
+    t.prompt.write_text("x")
+    t.commit_msg.write_text("y")
+    assert t.run() == task.EXIT_ERROR
+    assert t.lines[-1].startswith("RESULT demo exit=6") and "push failed" in t.lines[-1]
+
+
+def test_a_crashing_review_thread_is_a_reviewer_failure(tmp_path, monkeypatch):
+    t = _task(tmp_path)
+    monkeypatch.setattr(t, "write_diff", lambda: None)
+    monkeypatch.setattr(t, "review_cmd", lambda kind: [])
+    monkeypatch.setattr(t, "post_review", lambda *a: None)
+
+    def review(kind, sha):
+        if kind == "rev":
+            raise SystemExit("claude not found")  # BaseException: threading drops it
+        return task.parse_verdict("sec", PASS["sec"])
+
+    monkeypatch.setattr(t, "review", review)
+    rev, sec = t.reviews("1", "abc")
+    assert not rev.ok and "claude not found" in rev.error and sec.clean
+
+
+def test_codex_crash_is_an_error_not_no_changes(tmp_path, monkeypatch):
+    class Crashed:
+        returncode = 1
+
+    def fake_run(cmd, stdout=None, **kw):
+        stdout.write('{"type":"error","message":"stream disconnected"}\n')
+        return Crashed()
+
+    monkeypatch.setattr(task.subprocess, "run", fake_run)
+    monkeypatch.setattr(task, "which", lambda name: name)
+    t = _task(tmp_path)
+    with pytest.raises(task.TaskError, match="exit 1"):
+        t.codex("low", "x", "impl")
+
+
+@pytest.mark.parametrize("argv", [["demo", "--force"], ["demo", "a/../b"], ["demo"], ["a b", "x"]])
+def test_bad_arguments_exit_6(argv):
+    assert task.main(argv) == task.EXIT_ERROR
+
+
+def test_leftovers_outside_add_paths_are_not_dirty(tmp_path):
+    def git(*args):
+        task.subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").write_text("")
+    git("add", "tests")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x")
+    t = _task(tmp_path)
+    t.worktree = tmp_path
+    (tmp_path / "notes.md").write_text("scratch")
+    assert not t.dirty()
+    (tmp_path / "tests" / "test_a.py").write_text("x = 1\n")
+    assert t.dirty()
 
 
 # ---- suite runner ----------------------------------------------------------
