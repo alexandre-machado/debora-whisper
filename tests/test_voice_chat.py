@@ -97,7 +97,7 @@ def pcm_server():
             self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type", "audio/L16; rate=24000; channels=1")
-            self.send_header("X-Sample-Rate", "24000")
+            self.send_header("X-Sample-Rate", srv.rate)
             self.send_header("Transfer-Encoding", "chunked")
             self.send_header("Connection", "close")
             self.end_headers()
@@ -122,6 +122,7 @@ def pcm_server():
     raw = np.arange(7200, dtype="<i2").tobytes()
     srv.chunks = [raw[:1], raw[1:6000], raw[6000:]]
     srv.ending = b"0\r\n\r\n"
+    srv.rate = "24000"
     srv.gate, srv.sent = None, threading.Event()
     thread = threading.Thread(target=srv.serve_forever)
     thread.start()
@@ -169,6 +170,13 @@ def test_synthesize_stream_bounds_total_bytes(pcm_server, server, monkeypatch, f
 def test_synthesize_stream_rejects_truncated_chunked_body(pcm_server, ending):
     pcm_server.ending = ending
     with pytest.raises(http.client.IncompleteRead):
+        list(vc.synthesize_stream("Olá", _cfg(pcm_server)))
+
+
+@pytest.mark.parametrize("rate", ["1", "7999", "192001"])
+def test_synthesize_stream_rejects_absurd_sample_rate(pcm_server, rate):
+    pcm_server.rate = rate
+    with pytest.raises(ValueError, match="sample rate"):
         list(vc.synthesize_stream("Olá", _cfg(pcm_server)))
 
 
@@ -2252,6 +2260,42 @@ def test_stream_single_chunk_trims_long_final_silence(streaming_chat, monkeypatc
                         llm=FakeLLM(["Primeira frase longa."]), log=lambda *a: None)
     chat.respond("oi")
     np.testing.assert_array_equal(np.concatenate(played), vc.trim_silence(samples, 1000))
+
+
+def test_stream_trims_final_silence_spanning_chunks_like_whole_wav(streaming_chat, monkeypatch):
+    # XTTS sends its held tail last, so the final silence spans many chunks;
+    # a pause inside the sentence spanning chunks is still played.
+    whole = np.r_[np.full(250, 0.2), np.zeros(300), np.full(250, 0.2),
+                  np.zeros(400)].astype(np.float32)
+    chunks = [whole[i:i + 100] for i in range(0, len(whole), 100)]
+    monkeypatch.setattr(vc, "synthesize_stream", lambda *a: iter((c, 1000) for c in chunks))
+    played = []
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=lambda samples, *a: played.append(samples),
+                        llm=FakeLLM(["Primeira frase longa."]), log=lambda *a: None)
+    chat._synthesis_model.update = MagicMock(wraps=chat._synthesis_model.update)
+    chat.respond("oi")
+    expected = vc.trim_silence(whole, 1000)
+    np.testing.assert_array_equal(np.concatenate(played), expected)
+    assert chat._synthesis_model.update.call_args.args[3] == pytest.approx(len(expected) / 1000)
+
+
+def test_streamed_sentence_counts_once_for_echo(streaming_chat, monkeypatch):
+    # Ten clips of one sentence must not multiply her "não" past the user's.
+    monkeypatch.setattr(vc, "synthesize_stream", lambda *a: iter(
+        [(np.full(100, 0.2, np.float32), 1000)] * 10))
+    heard = []
+
+    def play(samples, rate, stop):
+        now = time.monotonic()
+        heard.append((chat.is_echo("não não não", now, now),
+                      chat.is_echo("não sei a resposta", now, now)))
+
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=play, log=lambda *a: None,
+                        llm=FakeLLM(["Não sei a resposta agora."]))
+    chat.respond("oi")
+    assert len(heard) >= 10
+    assert heard[-1] == (False, True)
+    assert len(chat._spoken) == 1
 
 
 def test_stream_external_stop_closes_inflight_http(streaming_chat, pcm_server):

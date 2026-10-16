@@ -625,8 +625,10 @@ def _synthesize(text, config, *, stream):
                     message = response.reason
                 raise TTSRejected(f"HTTP {response.status}: {message}")
             if stream and response.getheader("Content-Type", "").split(";")[0].lower() == "audio/l16":
-                rate = int(response.getheader("X-Sample-Rate"))
-                if not 0 < rate <= 384000:
+                # A tiny rate would turn the byte cap into millions of
+                # one-sample clips.
+                rate = int(response.getheader("X-Sample-Rate", "0"))
+                if not 8000 <= rate <= 192000:
                     raise ValueError("invalid TTS sample rate")
                 size = max(2, int(rate * 0.1) * 2)
                 pending = bytearray()
@@ -1093,6 +1095,7 @@ class VoiceChat:
         self._interrupt = threading.Event()
         self._spoken_lock = threading.Lock()
         self._spoken = []
+        self._spoken_sentence = None  # the streamed sentence of _spoken[-1]
         self._tts_cache_lock = threading.RLock()
         self._tts_cache_key = None
         self._waiting_clip = None
@@ -1219,6 +1222,9 @@ class VoiceChat:
             with self._spoken_lock:
                 now = time.monotonic()
                 self._spoken = [(begin, min(end, now), words) for begin, end, words in self._spoken]
+                # The replay after resume starts a new interval: one stretched
+                # over the pause would match the user's own words.
+                self._spoken_sentence = None
             self.log("Voice chat: paused reply on speech")
             self._playback.notify_all()
             return True
@@ -1240,11 +1246,18 @@ class VoiceChat:
             self._playback.notify_all()
             return True
 
-    def _remember_spoken(self, text, duration):
+    def _remember_spoken(self, text, duration, sentence=None):
+        """Record her words for the echo filter. The clips of one streamed
+        sentence extend a single interval, so is_echo counts its words once."""
         now = time.monotonic()
         with self._spoken_lock:
-            self._spoken.append((now, now + duration, text))
-            self._spoken = self._spoken[-256:]
+            if sentence is not None and sentence is self._spoken_sentence and self._spoken:
+                begin, end, words = self._spoken[-1]
+                self._spoken[-1] = (begin, max(end, now + duration), words)
+            else:
+                self._spoken.append((now, now + duration, text))
+                self._spoken = self._spoken[-256:]
+            self._spoken_sentence = sentence
 
     def is_echo(self, text, started, ended):
         """Compare only audio played during capture (plus a 2 s room tail).
@@ -1406,15 +1419,17 @@ class VoiceChat:
 
         def playback_started(timing):
             nonlocal first_audio
-            duration = timing["seconds"] if timing.get("streamed") else timing["audio"]
+            streamed = timing.get("streamed")
+            duration = timing["seconds"] if streamed else timing["audio"]
             timing = timing.get("sentence", timing)
             with self._playback:
                 if self._clip_stop.is_set():
                     return
                 self._show_audio(True)
-                # Every clip (including a replay after pause) needs a fresh
-                # capture interval; captions and timing are once per sentence.
-                self._remember_spoken(timing["spoken"], duration)
+                # Every clip (including a replay after pause) extends or opens
+                # a capture interval; captions and timing are once per sentence.
+                self._remember_spoken(timing["spoken"], duration,
+                                      sentence=timing if streamed else None)
                 if timing.get("streamed") and "play" in timing:
                     return
                 timing["play"] = time.perf_counter() - started
@@ -1518,6 +1533,7 @@ class VoiceChat:
 
         def render_stream(spoken, config, timing):
             nonlocal buffered
+            import numpy as np
             timing["streamed"] = True
             timing["audio"] = 0.0
             timing["seconds"] = self._synthesis_model.predict(spoken)[1]
@@ -1561,12 +1577,16 @@ class VoiceChat:
                         split = min(len(samples) - retain,
                                     len(trim_silence(samples, rate, leading=False)))
                         put(samples[:split], rate)
-                        held = samples[split:], rate
+                        held = [samples[split:]], rate
+                    elif rate == held[1] and not np.any(np.abs(samples) > _SILENCE_LEVEL):
+                        # XTTS sends its held tail last, so the final silence
+                        # spans many chunks: keep holding until speech returns.
+                        held[0].append(samples)
                     else:
-                        put(*held)
-                        held = samples, rate
+                        put(np.concatenate(held[0]), held[1])
+                        held = [samples], rate
                 if held is not None:
-                    put(*held, last=True)
+                    put(np.concatenate(held[0]), held[1], last=True)
             finally:
                 if hasattr(stream, "close"):
                     stream.close()
@@ -1770,6 +1790,7 @@ class VoiceChat:
                     now = time.monotonic()
                     self._spoken = [(begin, min(end, now), words)
                                     for begin, end, words in self._spoken]
+                    self._spoken_sentence = None
                 for timing in list(timings):
                     log_timing(timing)
                 elapsed = f"{first_audio:.3f}s" if first_audio is not None else "-"
