@@ -278,7 +278,7 @@ def spoken_numbers(text: str, language) -> str:
 
 
 def split_sentences(buffer: str, first=False) -> tuple[list[str], str]:
-    """Complete sentences and unfinished rest; optionally shorten the first."""
+    """Complete sentences and unfinished rest; shorten the first for whole-WAV TTS."""
     if first:
         sentence_end = _SENTENCE_END.search(buffer)
         limit = sentence_end.start() if sentence_end else len(buffer)
@@ -764,6 +764,10 @@ def _cache_tts_health(config, health=None):
 def _tts_capabilities(config):
     with _tts_health_cache_lock:
         return _tts_capabilities_cache.get(config.get("tts_url", "").rstrip("/"), {}).copy()
+
+
+def _streams_tts(config) -> bool:
+    return bool(config.get("tts_stream", True)) and _tts_capabilities(config).get("stream") is True
 
 
 def _tts_loading_health(config):
@@ -1449,6 +1453,7 @@ class VoiceChat:
             self._paused = False
         # Voice chat may have been switched on in Settings since startup.
         ensure_tts_server(self.config, self.log, self.tts_log_path)
+        streams_tts = _streams_tts(self.config)
         messages = self._messages(text)
         claude = self.config.get("voice_chat_backend", "local") == "claude"
         conversation = self._history
@@ -1464,7 +1469,7 @@ class VoiceChat:
         # short to send alone.
         # said: whether a sentence was kept, so an offer of help after it can go.
         state = {"reply": "", "llm_error": None, "buffer": "", "short": "", "tokens": False,
-                 "said": False, "markdown_pending": "", "fence": "", "first": True}
+                 "said": False, "markdown_pending": "", "fence": "", "first": not streams_tts}
         start = time.time()
         waiting = object()
         feedback_lock = threading.Lock()
@@ -1639,8 +1644,7 @@ class VoiceChat:
                                     timing["synth_start"] = time.perf_counter() - started
                                     self._playback.notify_all()
                                 try:
-                                    if (config.get("tts_stream", True)
-                                            and _tts_capabilities(config).get("stream") is True):
+                                    if streams_tts:
                                         render_stream(spoken, config, timing)
                                     else:
                                         audio = synthesize(spoken, config)

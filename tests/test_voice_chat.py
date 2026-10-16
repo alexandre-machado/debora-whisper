@@ -2105,6 +2105,32 @@ def streaming_chat(server, monkeypatch):
     monkeypatch.setattr(vc, "synthesize", MagicMock(side_effect=AssertionError("whole WAV requested")))
 
 
+@pytest.mark.parametrize("enabled,advertised", [(True, True), (False, True), (True, False)])
+def test_first_sentence_is_whole_only_when_streaming(server, monkeypatch, enabled, advertised):
+    server.health_body = json.dumps({"ok": True, "stream": advertised}).encode()
+    audio = np.full(2400, 0.2, np.float32), 24000
+    whole = MagicMock(return_value=audio)
+    streaming = MagicMock(side_effect=lambda *a: iter([audio]))
+    decision = MagicMock(wraps=vc._streams_tts)
+    monkeypatch.setattr(vc, "synthesize", whole)
+    monkeypatch.setattr(vc, "synthesize_stream", streaming)
+    monkeypatch.setattr(vc, "_streams_tts", decision)
+    head = "Eu posso explicar isso,"
+    tail = " com todos os detalhes necessários."
+    following = "Depois seguimos para outro assunto."
+    chat = vc.VoiceChat(_cfg(server, tts_stream=enabled), play=lambda *a: None,
+                        llm=FakeLLM([head + " ", tail.lstrip(), " " + following]),
+                        log=lambda *a: None)
+    chat.respond("oi")
+    decision.assert_called_once_with(chat.config)
+    if enabled and advertised:
+        assert [call.args[0] for call in streaming.call_args_list] == [head + tail, following]
+        whole.assert_not_called()
+    else:
+        assert [call.args[0] for call in whole.call_args_list] == [head, tail.lstrip(), following]
+        streaming.assert_not_called()
+
+
 def test_stream_playback_starts_before_generation_ends(streaming_chat, stream, monkeypatch):
     began = threading.Event()
     ended, requests, shown, logs = [], [], [], []
