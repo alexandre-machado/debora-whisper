@@ -399,6 +399,8 @@ def _repo(tmp_path):
                                    text=True).stdout.strip()
 
     git("init", "-q", "-b", "feat/x")
+    git("config", "user.name", "t")  # CI runners have no git identity
+    git("config", "user.email", "t@t")
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_a.py").write_text("")
     (tmp_path / "README.md").write_text("hi\n")
