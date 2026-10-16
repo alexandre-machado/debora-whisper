@@ -360,6 +360,94 @@ def test_report_quoting_a_token_is_not_posted(tmp_path, monkeypatch):
     assert posted == ["rev"] and not sec.ok and "credential" in sec.error
 
 
+def test_only_the_final_line_is_the_verdict():
+    text = ("Example of the expected line:\n```\n@rev verdict: PASS; high=0 medium=0 low=0\n```\n"
+            "@rev verdict: BLOCK; high=1, medium=0, low=0\n")  # malformed real line
+    assert not task.parse_verdict("rev", text).ok
+
+
+def _repo(tmp_path):
+    """A real repo with one commit, which is also origin/main."""
+    def git(*args):
+        return task.subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True,
+                                   text=True).stdout.strip()
+
+    git("init", "-q", "-b", "feat/x")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").write_text("")
+    (tmp_path / "README.md").write_text("hi\n")
+    git("add", "tests", "README.md")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    t = _task(tmp_path)
+    t.worktree = t.repo = tmp_path
+    t.branch = "feat/x"
+    return t, git
+
+
+def _commit_all(git, *paths):
+    git("add", "-A", "--", *paths)
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "y")
+
+
+def test_commit_refuses_changes_outside_the_add_paths(tmp_path):
+    t, git = _repo(tmp_path)
+    (tmp_path / "tests" / "test_a.py").write_text("x = 1\n")
+    (tmp_path / "conftest.py").write_text("")  # the suite saw it, the commit would not
+    with pytest.raises(task.TaskError, match="conftest.py"):
+        t.commit("feat: x")
+
+
+def test_commit_stages_a_deleted_file(tmp_path):
+    t, git = _repo(tmp_path)
+    (tmp_path / "README.md").unlink()
+    assert t.dirty()
+    t.commit("chore: drop readme")
+    assert git("status", "--porcelain", "--", "README.md", "tests") == ""
+    assert "README.md" not in git("ls-files")
+
+
+def test_branch_with_workflow_or_secret_is_not_pushed(tmp_path):
+    t, git = _repo(tmp_path)
+    (tmp_path / ".github").mkdir()
+    (tmp_path / ".github" / "ci.yml").write_text("on: push\n")
+    _commit_all(git, ".github")  # e.g. committed by Codex or by test code
+    with pytest.raises(task.TaskError, match=".github/ci.yml"):
+        t.check_branch()
+    git("reset", "-q", "--hard", "origin/main")
+    (tmp_path / "tests" / "test_a.py").write_text("TOKEN = 'ghp_" + "b2" * 18 + "'\n")
+    _commit_all(git, "tests")
+    with pytest.raises(task.TaskError, match="credential"):
+        t.check_branch()
+
+
+def test_existing_worktree_on_another_branch_is_refused(tmp_path, monkeypatch):
+    t, git = _repo(tmp_path)
+    monkeypatch.setattr(t, "git", lambda *a, cwd=None, check=True:
+                        "" if a[0] == "fetch" else task.Task.git(t, *a, cwd=cwd, check=check))
+    t.branch = "feat/other"
+    with pytest.raises(task.TaskError, match="is on feat/x"):
+        t.ensure_worktree()
+
+
+def test_a_fork_pr_with_the_same_branch_is_not_ours(tmp_path, monkeypatch):
+    t = _task(tmp_path)
+    monkeypatch.setattr(t, "gh", lambda *a, check=True: json.dumps(
+        [{"number": 9, "isCrossRepository": True}, {"number": 4, "isCrossRepository": False}]))
+    assert t.own_pr() == "4"
+    monkeypatch.setattr(t, "gh", lambda *a, check=True: json.dumps(
+        [{"number": 9, "isCrossRepository": True}]))
+    assert t.own_pr() == ""
+
+
+def test_reviewer_reads_only_the_review_input_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(task, "which", lambda name: name)
+    t = _task(tmp_path)
+    cmd = t.review_cmd("rev")
+    assert cmd[cmd.index("--add-dir") + 1] == str(t.review_input) != str(t.run_dir)
+    assert str(t.review_input / "review.diff") in t.review_prompt("rev", "abc")
+
+
 # ---- suite runner ----------------------------------------------------------
 
 def test_run_suite_counts_per_file(tmp_path):
