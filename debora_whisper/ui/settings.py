@@ -25,6 +25,21 @@ _BADGE_DL = "#9CA3AF"          # Gray-400 for "Download"
 
 # tts_voice null: Chatterbox's own voice.
 _DEFAULT_VOICE = "Chatterbox default"
+_TTS_ENGINES = {
+    "chatterbox": "Chatterbox (clones the voice)",
+    "qwen3": "Qwen3-TTS (experimental, clones the voice)",
+    "kokoro": "Kokoro (fastest, pt-BR voice pf_dora)",
+    # Choosing it accepts the Coqui Public Model License (non-commercial use).
+    "xtts": "XTTS-v2 (fast, clones the voice, non-commercial)",
+}
+# Engines that only clone a reference WAV: "Chatterbox default" is no voice.
+_CLONE_ONLY_ENGINES = {
+    "qwen3": "Qwen3 requires a reference voice (tts_voice); select a WAV voice with a "
+             "matching UTF-8 .txt transcript instead of Chatterbox default.",
+    "xtts": "XTTS-v2 requires a reference voice (tts_voice); select a WAV voice "
+            "instead of Chatterbox default.",
+}
+_TTS_ENGINE_KEYS = {label: key for key, label in _TTS_ENGINES.items()}
 
 
 def _make_wide_dropdown(om, values, on_select):
@@ -32,6 +47,8 @@ def _make_wide_dropdown(om, values, on_select):
     _state = {"win": None}
 
     def _open():
+        if om.cget("state") == "disabled":
+            return
         if _state["win"] and _state["win"].winfo_exists():
             _close()
             return
@@ -279,6 +296,23 @@ class SettingsWindow:
             scroll, text="Voice chat voice", fg_color="transparent",
             font=ctk.CTkFont(size=13, weight="bold"), text_color=_SECTION_TEXT,
         ).pack(**pad, anchor="w")
+        ctk.CTkLabel(
+            scroll, text="Voice engine", fg_color="transparent",
+            font=ctk.CTkFont(size=12), text_color=_SECTION_TEXT,
+        ).pack(padx=20, pady=(4, 0), anchor="w")
+        self._tts_engine_var = ctk.StringVar(
+            value=_TTS_ENGINES[self._config.get("tts_backend", "chatterbox")])
+        self._tts_engine_dropdown = ctk.CTkOptionMenu(
+            scroll, values=list(_TTS_ENGINES.values()), variable=self._tts_engine_var,
+            command=self._on_tts_engine_change, **dd_opts,
+        )
+        self._tts_engine_dropdown.pack(padx=20, pady=(4, 0), fill="x")
+        ctk.CTkLabel(
+            scroll, text="Kokoro ignores the voice. First use downloads the model.\n"
+                         "XTTS-v2 is licensed for non-commercial use only (Coqui CPML).",
+            font=ctk.CTkFont(size=11), text_color=_DESC_TEXT, fg_color="transparent",
+            justify="left",
+        ).pack(padx=20, pady=(2, 0), anchor="w")
         voice_row = ctk.CTkFrame(scroll, fg_color="transparent")
         voice_row.pack(padx=20, pady=(4, 0), fill="x")
         voice_names = self._voice_choices()
@@ -288,6 +322,7 @@ class SettingsWindow:
             voice_row, values=voice_names, variable=self._voice_var, **dd_opts,
         )
         self._voice_dropdown.pack(side="left", fill="x", expand=True)
+        self._on_tts_engine_change(self._tts_engine_var.get())
         ctk.CTkButton(
             voice_row, text="Open folder", command=self._open_voices_folder, width=100,
             fg_color=_BTN_SEC_BG, hover_color=_BTN_SEC_HOVER,
@@ -389,7 +424,13 @@ class SettingsWindow:
         _make_wide_dropdown(self._mic_dropdown, mic_names, None)
         _make_wide_dropdown(self._font_size_dropdown, font_sizes, None)
         _make_wide_dropdown(self._voice_dropdown, voice_names, None)
+        _make_wide_dropdown(self._tts_engine_dropdown, list(_TTS_ENGINES.values()),
+                            self._on_tts_engine_change)
         _make_wide_dropdown(self._backend_dropdown, list(backends.values()), None)
+
+    def _on_tts_engine_change(self, label):
+        self._voice_dropdown.configure(
+            state="disabled" if _TTS_ENGINE_KEYS[label] == "kokoro" else "normal")
 
     def _browse_harness_folder(self):
         folder = filedialog.askdirectory(parent=self._win, title="Harness folder",
@@ -523,6 +564,7 @@ class SettingsWindow:
         new_config["harness_new_session_on_start"] = self._harness_new_session_var.get()
         new_config["harness_session_name"] = self._harness_session_name_var.get()
         voice = self._voice_var.get()
+        new_config["tts_backend"] = _TTS_ENGINE_KEYS[self._tts_engine_var.get()]
         new_config["tts_voice"] = None if voice == _DEFAULT_VOICE else voice
         new_config["show_balloon"] = self._balloon_var.get()
         try:
@@ -539,6 +581,10 @@ class SettingsWindow:
         from debora_whisper.dictation_engine import validate_config
         try:
             validate_config(new_config)
+            if (new_config.get("tts_backend") in _CLONE_ONLY_ENGINES
+                    and new_config.get("tts_voice") is None
+                    and not new_config.get("tts_server_command")):
+                raise ValueError(_CLONE_ONLY_ENGINES[new_config["tts_backend"]])
         except ValueError as e:
             self.update_status(str(e), "#FF453A")
             return

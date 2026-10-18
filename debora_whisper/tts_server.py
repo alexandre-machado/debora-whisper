@@ -4,7 +4,7 @@
 #     "chatterbox-tts==0.1.7", "torch==2.6.0", "torchaudio==2.6.0",
 #     # resemble-perth (Chatterbox's watermark) imports pkg_resources,
 #     # which setuptools 81 dropped.
-#     "setuptools<81",
+#     "setuptools==80.9.0",
 # ]
 #
 # [[tool.uv.index]]
@@ -52,8 +52,15 @@ import wave
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+if __package__:
+    from .download_progress import DownloadProgress, track_hf_downloads
+else:  # uv run --script: sibling modules are available without the app.
+    from download_progress import DownloadProgress, track_hf_downloads
+
 MAX_TEXT_CHARS = 1000
 MAX_BODY_BYTES = 64_000
+STREAM_WRITE_TIMEOUT_SECONDS = 5.0
+STREAM_DEADLINE_SECONDS = 120.0
 VOICE_SUFFIXES = (".wav", ".flac", ".mp3", ".ogg")
 # Prepared voices kept in memory (a few MB each on the GPU).
 MAX_CACHED_VOICES = 8
@@ -231,14 +238,25 @@ def check_connection(connection):
 
 
 @contextmanager
-def cancellable_synthesis(model, connection):
+def cancellable_synthesis(model, connection, modules=None):
     """Check between speech tokens and flow steps; always remove our hooks."""
+    last_check = 0.0
     def check(*args):
+        nonlocal last_check
+        # Adapters hook leaf modules, including callers that use forward()
+        # directly. Bound socket polling overhead to once every 20 ms.
+        now = time.monotonic()
+        if modules is not None and args and now - last_check < 0.02:
+            return
+        last_check = now
         check_connection(connection)
 
     hooks = []
     try:
         check()
+        if modules is not None:
+            for module in modules:
+                hooks.append(module.register_forward_pre_hook(check))
         # Hook inner modules: Chatterbox calls the transformer/estimator's
         # forward directly, bypassing hooks on those outer modules.
         for path in ("t3.tfmr.layers.0", "s3gen.flow.decoder.estimator.time_mlp"):
@@ -256,29 +274,34 @@ def cancellable_synthesis(model, connection):
             hook.remove()
 
 
-def make_handler(model, default_language: str):
+def make_handler(model, default_language: str, *, adapter=False, error=None):
     # One generation at a time: the GPU is shared and Chatterbox is not
     # thread-safe.
     lock = threading.Lock()
-    voices = Voices(model)
+    voices = model if adapter else Voices(model)
     from importlib.metadata import PackageNotFoundError, version
     versions = {}
-    for package in ("torch", "chatterbox-tts"):
+    for package in (("torch", model.package) if adapter else ("torch", "chatterbox-tts")):
         try:
             versions[package] = version(package)
         except PackageNotFoundError:
             versions[package] = None
     inventory = {"schema_version": 1, "device": getattr(model, "_debora_device", None),
-                 "versions": versions, "loaded": True,
-                 "model": "ChatterboxMultilingualTTS", "precision": "unknown"}
+                 "versions": versions, "loaded": error is None,
+                 "model": model.model_id if adapter else "ChatterboxMultilingualTTS",
+                 "precision": getattr(model, "precision", "unknown") if adapter else "unknown"}
     inventory.update(getattr(model, "_debora_allocation", {}))
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def _reply(self, code, body: bytes, content_type="application/json"):
+            self.close_connection = True
             try:
                 self.send_response(code)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
             except OSError:
@@ -290,13 +313,99 @@ def make_handler(model, default_language: str):
         def do_GET(self):
             if self.path != "/health":
                 return self._error(404, "not found")
+            if error:
+                return self._reply(503, json.dumps({"ok": False, "error": error,
+                                                   "inventory": inventory}).encode())
             self._reply(200, json.dumps({"ok": True, "sample_rate": model.sr,
+                                        "stream": callable(getattr(model, "generate_stream", None)),
                                         "inventory": inventory}).encode())
 
+        def _stream(self, text, language, start):
+            import numpy as np
+            # Bound both a stalled write and a peer that reads just fast enough
+            # to avoid individual write timeouts while holding the GPU lock.
+            deadline = time.monotonic() + STREAM_DEADLINE_SECONDS
+
+            def bound_write():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SynthesisCancelled()
+                # On Windows, shutdown from another thread may not wake the
+                # select inside sendall; its own timeout must obey the deadline.
+                self.connection.settimeout(min(STREAM_WRITE_TIMEOUT_SECONDS, remaining))
+
+            def shutdown():
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+            timer = threading.Timer(STREAM_DEADLINE_SECONDS, shutdown)
+            timer.daemon = True
+            timer.start()
+            chunks = None
+            total = 0
+            first = None
+            try:
+                bound_write()
+                chunks = model.generate_stream(text, language_id=language)
+                for chunk in chunks:
+                    if time.monotonic() >= deadline:
+                        raise SynthesisCancelled()
+                    check_connection(self.connection)
+                    if hasattr(chunk, "cpu"):
+                        chunk = chunk.float().cpu().numpy()
+                    samples = np.asarray(chunk).reshape(-1)
+                    if not len(samples):
+                        continue
+                    pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+                    bound_write()
+                    if first is None:
+                        first = time.time() - start
+                        self.stream_headers = True
+                        try:
+                            self.send_response(200)
+                            self.send_header("Content-Type", f"audio/L16; rate={model.sr}; channels=1")
+                            self.send_header("X-Sample-Rate", str(model.sr))
+                            self.send_header("Transfer-Encoding", "chunked")
+                            self.send_header("Connection", "close")
+                            self.end_headers()
+                        except OSError as e:
+                            raise SynthesisCancelled() from e
+                    try:
+                        bound_write()
+                        self.wfile.write(f"{len(pcm):X}\r\n".encode() + pcm + b"\r\n")
+                        self.wfile.flush()
+                    except OSError as e:
+                        raise SynthesisCancelled() from e
+                    total += len(samples)
+                if first is None:
+                    raise ValueError("generation returned no audio")
+                bound_write()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (OSError, SynthesisCancelled) as e:
+                shutdown()
+                raise SynthesisCancelled() from e
+            finally:
+                try:
+                    if hasattr(chunks, "close"):
+                        chunks.close()
+                finally:
+                    timer.cancel()
+                    timer.join()
+            log(f"{total / model.sr:.1f}s of audio in {time.time() - start:.1f}s "
+                f"(first chunk {first:.3f}s): {text[:300]!r}")
+
         def do_POST(self):
+            self.close_connection = True
+            self.stream_headers = False
             if self.path != "/tts":
                 return self._error(404, "not found")
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._error(400, "invalid Content-Length")
             if length <= 0 or length > MAX_BODY_BYTES:
                 return self._error(413, "body missing or too large")
             # Read the body even when refusing it: closing a socket with
@@ -309,6 +418,8 @@ def make_handler(model, default_language: str):
             if self.headers.get("Origin") is not None or not (
                     self.headers.get("Content-Type") or "").startswith("application/json"):
                 return self._error(403, "only local JSON clients")
+            if error:
+                return self._error(503, error)
             try:
                 request = json.loads(body.decode("utf-8"))
                 text = str(request["text"]).strip()[:MAX_TEXT_CHARS]
@@ -331,17 +442,32 @@ def make_handler(model, default_language: str):
                     log(f"Voice {voice!r} unusable: {type(e).__name__}: {e}")
                     return self._error(400, f"voice unusable: {e}")
                 try:
-                    drop_attention_spies(model)
-                    with cancellable_synthesis(model, self.connection), torch.inference_mode():
-                        wav = model.generate(text, language_id=language)
+                    if not adapter:
+                        drop_attention_spies(model)
+                    modules = model.cancel_modules if adapter else None
+                    with cancellable_synthesis(model, self.connection, modules), torch.inference_mode():
+                        # Reference encoding also needs cancellation on new voices.
+                        if adapter:
+                            model.prepare_voice()
+                        streaming = (request.get("stream") is True
+                                     and callable(getattr(model, "generate_stream", None)))
+                        if streaming:
+                            self._stream(text, language, start)
+                        else:
+                            wav = model.generate(text, language_id=language)
+                    if streaming:
+                        return
                 except SynthesisCancelled:
-                    log(f"Cancelled synthesis after {time.time() - start:.1f}s (client disconnected)")
+                    log(f"Cancelled synthesis after {time.time() - start:.1f}s "
+                        "(client disconnected or stream timed out)")
                     return
                 except Exception as e:
                     # Chatterbox fails on text too short to speak ("OK").
                     log(f"Failed after {time.time() - start:.1f}s on {text[:300]!r}: "
                         f"{type(e).__name__}: {e}")
-                    return self._error(500, f"generation failed: {e}")
+                    if not self.stream_headers:
+                        self._error(500, f"generation failed: {e}")
+                    return
             samples = wav.squeeze(0).float().cpu().numpy()
             log(f"{len(samples) / model.sr:.1f}s of audio in {time.time() - start:.1f}s: "
                 f"{text[:300]!r}")
@@ -351,6 +477,93 @@ def make_handler(model, default_language: str):
             pass
 
     return Handler
+
+
+def loading_server(address, loader, language, *, adapter=True):
+    """Bind before loading; atomically publish the finished request handler."""
+    progress = DownloadProgress()
+
+    class LoadingHandler(BaseHTTPRequestHandler):
+        def reply(self, body):
+            raw = json.dumps(body).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            if self.path != "/health":
+                return self.send_error(404)
+            self.reply({"ok": False, "state": "loading", "download": progress.snapshot()})
+
+        def do_POST(self):
+            if self.path != "/tts":
+                return self.send_error(404)
+            self.reply({"error": "loading"})
+
+        def log_message(self, *args):
+            pass
+
+    state = types.SimpleNamespace(handler=LoadingHandler)
+
+    def dispatch(*args, **kwargs):
+        state.handler(*args, **kwargs)
+
+    server = ThreadingHTTPServer(address, dispatch)
+
+    def load():
+        try:
+            with track_hf_downloads(progress):
+                model, error = loader()
+            handler = make_handler(model, language, adapter=adapter, error=error)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            log(f"TTS startup failed: {error}")
+            model = types.SimpleNamespace(package="unknown", model_id="unknown")
+            handler = make_handler(model, language, adapter=True, error=error)
+        state.handler = handler
+
+    threading.Thread(target=load, daemon=True).start()
+    return server
+
+
+def serve(server):
+    log(f"Listening on http://127.0.0.1:{server.server_port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log("Stopped.")
+    finally:
+        server.server_close()
+
+
+def backend_main(loader, package, model_id, argv=None, notice=None):
+    """Shared entry point for isolated uv scripts; no app imports required.
+    notice (license terms, for example) ends --help."""
+    parser = argparse.ArgumentParser(description=f"Local TTS: {model_id}", epilog=notice)
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--voice", help="Local reference WAV (Qwen requires its .txt sidecar)")
+    parser.add_argument("--language", default="pt")
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    args = parser.parse_args(argv)
+    setup_logging()
+    serve(loading_server(("127.0.0.1", args.port),
+                         lambda: load_backend(loader, args.device, args.voice, package, model_id),
+                         args.language))
+
+
+def load_backend(loader, device, voice, package, model_id):
+    """Keep /health available with an actionable error after startup failure."""
+    try:
+        start = time.time()
+        model = loader(device, voice)
+        log(f"{model_id} loaded on {model._debora_device} in {time.time() - start:.1f}s")
+        return model, None
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        log(f"TTS startup failed: {error}")
+        return types.SimpleNamespace(package=package, model_id=model_id), error
 
 
 def main():
@@ -363,13 +576,9 @@ def main():
     setup_logging()
     log(f"Starting (pid {os.getpid()}, voice {args.voice or 'default'}, "
         f"language {args.language})")
-    model = load_model(args.device, args.voice)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(model, args.language))
-    log(f"Listening on http://127.0.0.1:{args.port}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log("Stopped.")
+    serve(loading_server(("127.0.0.1", args.port),
+                         lambda: (load_model(args.device, args.voice), None),
+                         args.language, adapter=False))
 
 
 if __name__ == "__main__":

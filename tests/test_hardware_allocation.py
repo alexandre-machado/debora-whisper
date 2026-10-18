@@ -192,12 +192,18 @@ def test_parakeet_reports_mixed_encoder_buckets_and_decoder_fallback(monkeypatch
     assert "bucket unsupported" in detail and "decoder unsupported" in detail
 
 
-def test_tts_health_uses_server_pid_not_launcher_and_is_deduplicated(monkeypatch):
+@pytest.mark.parametrize("adapter", [False, True])
+def test_tts_health_uses_server_pid_not_launcher_and_is_deduplicated(monkeypatch, adapter):
     from debora_whisper import tts_server, voice_chat
     model = SimpleNamespace(sr=24000, conds=None, _debora_device="CPU",
         _debora_allocation={"pid": 4321, "device_id": "CPU", "device_name": "Intel CPU",
                             "requested_device": "CUDA", "fallback_reason": "CUDA unavailable in TTS worker"})
-    server = ThreadingHTTPServer(("127.0.0.1", 0), tts_server.make_handler(model, "pt"))
+    if adapter:
+        model.package = "torch"
+        model.model_id = "XTTS-v2"
+        model.precision = "float32"
+        model.generate_stream = lambda *a, **kw: iter(())
+    server = ThreadingHTTPServer(("127.0.0.1", 0), tts_server.make_handler(model, "pt", adapter=adapter))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     config = {"voice_chat": True, "tts_url": f"http://127.0.0.1:{server.server_port}"}
@@ -206,7 +212,10 @@ def test_tts_health_uses_server_pid_not_launcher_and_is_deduplicated(monkeypatch
     monkeypatch.setattr(voice_chat, "_tts_process", SimpleNamespace(pid=9999))
     try:
         assert voice_chat.tts_server_up(config)
-        assert "ChatterboxMultilingualTTS" in logs[-1]
+        assert ("XTTS-v2" if adapter else "ChatterboxMultilingualTTS") in logs[-1]
+        assert voice_chat._tts_streams(config) is adapter
+        assert voice_chat._tts_capabilities(config)["ok"] is True
+        assert not voice_chat._tts_streams({**config, "tts_stream": False})
         assert "server pid 4321" in logs[-1]
         assert "9999" not in logs[-1]
         assert "planned CUDA, fell back to CPU: CUDA unavailable in TTS worker" in logs[-1]
@@ -306,7 +315,7 @@ def test_delayed_worker_reader_cannot_replace_or_remove_current_allocation(monke
     def start(pid):
         ready, release = threading.Event(), threading.Event()
         releases.append(release)
-        message = ({"loaded": "CPU", "allocation": {"target": "CPU test CPU"}}
+        message = ({"ready": "CPU", "allocation": {"target": "CPU test CPU"}}
                    if component == "LLM" else
                    {"type": "system", "subtype": "init", "model": f"claude-{pid}"})
 
@@ -371,8 +380,9 @@ def test_dictation_startup_reports_only_confirmed_resident_tts(monkeypatch, load
     observed = {"tts": {"schema_version": 1, "status": status, "loaded": loaded,
         "device": "CUDA", "device_id": "CUDA:0", "device_name": "Resident GPU",
         "model": "Resident Chatterbox", "pid": 4321, "worker_pid": 9876, "versions": {}}}
-    monkeypatch.setattr(device_inventory, "probe_inventory",
-                        lambda *a: device_inventory.make_inventory(observed))
+    inventory = {**device_inventory.make_inventory(observed),
+                 "timed_out": False, "elapsed_ms": 0.0}
+    monkeypatch.setattr(device_inventory, "probe_inventory", lambda *a: inventory)
     monkeypatch.setattr(de, "log", logs.append)
     ensure = Mock(side_effect=AssertionError("Inventory must not start TTS"))
     monkeypatch.setattr(voice_chat, "ensure_tts_server", ensure)

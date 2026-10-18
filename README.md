@@ -418,7 +418,9 @@ loaded until the app exits, so switching back is instant.
   "llm_model": "OpenVINO/Qwen3-8B-int4-cw-ov",
   "llm_device": "GPU",
   "llm_prompt": null,
+  "tts_backend": "chatterbox",
   "tts_voice": "debora_v2",
+  "tts_stream": true,
   "tts_url": "http://127.0.0.1:8765",
   "tts_timeout_seconds": 60,
   "tts_server_command": null
@@ -446,16 +448,73 @@ neither shown nor spoken, and dates, times, percentages and numbers
 are spelled out (with `num2words`) before they reach Chatterbox, which reads
 digits badly; the overlay keeps the digits.
 
-The TTS is Chatterbox Multilingual on an NVIDIA GPU, served by
-`debora_whisper/tts_server.py`. It needs torch 2.6 with CUDA, so it never runs in
-the app's environment: the script declares its own dependencies and the app
+`tts_backend` selects `chatterbox` (the unchanged default), `qwen3`, `kokoro` or
+`xtts`. Each has its own server script (`tts_server.py`, `tts_server_qwen3.py`,
+`tts_server_kokoro.py` or `tts_server_xtts.py`) and isolated uv environment with pinned dependencies;
+none runs in the app's environment. The app
 starts it with `uv run --script` (uv builds that environment on the first run,
 a few GB, and caches it). It is started only when nothing answers at
 `tts_url`, stopped when the app exits, and logs to
 `~/.debora/logs/tts_server.log`. `tts_server_command` replaces that
 command line (a list of arguments).
 
-`tts_voice` clones a voice from ~10 s of clean speech: a WAV path, or a name
+Pick the engine in **Settings → Voice chat voice → Voice engine**; Apply switches the app-managed server without restarting the app.
+A manually started server at `tts_url` must be restarted manually to switch backends;
+`tts_server_command` takes precedence over script selection.
+All backends keep the same loopback HTTP API, Origin checks, disconnect
+cancellation and complete WAV responses; this stage does not add streaming.
+
+`qwen3` uses **Qwen3-TTS 0.6B Base** (`Qwen/Qwen3-TTS-12Hz-0.6B-Base`, Apache-2.0)
+to clone `tts_voice`. It requires a UTF-8 transcript at `<voice>.txt` beside the
+WAV. The confirmed transcript `debora_whisper/voices/debora_v2.txt` ships with
+the default voice. Other voices need their own exact transcript; a user WAV
+that overrides the bundled voice also needs its own sidecar. Missing or empty
+transcripts produce an actionable `/health` error; they are never guessed.
+`tts_voice: null` is unsupported by Qwen, and Settings rejects it. It uses SDPA
+without FlashAttention. On an RTX 4070 Laptop it measured about 2.9 s of compute
+per second of audio, slower than Chatterbox, so it is experimental.
+
+`kokoro` uses **Kokoro-82M** (Apache-2.0), voice **pf_dora**, language **p**
+(pt-BR). It has **no voice cloning** and ignores `tts_voice`. Its pt-BR
+phonemizer, espeak-ng, comes bundled through `espeakng-loader`: no system install
+is needed. If it fails to load, `/health` reports how to fix it. Both new backends accept
+`--device cpu` or `--device cuda` when launched manually (default CUDA, CPU
+fallback when unavailable).
+
+Stage 2 (Qwen3 and Kokoro) is implemented and **pending benchmark**: speed, VRAM
+and pt-BR quality have not been measured. See
+[exact server and benchmark commands](docs/benchmarks/tts-bench/README.md).
+
+`xtts` uses **Coqui XTTS-v2** (`tts_models/multilingual/multi-dataset/xtts_v2`,
+through `coqui-tts`, Python 3.11) to clone `tts_voice` from the WAV alone, with
+no transcript. **Its weights are under the Coqui Public Model License (CPML),
+which allows non-commercial use only** (https://coqui.ai/cpml). Selecting this
+backend is taken as accepting it: the server sets `COQUI_TOS_AGREED=1` instead
+of asking on a console nobody sees, and says so in its log and `--help`. Pick
+another backend for commercial use. `tts_voice: null` is unsupported (XTTS-v2
+has no voice of its own), and Settings rejects it; changing the voice restarts
+the managed server. Languages follow XTTS-v2's list (`pt` covers `pt-BR`);
+others fail with an error naming the supported codes. A final `.`, `!`, `;`,
+`:` or `…` is dropped before synthesis (XTTS-v2 appends noise after it). As a
+safety net, a sound after a near-silent gap of at least 150 ms in the last
+second is trimmed, unless the last three words carry a pause mark (`Pode ser,
+sim`), where that gap is a real pause. On an RTX 4070 Laptop with `debora_v2`
+it loaded in about 12 s, used about 2 GB of VRAM and needed about 0.6 s of
+compute per second of audio, faster than Chatterbox (1.4 s). The first run
+downloads about 1.8 GB to `%LOCALAPPDATA%\tts`. On every start, `coqui-tts`
+also fetches the model's `config.json` from Hugging Face and downloads the
+whole model again if it changed upstream; without network access it keeps the
+local copy.
+
+`tts_stream` (boolean, default `true`) plays XTTS audio as it is generated when
+the server's cached `/health` advertises `stream: true`. Set it to `false` for
+whole-sentence WAV playback. Kokoro, Qwen3, Chatterbox and older servers retain
+WAV playback. Streaming retains the final second for the artifact check above;
+first-audio latency depends on hardware and voice, and ~0.5 s is a target, not
+a measured guarantee. Warm-up and the waiting announcement still use WAV.
+See the [TTS HTTP protocol](docs/TTS-PROTOCOL.md) for framing and cancellation.
+
+For Chatterbox, Qwen and XTTS-v2, `tts_voice` clones a voice from clean speech: a WAV path, or a name
 looked up as `<name>.wav` in the voices folder (see File Paths), then among
 the voices that ship with the app: `carol`, `debora`, `debora_v2` (the
 default), `isabel` and `mari`. A file of the same name in the voices folder wins. `null` uses
@@ -477,6 +536,7 @@ Changing the model, device, hotkey, chime, sample rate or maximum recording leng
 |------|---------|
 | `~/.debora/config.json` | User configuration |
 | `~/.debora/logs/` | `app.log`, `telemetry.log`, `tts_server.log`, `llm_server.log`; the first three with `[YYYY-MM-DD HH:MM:SS] message` lines; at startup a log over 5 MB moves to `<name>.1` |
+| Download telemetry | Every 5 s, active model downloads add `DL STT 42% (310/740 MB)` and/or `DL TTS 17%` to the resource line; progress covers files discovered so far and disappears when idle. |
 | `~/.debora/npu_lost.json` | An NPU lost to DEVICE_LOST: startup uses the next device and probes the NPU in the background (cleared when a probe passes or Windows restarts) |
 | `~/.debora/models/` | Downloaded model files |
 | `~/.debora/ov-cache/` | OpenVINO compilation cache (do not delete) |

@@ -1,5 +1,5 @@
 """Voice chat: each final transcription goes to a local LLM or Claude Code,
-and its reply is spoken aloud by the Chatterbox TTS server
+and its reply is spoken aloud by the configured TTS server
 (debora_whisper/tts_server.py, in its own uv environment).
 
 The reply is streamed and spoken sentence by sentence: the first sentence
@@ -21,11 +21,11 @@ import sys
 import threading
 import time
 import unicodedata
-import urllib.error
 import urllib.parse
-import urllib.request
 import wave
 from dataclasses import dataclass
+# Bound at import: tests replace threading.Timer to drive reply feedback.
+from threading import Timer as _DeadlineTimer
 from pathlib import Path
 
 from debora_whisper import paths
@@ -106,7 +106,19 @@ TTS_MAX_RESPONSE_BYTES = 50_000_000
 # How long the first reply waits for a TTS server this process started
 # (Chatterbox loads in ~15 s; uv builds its environment on the very first run).
 TTS_STARTUP_SECONDS = 180
+# One health check, start to finish: a peer trickling bytes cannot stretch it.
+TTS_HEALTH_SECONDS = 1.0
+TTS_HEALTH_MAX_BYTES = 64_000
 TTS_SERVER_SCRIPT = Path(__file__).with_name("tts_server.py")
+TTS_SERVER_SCRIPTS = {
+    "chatterbox": TTS_SERVER_SCRIPT,
+    "qwen3": TTS_SERVER_SCRIPT.with_name("tts_server_qwen3.py"),
+    "kokoro": TTS_SERVER_SCRIPT.with_name("tts_server_kokoro.py"),
+    "xtts": TTS_SERVER_SCRIPT.with_name("tts_server_xtts.py"),
+}
+# Backends that need their startup reference voice: --voice is passed even
+# when the file is missing, so /health explains it, and changing it restarts.
+_STARTUP_VOICE_BACKENDS = ("qwen3", "xtts")
 # Shorter sentences wait for the next one: "Opa!" alone sounds clipped, and
 # Chatterbox cannot speak a bare "OK" at all.
 TTS_MIN_CHARS = 16
@@ -122,12 +134,6 @@ _EMOJI = re.compile(f"[{_EMOJI_CHAR}](?:[️⃣\U000E0020-\U000E007F]"
 
 def is_http_url(url) -> bool:
     return isinstance(url, str) and re.match(r"https?://", url, re.IGNORECASE) is not None
-
-
-def _opener():
-    # No proxies: the reply goes straight to the local TTS server, never
-    # through HTTP(S)_PROXY from the environment.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def speakable(text: str) -> str:
@@ -571,15 +577,35 @@ class TTSCancellation:
                     sock.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
+                # HTTPResponse owns a makefile reference: socket.close() alone
+                # defers closing its handle. On Windows shutdown alone also
+                # leaves a timed read blocked in select until the server writes.
+                handle = sock.detach()
+                if handle != -1:
+                    try:
+                        socket.close(handle)
+                    except OSError:
+                        pass
 
 
 def synthesize(text: str, config: dict):
     """(float32 samples, sample rate) for text from config["tts_url"]."""
+    return next(_synthesize(text, config, stream=False))
+
+
+def synthesize_stream(text: str, config: dict):
+    """Yield PCM chunks as they arrive, or one WAV from an older server."""
+    yield from _synthesize(text, config, stream=True)
+
+
+def _synthesize(text, config, *, stream):
     import numpy as np
     url = config["tts_url"]
     if not is_http_url(url):
         raise ValueError(f"tts_url {url!r} is not an http(s) URL")
     body = {"text": text}
+    if stream:
+        body["stream"] = True
     if config.get("language") and config["language"] != "auto":
         body["language"] = config["language"]
     # Sent on every request, so a voice picked in Settings speaks the next
@@ -612,6 +638,37 @@ def synthesize(text: str, config: dict):
                 except Exception:
                     message = response.reason
                 raise TTSRejected(f"HTTP {response.status}: {message}")
+            if stream and response.getheader("Content-Type", "").split(";")[0].lower() == "audio/l16":
+                # A tiny rate would turn the byte cap into millions of
+                # one-sample clips.
+                rate = int(response.getheader("X-Sample-Rate", "0"))
+                if not 8000 <= rate <= 192000:
+                    raise ValueError("invalid TTS sample rate")
+                size = max(2, int(rate * 0.1) * 2)
+                pending = bytearray()
+                total = 0
+                while True:
+                    raw = response.read1(min(size, TTS_MAX_RESPONSE_BYTES - total + 1))
+                    if cancellation and cancellation.cancelled:
+                        raise TTSRejected("cancelled")
+                    if not raw:
+                        break
+                    total += len(raw)
+                    if total > TTS_MAX_RESPONSE_BYTES:
+                        raise ValueError(f"TTS response larger than {TTS_MAX_RESPONSE_BYTES} bytes")
+                    pending.extend(raw)
+                    if len(pending) >= size:
+                        count = len(pending) // 2 * 2
+                        samples = np.frombuffer(bytes(pending[:count]), dtype="<i2")
+                        del pending[:count]
+                        yield samples.astype(np.float32) / 32768.0, rate
+                if len(pending) % 2:
+                    raise ValueError("odd byte count in TTS PCM response")
+                if response.length not in (None, 0):
+                    raise ValueError("truncated TTS PCM response")
+                if pending:
+                    yield np.frombuffer(bytes(pending), dtype="<i2").astype(np.float32) / 32768.0, rate
+                return
             raw = response.read(TTS_MAX_RESPONSE_BYTES + 1)
     finally:
         if cancellation and sock is not None:
@@ -624,7 +681,7 @@ def synthesize(text: str, config: dict):
             raise ValueError("TTS server must return 16-bit PCM WAV")
         samples = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
         samples = samples.reshape(-1, w.getnchannels())[:, 0]
-        return samples.astype(np.float32) / 32768.0, w.getframerate()
+        yield samples.astype(np.float32) / 32768.0, w.getframerate()
 
 
 def resolve_voice(voice) -> Path | None:
@@ -653,57 +710,225 @@ def list_voices() -> list[str]:
 
 
 def tts_command(config: dict, log=print) -> list[str] | None:
-    """tts_server_command, or uv running tts_server.py on tts_url's port
+    """tts_server_command, or uv running the selected backend on tts_url's port
     with tts_voice (None if tts_url is not local or uv is missing)."""
     if config.get("tts_server_command"):
         return config["tts_server_command"]
     url = urllib.parse.urlparse(config.get("tts_url") or "")
     if url.hostname not in ("127.0.0.1", "localhost"):
         return None
+    backend = config.get("tts_backend", "chatterbox")
+    script = TTS_SERVER_SCRIPTS[backend]
     uv = shutil.which("uv")
     if not uv:
         log("Voice chat: uv not found on PATH; start the TTS server yourself "
-            f"(uv run --script {TTS_SERVER_SCRIPT}).")
+            f"(uv run --script {script}).")
         return None
-    command = [uv, "run", "--script", str(TTS_SERVER_SCRIPT), "--port", str(url.port or 80)]
+    command = [uv, "run", "--script", str(script), "--port", str(url.port or 80)]
     voice = resolve_voice(config.get("tts_voice"))
-    if voice is not None and voice.is_file():
+    if voice is not None and backend != "kokoro" and (voice.is_file() or backend in _STARTUP_VOICE_BACKENDS):
         command += ["--voice", str(voice)]
-    elif voice is not None:
+    elif voice is not None and backend == "chatterbox":
         log(f"Voice chat: voice {voice} not found; using Chatterbox's own voice.")
     if config.get("language") and config["language"] != "auto":
         command += ["--language", config["language"]]
     return command
 
 
-_tts_lock = threading.Lock()
+_tts_lock = threading.RLock()
 _tts_process: subprocess.Popen | None = None
+_tts_server_key = None  # Process settings; also remembers settings seen with an external server.
+_tts_retiring_url = None  # A managed child may outlive its uv parent briefly.
 _tts_stopping = threading.Event()
 
 
-def tts_server_up(config: dict) -> bool:
+class TTSStartupError(RuntimeError):
+    """The server is reachable, but its backend cannot finish startup."""
+
+
+def _shutdown_socket(sock):
     try:
-        url = config["tts_url"].rstrip("/") + "/health"
-        with _opener().open(url, timeout=1) as response:
-            if response.status != 200:
-                return False
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+# Filled by startup checks and background polling, never by telemetry itself.
+_tts_health_cache = {}
+_tts_capabilities_cache = {}  # Ready capabilities outlive loading telemetry/polls.
+_tts_health_cache_lock = threading.Lock()
+_tts_health_polls = {}
+_tts_health_poll_context = threading.local()
+
+
+def _cache_tts_health(config, health=None):
+    with _tts_health_cache_lock:
+        cancelled = getattr(_tts_health_poll_context, "cancelled", None)
+        if cancelled is not None and cancelled.is_set():
+            return  # An in-flight check must not repopulate the cache after stop.
+        url = config.get("tts_url", "").rstrip("/")
+        _tts_health_cache.pop(url, None)
+        _tts_capabilities_cache.pop(url, None)
+        if health is not None and health.get("ok") is True:
+            _tts_capabilities_cache[url] = health
+        elif health is not None:
+            _tts_health_cache[url] = (time.monotonic(), health)
+
+
+def _tts_capabilities(config):
+    with _tts_health_cache_lock:
+        return _tts_capabilities_cache.get(config.get("tts_url", "").rstrip("/"), {}).copy()
+
+
+def _tts_streams(config):
+    return config.get("tts_stream", True) and _tts_capabilities(config).get("stream") is True
+
+
+def _tts_loading_health(config):
+    with _tts_health_cache_lock:
+        cached = _tts_health_cache.get(config.get("tts_url", "").rstrip("/"))
+        if cached and time.monotonic() - cached[0] <= 5 + TTS_HEALTH_SECONDS:
+            return cached[1]
+    return {}
+
+
+def tts_download_progress(config):
+    """Local snapshot only: no I/O or startup/process lock on telemetry's thread."""
+    return _tts_loading_health(config).get("download")
+
+
+def _start_tts_health_poll(config, process=None):
+    """Keep loading telemetry fresh independently of any caller's wait deadline."""
+    config = {"tts_url": config["tts_url"]}
+    url = config["tts_url"].rstrip("/")
+    with _tts_health_cache_lock:
+        if url in _tts_health_polls:
+            return
+        cancelled = threading.Event()
+
+        def poll():
+            _tts_health_poll_context.cancelled = cancelled
             try:
-                inventory = json.loads(response.read(16_384)).get("inventory")
-            except (ValueError, TypeError, AttributeError):
-                inventory = None
-            report_tts(config, inventory)
-            return True
+                while not cancelled.wait(0.5):
+                    if process is not None and process.poll() is not None:
+                        break
+                    state = _check_tts_health(config)
+                    if state == "ready":
+                        break
+                    if process is None and state != "loading":
+                        break
+            except TTSStartupError:
+                pass  # Individual waiters still receive the terminal error.
+            finally:
+                with _tts_health_cache_lock:
+                    if _tts_health_polls.get(url, (None,))[0] is cancelled:
+                        _tts_health_polls.pop(url, None)
+                        _tts_health_cache.pop(url, None)
+                del _tts_health_poll_context.cancelled
+
+        worker = threading.Thread(target=poll, daemon=True, name="tts-health")
+        _tts_health_polls[url] = (cancelled, worker)
+        worker.start()
+
+
+def tts_server_up(config: dict) -> bool:
+    """True if /health answers 200; TTSStartupError if the server reports
+    a terminal startup error (503 with {"ok": false, "error": ...})."""
+    return _check_tts_health(config) == "ready"
+
+
+def _check_tts_health(config: dict) -> str:
+    """Return this request's state and publish telemetry or ready capabilities.
+
+    Startup callers must use the returned state: another poll may replace the
+    shared telemetry as soon as this request publishes it.
+    """
+    connection = timer = None
+    try:
+        target = urllib.parse.urlsplit(config["tts_url"].rstrip("/") + "/health")
+        connection_type = (http.client.HTTPSConnection if target.scheme == "https"
+                           else http.client.HTTPConnection)
+        connection = connection_type(target.hostname, target.port, timeout=TTS_HEALTH_SECONDS)
+        connection.connect()
+        # The socket timeout restarts with every byte, so a peer trickling its
+        # answer could hold this check (and _tts_lock) indefinitely. Closing
+        # the socket at an absolute deadline ends any read still blocked.
+        timer = _DeadlineTimer(TTS_HEALTH_SECONDS, _shutdown_socket, (connection.sock,))
+        timer.daemon = True
+        timer.start()
+        connection.request("GET", urllib.parse.urlunsplit(("", "", target.path, target.query, "")))
+        with connection.getresponse() as response:
+            status = response.status
+            if status not in (200, 503):
+                _cache_tts_health(config)
+                return "unavailable"
+            raw = response.read(TTS_HEALTH_MAX_BYTES + 1)
+        try:
+            health = json.loads(raw) if len(raw) <= TTS_HEALTH_MAX_BYTES else None
+        except (ValueError, UnicodeError):
+            health = None
     except Exception:
-        return False
+        _cache_tts_health(config)
+        return "unavailable"
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if connection is not None:
+            connection.close()
+    if status == 200:
+        report_tts(config, health.get("inventory") if isinstance(health, dict) else None)
+        _cache_tts_health(config, {"ok": True, "stream": (
+            isinstance(health, dict) and health.get("stream") is True)})
+        return "ready"
+    if (isinstance(health, dict) and health.get("ok") is False
+            and isinstance(health.get("error"), str) and health["error"]):
+        _cache_tts_health(config)
+        raise TTSStartupError(health["error"])
+    if isinstance(health, dict) and health.get("state") == "loading" and health.get("ok") is False:
+        _cache_tts_health(config, health)
+        return "loading"
+    _cache_tts_health(config)
+    return "unavailable"
 
 
-def ensure_tts_server(config: dict, log=print, log_path=None):
+def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=False):
     """Start the TTS server (tts_command) if nothing answers at tts_url.
-    One server per process: engine rebuilds (Settings) reuse it."""
-    global _tts_process
+    Called by the background engine loader; reuse only matching servers.
+    With managed_only, reconcile settings only if we already own a server."""
+    global _tts_process, _tts_server_key, _tts_retiring_url
     if not is_http_url(config.get("tts_url")):
         return
     with _tts_lock:
+        if managed_only and _tts_process is None and _tts_retiring_url is None:
+            return
+        backend = config.get("tts_backend", "chatterbox")
+        custom_command = config.get("tts_server_command")
+        # Language and Chatterbox's voice are sent with every request. File
+        # additions/removals must not turn them into process restart triggers.
+        voice = (resolve_voice(config.get("tts_voice"))
+                 if backend in _STARTUP_VOICE_BACKENDS and not custom_command else None)
+        key = (backend, tuple(custom_command) if custom_command else None,
+               urllib.parse.urlparse(config["tts_url"]).port or 80,
+               str(voice) if voice is not None else None)
+        if _tts_process is not None and _tts_server_key != key:
+            log("Voice chat: TTS settings changed; restarting the managed server.")
+            # Keep the outer lock through shutdown and startup so another loader
+            # cannot start a replacement while the old process still owns the port.
+            _tts_retiring_url = _tts_process.tts_url
+            stop_tts_server()
+        if _tts_retiring_url is not None:
+            deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    if _check_tts_health({"tts_url": _tts_retiring_url}) == "unavailable":
+                        _tts_retiring_url = None
+                        break
+                except TTSStartupError:
+                    pass  # Still answering, even if unhealthy.
+                if time.monotonic() >= deadline:
+                    log("Voice chat: waiting for the previous TTS server to stop; will retry.")
+                    return
+                time.sleep(0.1)
         _tts_stopping.clear()
         if _tts_process is not None:
             if _tts_process.poll() is not None and not _tts_process.reported:
@@ -714,8 +939,20 @@ def ensure_tts_server(config: dict, log=print, log_path=None):
                     f"see {log_path or 'its output'}. Restart the app after fixing it.")
                 allocation.update("TTS", f"unavailable; server exited (launcher pid {_tts_process.pid})")
             return
-        if tts_server_up(config):
-            return  # started by hand, or left over from an earlier run
+        try:
+            state = _check_tts_health(config)
+            if state in ("ready", "loading"):
+                if state == "loading":
+                    _start_tts_health_poll(config)
+                if _tts_server_key is not None and _tts_server_key != key:
+                    log(f"Voice chat: configured TTS backend/command changed to {key[0]}; "
+                        "keeping the external server. Restart it manually to apply the change.")
+                if _tts_server_key is None:
+                    _tts_server_key = key
+                return  # started by hand, or left over from an earlier run
+        except TTSStartupError as exc:
+            log(f"Voice chat: TTS startup failed ({exc}); restart the server after fixing it.")
+            return
         command = tts_command(config, log)
         if not command:
             return
@@ -732,30 +969,46 @@ def ensure_tts_server(config: dict, log=print, log_path=None):
             if log_path:
                 output.close()
         _tts_process.reported = False
+        _tts_process.tts_url = config["tts_url"]
+        _tts_server_key = key
+        _start_tts_health_poll(config, _tts_process)
         atexit.register(stop_tts_server)
         log(f"Voice chat: starting the TTS server (pid {_tts_process.pid}); "
             f"output in {log_path or 'nowhere'}")
 
 
 def wait_tts_server(config: dict, timeout=TTS_STARTUP_SECONDS) -> bool:
-    """True once the TTS server answers; waits only while a server this
-    process started is still loading."""
+    """Wait for managed startup or an explicit loading response from /health.
+    Raise TTSStartupError on terminal failure."""
     deadline = time.time() + timeout
     while True:
-        if tts_server_up(config):
+        state = _check_tts_health(config)
+        if state == "ready":
             return True
         process = _tts_process
-        if process is None or process.poll() is not None or time.time() > deadline:
+        if ((process is None and state != "loading")
+                or (process is not None and process.poll() is not None)):
+            _cache_tts_health(config)
+            return False
+        _start_tts_health_poll(config, process)
+        if time.time() > deadline:
             return False
         time.sleep(0.5)
 
 
 def stop_tts_server():
     """Stop the TTS server this process started, if any."""
-    global _tts_process
+    global _tts_process, _tts_server_key
     with _tts_lock:
         _tts_stopping.set()
+        with _tts_health_cache_lock:
+            for cancelled, _ in _tts_health_polls.values():
+                cancelled.set()
+            _tts_health_polls.clear()
+            _tts_health_cache.clear()
+            _tts_capabilities_cache.clear()
         process, _tts_process = _tts_process, None
+        _tts_server_key = None
     if process is None:
         return
     # uv runs the server as a child process: end the whole tree, or the
@@ -863,6 +1116,7 @@ class VoiceChat:
         self._interrupt = threading.Event()
         self._spoken_lock = threading.Lock()
         self._spoken = []
+        self._spoken_sentence = None  # the streamed sentence of _spoken[-1]
         self._tts_cache_lock = threading.RLock()
         self._tts_cache_key = None
         self._waiting_clip = None
@@ -891,7 +1145,8 @@ class VoiceChat:
 
     def _select_tts_cache(self, config):
         """Called under the cache lock; settings changes discard the old voice."""
-        key = (config.get("tts_voice"), config.get("language"), config.get("tts_url"))
+        key = (config.get("tts_backend", "chatterbox"), config.get("tts_voice"),
+               config.get("language"), config.get("tts_url"))
         if key != self._tts_cache_key:
             self._tts_cache_key = key
             self._waiting_clip = None
@@ -931,6 +1186,8 @@ class VoiceChat:
                     self._waiting_audio(config)
                     self._tts_warmed = True
                     self.log(f"Voice chat: TTS warmed in {time.perf_counter() - started:.1f}s")
+            except TTSStartupError as e:
+                self.log(f"Voice chat: TTS startup failed ({e}); restart the server after fixing it.")
             except Exception as e:
                 self.log(f"Voice chat: TTS warm-up failed ({e}); will try on the next reply.")
 
@@ -986,6 +1243,9 @@ class VoiceChat:
             with self._spoken_lock:
                 now = time.monotonic()
                 self._spoken = [(begin, min(end, now), words) for begin, end, words in self._spoken]
+                # The replay after resume starts a new interval: one stretched
+                # over the pause would match the user's own words.
+                self._spoken_sentence = None
             self.log("Voice chat: paused reply on speech")
             self._playback.notify_all()
             return True
@@ -1007,11 +1267,18 @@ class VoiceChat:
             self._playback.notify_all()
             return True
 
-    def _remember_spoken(self, text, duration):
+    def _remember_spoken(self, text, duration, sentence=None):
+        """Record her words for the echo filter. The clips of one streamed
+        sentence extend a single interval, so is_echo counts its words once."""
         now = time.monotonic()
         with self._spoken_lock:
-            self._spoken.append((now, now + duration, text))
-            self._spoken = self._spoken[-256:]
+            if sentence is not None and sentence is self._spoken_sentence and self._spoken:
+                begin, end, words = self._spoken[-1]
+                self._spoken[-1] = (begin, max(end, now + duration), words)
+            else:
+                self._spoken.append((now, now + duration, text))
+                self._spoken = self._spoken[-256:]
+            self._spoken_sentence = sentence
 
     def is_echo(self, text, started, ended):
         """Compare only audio played during capture (plus a 2 s room tail).
@@ -1104,7 +1371,10 @@ class VoiceChat:
                 self._playback.notify_all()
 
         def hold(timing):
-            if not prebuffer or timing.get("feedback") or timing.get("cached"):
+            # Whole-sentence estimates would defeat streaming's first audio
+            # and stall continuations whenever the network queue empties.
+            if (not prebuffer or timing.get("feedback") or timing.get("cached")
+                    or timing.get("streamed")):
                 return
             began = None
             snapshot = None
@@ -1136,6 +1406,7 @@ class VoiceChat:
         def wake_on_stop():
             # An externally supplied Event cannot notify our condition.
             stop.wait()
+            cancellation.cancel()
             with self._playback:
                 self._playback.notify_all()
 
@@ -1143,15 +1414,18 @@ class VoiceChat:
             with timing_lock:
                 if timing.get("logged"):
                     return
+                if timing.get("streamed") and "synth_end" not in timing:
+                    return
                 timing["logged"] = True
                 fields = " ".join(f"{key}={timing[key]:.3f}s" if key in timing else f"{key}=-"
-                                  for key in ("enqueued", "synth_start", "synth_end", "audio", "play"))
+                                  for key in ("enqueued", "synth_start", "first_chunk", "synth_end", "audio", "play"))
                 self.log(f"Voice chat: TTS turn={turn} chunk={timing['chunk']} {fields}"
                          + (" cached" if timing.get("cached") else ""))
 
         shown = []
 
         def show(timing, audible=False):
+            timing = timing.get("sentence", timing)
             # Her words enter the balloon together with her voice, and with
             # how long that voice lasts.
             if timing.get("shown") and on_reply:
@@ -1166,13 +1440,21 @@ class VoiceChat:
 
         def playback_started(timing):
             nonlocal first_audio
+            streamed = timing.get("streamed")
+            duration = timing["seconds"] if streamed else timing["audio"]
+            timing = timing.get("sentence", timing)
             with self._playback:
                 if self._clip_stop.is_set():
                     return
-                timing["play"] = time.perf_counter() - started
                 self._show_audio(True)
+                # Every clip (including a replay after pause) extends or opens
+                # a capture interval; captions and timing are once per sentence.
+                self._remember_spoken(timing["spoken"], duration,
+                                      sentence=timing if streamed else None)
+                if timing.get("streamed") and "play" in timing:
+                    return
+                timing["play"] = time.perf_counter() - started
                 show(timing, audible=True)
-                self._remember_spoken(timing["spoken"], timing["audio"])
                 if first_audio is None:
                     first_audio = timing["play"]
                 log_timing(timing)
@@ -1236,7 +1518,8 @@ class VoiceChat:
             if claude:
                 chunk, state["markdown_pending"], state["fence"] = speech_markdown(
                     state["markdown_pending"] + chunk, state["fence"])
-            done, state["buffer"] = split_sentences(state["buffer"] + chunk, first=state["first"])
+            done, state["buffer"] = split_sentences(
+                state["buffer"] + chunk, first=state["first"] and not _tts_streams(self.config))
             for sentence in done:
                 if unwanted(sentence):
                     continue
@@ -1270,6 +1553,67 @@ class VoiceChat:
                 with self._playback:
                     self._playback.notify_all()
 
+        def render_stream(spoken, config, timing):
+            nonlocal buffered
+            import numpy as np
+            timing["streamed"] = True
+            timing["audio"] = 0.0
+            timing["seconds"] = self._synthesis_model.predict(spoken)[1]
+            seconds = 0.0
+            held = None
+            stream = synthesize_stream(spoken, config)
+
+            def put(samples, rate, *, last=False):
+                nonlocal buffered, seconds
+                first = not timing.get("stream_queued")
+                samples = trim_silence(samples, rate, leading=first, trailing=last)
+                if not len(samples):
+                    return
+                duration = len(samples) / rate
+                with self._playback:
+                    if stop.is_set() or cancellation.cancelled:
+                        return
+                    seconds += duration
+                    buffered += duration
+                    # A sentence leaves pending at its first playable chunk;
+                    # buffered counts only audio actually queued, not predictions.
+                    pending.pop(timing["chunk"], None)
+                    clips.put((samples, rate, {"sentence": timing, "streamed": True,
+                                              "continuation": not first, "last": last,
+                                              "seconds": duration}))
+                    timing["stream_queued"] = True
+                    self._playback.notify_all()
+
+            try:
+                for samples, rate in stream:
+                    if stop.is_set() or cancellation.cancelled:
+                        return
+                    timing.setdefault("first_chunk", time.perf_counter() - started)
+                    timing["audio"] += len(samples) / rate
+                    if held is None:
+                        # Start on the first chunk. Retain a small suffix so
+                        # even a one-chunk stream can have its final silence cut.
+                        retain = min(int(rate * 0.05), len(samples) // 2)
+                        # Retain a longer quiet ending too. It may be a pause
+                        # (released with the next chunk) or the sentence's end.
+                        split = min(len(samples) - retain,
+                                    len(trim_silence(samples, rate, leading=False)))
+                        put(samples[:split], rate)
+                        held = [samples[split:]], rate
+                    elif rate == held[1] and not np.any(np.abs(samples) > _SILENCE_LEVEL):
+                        # XTTS sends its held tail last, so the final silence
+                        # spans many chunks: keep holding until speech returns.
+                        held[0].append(samples)
+                    else:
+                        put(np.concatenate(held[0]), held[1])
+                        held = [samples], rate
+                if held is not None:
+                    put(np.concatenate(held[0]), held[1], last=True)
+            finally:
+                if hasattr(stream, "close"):
+                    stream.close()
+                timing["seconds"] = seconds
+
         def render():
             nonlocal buffered
             tts_ok = None  # unknown until the first sentence
@@ -1298,9 +1642,14 @@ class VoiceChat:
                         continue  # an emoji or punctuation: nothing to say
                     audio = None
                     if tts_ok is None:
-                        tts_ok = wait_tts_server(self.config)
-                        if not tts_ok:
-                            self.log("Voice chat: TTS server not reachable; showing the reply only.")
+                        try:
+                            tts_ok = wait_tts_server(self.config)
+                        except TTSStartupError as e:
+                            tts_ok = False
+                            self.log(f"Voice chat: TTS startup failed ({e}); showing the reply only.")
+                        else:
+                            if not tts_ok:
+                                self.log("Voice chat: TTS server not reachable; showing the reply only.")
                     if tts_ok:
                         try:
                             config = dict(self.config)
@@ -1312,11 +1661,26 @@ class VoiceChat:
                                     timing["synth_start"] = time.perf_counter() - started
                                     self._playback.notify_all()
                                 try:
-                                    audio = synthesize(spoken, config)
+                                    if _tts_streams(config):
+                                        render_stream(spoken, config, timing)
+                                    else:
+                                        audio = synthesize(spoken, config)
                                 finally:
                                     timing["synth_end"] = time.perf_counter() - started
+                                if (timing.get("streamed") and not stop.is_set()
+                                        and not cancellation.cancelled):
+                                    # Learn from complete sentences only; a failed
+                                    # stream's partial duration would bias the model.
+                                    with self._playback:
+                                        self._synthesis_model.update(
+                                            spoken, timing["synth_end"] - timing["synth_start"],
+                                            timing["audio"], timing["seconds"])
                         except TTSRejected as e:
-                            self.log(f"Voice chat: TTS skipped {spoken[:40]!r} ({e})")
+                            if timing.get("stream_queued"):
+                                if not stop.is_set():
+                                    self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
+                            else:
+                                self.log(f"Voice chat: TTS skipped {spoken[:40]!r} ({e})")
                         except Exception as e:
                             # Keep showing the text even without a voice.
                             tts_ok = False
@@ -1324,6 +1688,10 @@ class VoiceChat:
                                 self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
                     if stop.is_set():
                         return
+                    if timing.get("stream_queued"):
+                        if "play" in timing:
+                            log_timing(timing)
+                        continue
                     if audio is not None:
                         timing["audio"] = len(audio[0]) / audio[1]
                         timing["spoken"] = spoken
@@ -1354,8 +1722,8 @@ class VoiceChat:
 
         writer = threading.Thread(target=write, daemon=True)
         renderer = threading.Thread(target=render, daemon=True)
-        if prebuffer:
-            threading.Thread(target=wake_on_stop, daemon=True).start()
+        stop_watcher = threading.Thread(target=wake_on_stop, daemon=True)
+        stop_watcher.start()
         if timer:
             timer.daemon = True
             timer.start()
@@ -1400,13 +1768,16 @@ class VoiceChat:
                             clip_stop = self._clip_stop = PlaybackStop(stop)
                         if stop.is_set():
                             break
+                        on_start = lambda timing=clip[2]: playback_started(timing)
                         if self._play is None:
                             play(clip[0], clip[1], clip_stop,
-                                 on_start=lambda timing=clip[2]: playback_started(timing),
-                                 wait_for_tail=(self.config.get("voice_chat_pause_on_speech", True)
+                                 continuation=clip[2].get("continuation", False),
+                                 on_start=on_start,
+                                 wait_for_tail=((not clip[2].get("streamed") or clip[2].get("last"))
+                                                and self.config.get("voice_chat_pause_on_speech", True)
                                                 and self.config.get("voice_chat_barge_in", True)))
                         else:
-                            playback_started(clip[2])
+                            on_start()
                             play(clip[0], clip[1], clip_stop)
                         with self._playback:
                             cut = clip_stop.is_set()
@@ -1431,10 +1802,16 @@ class VoiceChat:
                 # Drain Claude's result / local cancellation before the next
                 # turn. In particular, never clear its stop event early.
                 writer.join()
+                if any(timing.get("streamed") for timing in timings):
+                    renderer.join()
+                stop_watcher.join()
+                if timer:
+                    timer.join()
                 with self._spoken_lock:
                     now = time.monotonic()
                     self._spoken = [(begin, min(end, now), words)
                                     for begin, end, words in self._spoken]
+                    self._spoken_sentence = None
                 for timing in list(timings):
                     log_timing(timing)
                 elapsed = f"{first_audio:.3f}s" if first_audio is not None else "-"
@@ -1466,15 +1843,16 @@ SENTENCE_GAP_SECONDS = 0.15
 _SILENCE_LEVEL = 10 ** (-45 / 20)  # -45 dBFS
 
 
-def trim_silence(samples, sample_rate: int, keep_seconds=0.05):
+def trim_silence(samples, sample_rate: int, keep_seconds=0.05, *, leading=True, trailing=True):
     """samples without the silence the TTS leaves before and after speech."""
     import numpy as np
     loud = np.flatnonzero(np.abs(samples) > _SILENCE_LEVEL)
     if len(loud) == 0:
-        return samples[:0]
+        return samples[:0] if leading or trailing else samples
     keep = int(sample_rate * keep_seconds)
-    samples = samples[max(loud[0] - keep, 0):loud[-1] + keep + 1]
-    return _without_trailing_hiss(samples, sample_rate, keep)
+    samples = samples[max(loud[0] - keep, 0) if leading else 0:
+                      loud[-1] + keep + 1 if trailing else len(samples)]
+    return _without_trailing_hiss(samples, sample_rate, keep) if trailing else samples
 
 
 # Chatterbox sometimes adds a faint hiss after a pause once the speech is
@@ -1520,7 +1898,7 @@ class StreamPlayer:
         self._rate = None
 
     def __call__(self, samples, sample_rate: int, stop: threading.Event, on_start=None,
-                 wait_for_tail=False):
+                 wait_for_tail=False, continuation=False):
         import numpy as np
         import sounddevice as sd
         gap = 0
@@ -1530,7 +1908,7 @@ class StreamPlayer:
             self._stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32")
             self._stream.start()
             self._rate = sample_rate
-        else:
+        elif not continuation:
             gap = int(sample_rate * SENTENCE_GAP_SECONDS)
             samples = np.concatenate([np.zeros(gap, dtype=np.float32), samples])
         data = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1, 1)

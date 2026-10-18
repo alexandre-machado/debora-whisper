@@ -12,6 +12,7 @@ import json
 import re
 import argparse
 import inspect
+import unicodedata
 from copy import deepcopy
 import threading
 import zlib
@@ -20,16 +21,18 @@ from enum import Enum
 from pathlib import Path
 from datetime import datetime
 
+from debora_whisper.download_progress import STT_DOWNLOAD, format_download, track_hf_downloads
 from debora_whisper import paths, platforms, processes
+from debora_whisper.platforms.base import CaretReadStatus
 # Kept for callers checking the shared clipboard transaction lock.
-from debora_whisper.platforms.windows_text import _clipboard_lock
+from debora_whisper.platforms.windows_text import _clipboard_lock, can_backspace_draft
 from debora_whisper.harness import MemoryHotwords, ProjectHotwords, bounded_hotwords
 from debora_whisper.solo_key import SoloKeyTap
 from debora_whisper.paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, LOG_DIR, MODEL_DIR
 from debora_whisper.vad_endpoint import AdaptiveEndpoint, VadSegment
 from debora_whisper.hardware_allocation import allocation, model_description, ov_target, cpu_target, cuda_target
 from debora_whisper.voice_chat import (VoiceChat, download_llm, ensure_tts_server, is_http_url,
-                                    llm_loaded, load_llm)
+                                    llm_loaded, load_llm, tts_download_progress)
 
 # Disable HuggingFace symlinks on Windows to avoid WinError 1314
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
@@ -113,11 +116,14 @@ DEFAULT_CONFIG = {
     # file path, or a name looked up as <name>.wav in the voices folder
     # (paths.VOICES_DIR), then among the bundled voices (carol, debora,
     # debora_v2, isabel, mari). null: Chatterbox's own voice.
+    # chatterbox, qwen3 (clone), kokoro (pf_dora), xtts (clone, non-commercial)
+    "tts_backend": "chatterbox",
     "tts_voice": "debora_v2",
+    "tts_stream": True,
     "tts_url": "http://127.0.0.1:8765",
     "tts_timeout_seconds": 60,
     # Command that starts the TTS server when nothing answers at tts_url.
-    # null: uv runs debora_whisper/tts_server.py with tts_voice.
+    # null: uv runs the script selected by tts_backend with tts_voice.
     "tts_server_command": None,
     # Diagnostics: keep the audio of the last transcription in
     # last_recording.wav (overwritten each time) to reproduce a bad result.
@@ -405,6 +411,8 @@ def validate_config(config: dict):
         raise ValueError("voice_chat_pause_on_speech must be a bool")
     if not isinstance(config.get("voice_chat_prebuffer", True), bool):
         raise ValueError("voice_chat_prebuffer must be a bool")
+    if not isinstance(config.get("tts_stream", True), bool):
+        raise ValueError("tts_stream must be a bool")
     if not isinstance(config.get("harness_new_session_on_start", False), bool):
         raise ValueError("harness_new_session_on_start must be a bool")
     from debora_whisper.harness import validate_session_name
@@ -426,6 +434,8 @@ def validate_config(config: dict):
     if not isinstance(rules, list) or any(
             not isinstance(rule, str) or not rule.strip() for rule in rules):
         raise ValueError("harness_extra_allowed_tools must be a list of non-empty permission rules")
+    if config.get("tts_backend", "chatterbox") not in ("chatterbox", "qwen3", "kokoro", "xtts"):
+        raise ValueError("tts_backend must be chatterbox, qwen3, kokoro or xtts")
     voice = config.get("tts_voice")
     if voice is not None and (not isinstance(voice, str) or not voice.strip()):
         raise ValueError(f"tts_voice must be null or a file path or name, got {voice!r}")
@@ -473,50 +483,8 @@ def setup_model(config: dict, progress_callback=None):
     try:
         from huggingface_hub import snapshot_download
 
-        # Build tqdm_class wrapper for progress reporting.
-        # snapshot_download creates one _ProgressBar per file, so we
-        # accumulate bytes across all instances for overall progress.
-        tqdm_kwargs = {}
-        if progress_callback:
-            _cumulative = [0, 0]  # [downloaded_bytes, total_bytes]
-
-            class _ProgressBar:
-                """Minimal tqdm-compatible wrapper that forwards to progress_callback."""
-                _lock = None
-                def __init__(self, *args, **kwargs):
-                    self.total = kwargs.get("total", 0)
-                    self.n = 0
-                    _cumulative[1] += self.total
-                @classmethod
-                def get_lock(cls):
-                    import threading
-                    if cls._lock is None:
-                        cls._lock = threading.Lock()
-                    return cls._lock
-                @classmethod
-                def set_lock(cls, lock):
-                    cls._lock = lock
-                def update(self, n=1):
-                    self.n += n
-                    _cumulative[0] += n
-                    if _cumulative[1] > 0:
-                        progress_callback(_cumulative[0], _cumulative[1])
-                def close(self):
-                    pass
-                def set_description(self, *a, **kw):
-                    pass
-                def set_postfix(self, *a, **kw):
-                    pass
-                def refresh(self, *a, **kw):
-                    pass
-                def __enter__(self):
-                    return self
-                def __exit__(self, *a):
-                    pass
-
-            tqdm_kwargs["tqdm_class"] = _ProgressBar
-
-        snapshot_download(ov_repo, local_dir=str(model_path), **tqdm_kwargs)
+        with track_hf_downloads(STT_DOWNLOAD, progress_callback):
+            snapshot_download(ov_repo, local_dir=str(model_path))
 
         # Verify download
         if model_files_complete(model_path):
@@ -559,6 +527,9 @@ class RestartRequiredError(RuntimeError):
 
 _device_failure_lock = threading.Lock()
 _device_failure: dict | None = None
+# Failed pipelines must outlive their engine, including its telemetry thread.
+# Their destructors can call into a lost driver and crash the process.
+_quarantined_models: list = []
 
 # Held by a transcription and by the LLM's compile (in its own process, on
 # the Arc iGPU): both times that compile overlapped an NPU inference, the
@@ -904,7 +875,8 @@ class FasterWhisperCUDA:
         
         # compute_type="int8_float16" gives the best performance/VRAM tradeoff on RTX.
         start = time.time()
-        self.pipeline = WhisperModel(self.model_size, device="cuda", compute_type="int8_float16")
+        with track_hf_downloads(STT_DOWNLOAD):
+            self.pipeline = WhisperModel(self.model_size, device="cuda", compute_type="int8_float16")
         hw_name = has_nvidia_gpu(return_name=True) or "NVIDIA GPU"
         self.hardware_backend = "faster-whisper"
         self.hardware_target = cuda_target(0, hw_name)
@@ -2406,6 +2378,36 @@ def _type_text_ctypes(text: str):
     return platforms.current()._type_text_ctypes(text)
 
 
+def _normalize_draft_text(text: str) -> str:
+    """Compare representations, without case folding or dropping hidden text."""
+    quotes = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
+    text = text.replace("\r\n", "\n").translate(quotes)
+    return "".join(" " if unicodedata.category(c) == "Zs" else
+                   "\n" if c in "\r\v\u2028\u2029" else c for c in text)
+
+
+def _draft_read_matches(expected: str, observed: str | CaretReadStatus | None) -> tuple[bool, bool]:
+    """Return (equivalent suffix, safe key count).
+
+    Extra paragraph/cell marks and trimmed whitespace can explain a match,
+    but do not establish how many Shift+Left keys would select our text.
+    Only one-for-one substitutions of unambiguous characters authorize the
+    existing deletion count; a provider may count graphemes, not code points.
+    """
+    if not isinstance(observed, str) or not expected:
+        return False, False
+    normalized = _normalize_draft_text(expected)
+    body = normalized.rstrip(" \t\n\x07")
+    equivalent = bool(body) and _normalize_draft_text(observed).rstrip(" \t\n\x07").endswith(body)
+    suffix = observed[-len(expected):]
+    safe = (len(suffix) == len(expected) == len(normalized)
+            and _normalize_draft_text(suffix) == normalized
+            # Reuse the conservative key-count guard. Verified single line
+            # separators are supported, unlike unverified Backspace drafts.
+            and can_backspace_draft(normalized.replace("\n", " ")))
+    return equivalent, safe
+
+
 # ---------------------------------------------------------------------------
 # Audio feedback (chimes)
 # ---------------------------------------------------------------------------
@@ -2598,6 +2600,8 @@ class DictationApp:
         self._draft_target = None
         self._inline_drafts_abandoned = False
         self._draft_strategy = None
+        self._draft_final_suppressed = False
+        self._draft_mismatch_logged = False
         self.voice_chat = VoiceChat(config, log=log, tts_log_path=TTS_SERVER_LOG,
                                     llm_log_path=LLM_SERVER_LOG)
         self.recorder.on_voice = self._voice_activity
@@ -2647,8 +2651,9 @@ class DictationApp:
         try:
             import psutil
             process = psutil.Process()
-            while True:
-                cpu = psutil.cpu_percent(interval=5.0)
+            psutil.cpu_percent(interval=None)  # Prime the per-thread sample.
+            while not self._stopping.wait(5.0):
+                cpu = psutil.cpu_percent(interval=None)
                 mem = process.memory_info().rss / (1024 * 1024)
                 sys_mem = psutil.virtual_memory().percent
                 
@@ -2657,7 +2662,9 @@ class DictationApp:
                 state_name = self._state.value if hasattr(self, "_state") else "UNKNOWN"
                 # Short enough for an ~80-column console.
                 log(f"[Telemetry] {state_name:<10} CPU {cpu:3.0f}% RAM {mem:.0f}M "
-                    f"sys {sys_mem:.0f}%{vram_info}")
+                    f"sys {sys_mem:.0f}%{vram_info}"
+                    f"{format_download('STT', STT_DOWNLOAD.snapshot())}"
+                    f"{format_download('TTS', tts_download_progress(self.config))}")
         except ImportError:
             log("[Telemetry] psutil not found. Resource monitoring disabled.")
         except Exception as e:
@@ -2720,6 +2727,7 @@ class DictationApp:
             self._lost_device = self.config["device"]
             if self.whisper is not None:
                 self._quarantined_models.append(self.whisper)
+                _quarantined_models.append(self.whisper)
                 self.whisper = None
                 log(f"Quarantined model on lost {self._lost_device}: it will not "
                     f"be called or released again in this process.")
@@ -2745,6 +2753,7 @@ class DictationApp:
         self._allocation_planned = self.config["device"]
         allocation.update("STT", f"unavailable; {cause}; device lost/quarantined")
         if kind == "LATCHED":
+            self._quarantine_lost_model()
             failure = device_failure()
             self._load_error = failure["message"]
             self._model_ready.set()
@@ -3018,13 +3027,40 @@ class DictationApp:
         """Caller holds _output_lock. A changed target ends inline output."""
         if self._draft_strategy == "backspace":
             return True
-        observed = platforms.current().text_before_caret(len(self._draft_typed_text))
-        if observed == self._draft_typed_text:
-            return True
+        expected = self._draft_typed_text
+        for attempt in range(2):
+            if not same_input_target(get_input_target(), self._draft_target):
+                break
+            # A little context on retry prevents a provider's trailing marks
+            # from cutting the first characters off the expected suffix.
+            observed = platforms.current().text_before_caret(len(expected) + (8 if attempt else 0))
+            # Focus may change while COM is reading or between retries.
+            if not same_input_target(get_input_target(), self._draft_target):
+                break
+            equivalent, safe = _draft_read_matches(expected, observed)
+            exact = isinstance(observed, str) and observed[-len(expected):] == expected
+            if (not exact or not safe) and not self._draft_mismatch_logged:
+                self._draft_mismatch_logged = True
+                observed_len = len(observed) if isinstance(observed, str) else None
+                read_status = ("text" if isinstance(observed, str) else
+                               "unsafe" if observed is CaretReadStatus.UNSAFE else "unavailable")
+                representation_changed = (isinstance(observed, str)
+                                          and _normalize_draft_text(observed) != observed)
+                log(f"Inline draft: verification mismatch; expected_len={len(expected)} "
+                    f"read_len={observed_len} read_status={read_status} "
+                    f"representation_changed={representation_changed} "
+                    f"equivalent={equivalent} safe_count={safe}")
+            if safe:
+                return True
+            if observed is CaretReadStatus.UNSAFE:
+                break
+            if attempt == 0:
+                time.sleep(0.040)
         self._inline_drafts_abandoned = True
+        self._draft_final_suppressed = True
         self._draft_typed_text = ""
         self._draft_target = None
-        log("Inline draft: target changed; leaving the draft and typing the final")
+        log("Inline draft: cannot safely reconcile; keeping the draft and suppressing final paste")
         return False
 
     def _choose_draft_strategy_locked(self):
@@ -3048,17 +3084,23 @@ class DictationApp:
 
     def _forget_draft_locked(self, erase: bool):
         """Stop tracking the typed draft, first erasing it if asked and keys
-        still land where it was typed. Caller holds _output_lock."""
+        still land where it was typed. Return whether text was left behind.
+        Caller holds _output_lock."""
+        retained = bool(self._draft_typed_text) or self._draft_final_suppressed
         if erase and self._draft_typed_text:
             if same_input_target(get_input_target(), self._draft_target):
                 if self._verify_draft_locked():
                     self._delete_draft_tail_locked(len(self._draft_typed_text))
+                    retained = False
             else:
                 log("Input focus changed; leaving the draft where it was typed.")
         self._draft_typed_text = ""
         self._draft_target = None
         self._inline_drafts_abandoned = False
         self._draft_strategy = None
+        self._draft_final_suppressed = False
+        self._draft_mismatch_logged = False
+        return retained
 
     def _finish_recording(self, generation=None, audio=None, is_final=True,
                           segment_id=None, audio_end=None, captured_at=None):
@@ -3181,13 +3223,17 @@ class DictationApp:
                                 and not self._inline_drafts_abandoned):
                             if self._draft_strategy is None:
                                 self._choose_draft_strategy_locked()
-                            if (self._draft_strategy == "backspace"
-                                    and not platforms.current().can_backspace_draft(text)):
+                            if ((self._draft_strategy == "backspace"
+                                    and not platforms.current().can_backspace_draft(text))
+                                    or (self._draft_strategy == "verified"
+                                        and not _draft_read_matches(text, text)[1])):
                                 # Remove only the previous, simple-character draft.
                                 # Never inline text whose deletion count is ambiguous.
-                                self._forget_draft_locked(erase=True)
+                                # Even an exact read must authorize its later removal.
+                                retained = self._forget_draft_locked(erase=True)
                                 self._draft_strategy = "overlay"
                                 self._inline_drafts_abandoned = True
+                                self._draft_final_suppressed = retained
                                 log("Inline draft: complex Unicode; drafts stay in the overlay")
                         if self._draft_typed_text:
                             if same_input_target(target, self._draft_target):
@@ -3200,9 +3246,12 @@ class DictationApp:
                                 self._draft_typed_text = ""
                                 self._draft_target = None
                                 self._inline_drafts_abandoned = True
+                                self._draft_final_suppressed = True
 
                         if is_final:
-                            if text_to_type:
+                            if self._draft_final_suppressed:
+                                log("Inline draft: final kept in history; no duplicate pasted")
+                            elif text_to_type:
                                 type_text(text_to_type, auto_enter=self.config["auto_enter"])
                             elif self.config["auto_enter"]:
                                 # The draft already holds the whole text.
@@ -3211,6 +3260,8 @@ class DictationApp:
                             self._draft_target = None
                             self._inline_drafts_abandoned = False
                             self._draft_strategy = None
+                            self._draft_final_suppressed = False
+                            self._draft_mismatch_logged = False
                             log(f"Final transcription: {text.strip()}")
 
                             self._history.append({
@@ -3609,7 +3660,7 @@ class DictationApp:
 
     # -- Lifecycle -------------------------------------------------------
 
-    def start_background(self):
+    def start_background(self, *, reconcile_tts: bool = False):
         """Register hotkey and start model loading without blocking.
 
         Use this from GUI mode instead of ``run()`` — does NOT call
@@ -3626,6 +3677,14 @@ class DictationApp:
         self._start_loader()
         if self.config.get("voice_chat") or self.warm_voice_chat:
             self._warm_up_voice_chat()
+        elif reconcile_tts:
+            # Apply must switch a previously started TTS server even while
+            # dictating. Shutdown may wait on the process; keep it off Tk.
+            threading.Thread(
+                target=ensure_tts_server,
+                args=(self.config, log, TTS_SERVER_LOG),
+                kwargs={"managed_only": True}, daemon=True,
+            ).start()
         self._start_segment_consumer()
 
     def _register_voice_chat_hotkey(self, keyboard):
@@ -3785,7 +3844,7 @@ class DictationApp:
         threading.Thread(target=_continuous_consumer, daemon=True).start()
 
     def busy_reason(self) -> str | None:
-        """What accelerator/microphone work is in flight, or None if idle."""
+        """What recording or model work is in flight, or None if idle."""
         with self._audio_lifecycle_lock:
             return self._busy_reason_locked()
 
@@ -3799,12 +3858,12 @@ class DictationApp:
         return None
 
     def stop_if_idle(self) -> str | None:
-        """Stop this engine only if no recording, transcription or model load
+        """Stop only if no recording, transcription or model load
         is in flight. Returns the busy reason (engine left running) or None
         (engine stopped).
 
-        The idle check and the stop flag are set under the same lock every
-        start path (hotkey start, timer/user stop, loader spawn) takes, so no
+        The idle check and the stop flag are set under the locks every
+        start path (recording or loader) takes, so no
         new work can begin between the check and the stop. Used before a
         Settings rebuild so a new pipeline is never compiled while the old
         one may still be running on the same device. Never blocks on
@@ -3816,6 +3875,16 @@ class DictationApp:
                 return reason
             self._stopping.set()
         self.stop()
+        # No work can start after the idle reservation above. Release the
+        # healthy pipeline before Settings constructs/loads its replacement;
+        # the old engine may still be referenced by callbacks or history.
+        # A failed driver must never be entered, even by a destructor.
+        if not device_failure():
+            with self._model_lock:
+                self.whisper = None
+                self._model_ready.clear()
+            import gc
+            gc.collect()
         return None
 
     def stop(self):

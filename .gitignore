@@ -43,3 +43,6 @@ nul
 
 # Voice samples for TTS cloning: personal recordings, never committed
 samples/
+
+# Workspace-local pytest scratch files (including mock audio).
+.test-tmp/
