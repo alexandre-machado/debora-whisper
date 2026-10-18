@@ -196,9 +196,15 @@ def test_one_process_serves_every_reply(llm):
 
 def test_llm_falls_back_to_the_cpu(llm, monkeypatch):
     config, logs = llm
+    from debora_whisper.hardware_allocation import allocation
+    allocation.configure({**config, "voice_chat": True}, logs.append)
     monkeypatch.setenv("FAKE_FAIL_ON", "GPU")
     _reply(config, logs)
     assert vc._llm.device == "CPU"
+    summary = next(line for line in logs if line.startswith("Hardware allocation"))
+    assert f"pid {vc._llm.process.pid}" in summary
+    assert "planned GPU, fell back to OV:CPU" in summary
+    assert "GPU is not available" in summary
 
 
 def test_llm_that_loads_nowhere_fails_the_reply(llm, monkeypatch):

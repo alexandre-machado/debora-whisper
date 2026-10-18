@@ -390,6 +390,11 @@ class HarnessSession:
             raise
         with _sessions_lock:
             _run_sessions[run_key] = (self.session_id, resumable)
+        from debora_whisper.hardware_allocation import allocation
+        self._allocation_owner = allocation.claim("CLAUDE")
+        allocation.update("CLAUDE", f"external Claude Code; model={config.get('harness_model') or 'CLI default'}; "
+                          f"endpoint=Claude Code managed; harness pid {self.process.pid} (CPU orchestration)",
+                          owner=self._allocation_owner)
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
         log(f"Voice chat: Claude session {self.session_id} in {self.cwd} "
@@ -408,9 +413,17 @@ class HarnessSession:
                     self.log(f"Voice chat: Claude stdout: {line.strip()}")
                     continue
                 if isinstance(message, dict):
+                    if message.get("type") == "system" and message.get("subtype") == "init":
+                        from debora_whisper.hardware_allocation import allocation
+                        allocation.update("CLAUDE", f"external Claude Code; model={message.get('model') or 'unreported'}; "
+                                          f"endpoint=Claude Code managed; harness pid {self.process.pid} (CPU orchestration)",
+                                          owner=self._allocation_owner)
                     self._events.put(message)
         finally:
             self.error = self.error or "Claude closed its output"
+            from debora_whisper.hardware_allocation import allocation
+            allocation.update("CLAUDE", f"external Claude Code; harness exited pid {self.process.pid}",
+                              owner=self._allocation_owner)
             self._events.put(None)
 
     def _read_stderr(self):
@@ -573,6 +586,8 @@ class HarnessSession:
             self.process.wait(5)
         finally:
             self._remove_prompt()
+            from debora_whisper.hardware_allocation import allocation
+            allocation.update("CLAUDE", None, owner=self._allocation_owner)
 
 
 _harness_lock = threading.Lock()

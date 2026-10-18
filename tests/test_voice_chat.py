@@ -1118,9 +1118,13 @@ def test_voice_chat_flag_turns_the_mode_on(monkeypatch, module, session_flags, f
         **DEFAULT_CONFIG, "harness_new_session_on_start": bool(session_flags)})
     app_class = "GUIApp" if module.endswith(".app") else "DictationApp"
     monkeypatch.setattr(mod, app_class, lambda config: started.append(config) or MagicMock())
+    # CLI parsing must not leave a real inventory worker running into later tests.
+    inventory = MagicMock()
+    monkeypatch.setattr(mod, "log_hardware_inventory", inventory)
     if module.endswith(".app"):
         monkeypatch.setattr(mod, "_claim_single_instance", lambda: True)
     mod.main()
+    inventory.assert_called_once_with(started[0])
     assert started[0]["voice_chat"] is True
     assert started[0]["harness_new_session_on_start"] is fresh
     assert started[0]["harness_session_name"] == "Debora test"

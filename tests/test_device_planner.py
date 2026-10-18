@@ -404,6 +404,9 @@ def test_logging_hook_runs_in_background_without_changing_config(monkeypatch, mo
     lines = [line for line in logs if line.startswith("Device plan 1 ")]
     assert len(lines) == 3
     assert all(f"mode={mode}" in line and "confidence=" in line and "reservation=" in line for line in lines)
+    stt_line = next(line for line in lines if "component=stt " in line)
+    assert "GPU,GPU" not in stt_line
+    assert "OV:GPU" in stt_line
 
 
 @pytest.mark.parametrize("failure", ["probe", "planner"])

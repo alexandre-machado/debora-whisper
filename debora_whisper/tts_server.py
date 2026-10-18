@@ -131,6 +131,7 @@ def load_model(device: str, voice: str | None):
     import torch
     import torch._dynamo  # noqa: F401
     from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+    requested_device = device
     if device == "cuda" and not torch.cuda.is_available():
         log("CUDA not available; using the CPU (much slower).")
         device = "cpu"
@@ -139,6 +140,20 @@ def load_model(device: str, voice: str | None):
     # Report the device actually loaded, without another CUDA probe. The UI's
     # STT environment cannot infer this server's PyTorch capabilities.
     model._debora_device = device.upper()
+    import platform
+    model._debora_allocation = {
+        "pid": os.getpid(), "requested_device": requested_device.upper(),
+        "device_id": "CPU", "device_name": platform.processor() or "name unavailable",
+        "fallback_reason": "CUDA unavailable in TTS worker" if device != requested_device else None,
+    }
+    if device == "cuda":
+        model._debora_allocation.update(device_id="CUDA (index unreported)", device_name="name unavailable")
+        try:
+            index = torch.cuda.current_device()
+            model._debora_allocation.update(device_id=f"CUDA:{index}",
+                                            device_name=torch.cuda.get_device_name(index))
+        except Exception:
+            pass  # Optional identity queries must not invalidate a loaded model.
     _stub_sklearn()
     model.builtin_conds = model.conds
     if voice:
@@ -275,6 +290,7 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                  "versions": versions, "loaded": error is None,
                  "model": model.model_id if adapter else "ChatterboxMultilingualTTS",
                  "precision": getattr(model, "precision", "unknown") if adapter else "unknown"}
+    inventory.update(getattr(model, "_debora_allocation", {}))
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"

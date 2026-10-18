@@ -16,6 +16,7 @@ import re
 import shutil
 import socket
 import subprocess
+from debora_whisper.hardware_allocation import allocation, report_tts
 import sys
 import threading
 import time
@@ -380,6 +381,7 @@ class LLMProcess:
             if log_path:
                 output.close()
         self._start = time.time()
+        self._allocation_owner = allocation.claim("LLM")
         threading.Thread(target=self._read, daemon=True).start()
 
     @property
@@ -399,6 +401,14 @@ class LLMProcess:
                 self.log(f"Voice chat: {message['log']}")
             elif "ready" in message:
                 self.device = message["ready"]
+                report = message.get("allocation", {})
+                target = report.get("target", self.device + " (hardware identity unreported)")
+                detail = (f"{self.key[0]} (openvino-genai) -> {target}  "
+                          f"pid {self.process.pid}")
+                if report.get("fallbacks"):
+                    detail += (f"; planned {report['planned']}, fell back to {target}: "
+                               + "; ".join(report["fallbacks"]))
+                allocation.update("LLM", detail, owner=self._allocation_owner)
                 self.log(f"Voice chat: {self.key[0]} loaded on {self.device} in "
                          f"{time.time() - self._start:.1f}s (process {self.process.pid})")
                 self.loaded.set()
@@ -410,6 +420,8 @@ class LLMProcess:
         if self.error is None:
             self.error = f"the LLM process exited (code {code})"
         self.loaded.set()
+        allocation.update("LLM", f"unavailable; {self.error}  pid {self.process.pid}",
+                          owner=self._allocation_owner)
         for replies in list(self._replies.values()):
             replies.put({"error": self.error})
 
@@ -474,6 +486,8 @@ class LLMProcess:
             self.process.wait(5)
         except subprocess.TimeoutExpired:
             kill_tree(self.process)
+        finally:
+            allocation.update("LLM", None, owner=self._allocation_owner)
 
 
 _llm_lock = threading.Lock()
@@ -862,6 +876,7 @@ def _check_tts_health(config: dict) -> str:
         if connection is not None:
             connection.close()
     if status == 200:
+        report_tts(config, health.get("inventory") if isinstance(health, dict) else None)
         _cache_tts_health(config, {"ok": True, "stream": (
             isinstance(health, dict) and health.get("stream") is True)})
         return "ready"
@@ -922,6 +937,7 @@ def ensure_tts_server(config: dict, log=print, log_path=None, *, managed_only=Fa
                 _tts_process.reported = True
                 log(f"Voice chat: the TTS server exited (code {_tts_process.returncode}); "
                     f"see {log_path or 'its output'}. Restart the app after fixing it.")
+                allocation.update("TTS", f"unavailable; server exited (launcher pid {_tts_process.pid})")
             return
         try:
             state = _check_tts_health(config)
@@ -998,6 +1014,7 @@ def stop_tts_server():
     # uv runs the server as a child process: end the whole tree, or the
     # server keeps its GPU memory after uv is gone.
     kill_tree(process)
+    allocation.update("TTS", None)
     try:
         process.wait(5)
     except subprocess.TimeoutExpired:

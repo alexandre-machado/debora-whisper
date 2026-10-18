@@ -848,8 +848,13 @@ def test_startup_after_an_npu_loss_probes_it_in_the_background(monkeypatch):
     monkeypatch.setattr(app_module, "GUIApp", FakeGUI)
     monkeypatch.setattr(app_module, "_claim_single_instance", lambda: True)
     monkeypatch.setattr(app_module, "load_config", lambda: _priority_config())
+    # This tests recovery scheduling, not the independent inventory worker.
+    # A real worker can outlive this test and call a later test's patched planner.
+    inventory = MagicMock()
+    monkeypatch.setattr(app_module, "log_hardware_inventory", inventory)
     monkeypatch.setattr(sys, "argv", ["debora", "--device", "NPU"])
     app_module.main()
 
+    inventory.assert_called_once()
     assert created[0].config["device"] == "GPU"
     assert created[0].scheduled == 1
