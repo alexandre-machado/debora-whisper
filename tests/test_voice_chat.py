@@ -1590,6 +1590,38 @@ def test_only_the_first_reply_chunk_splits_at_a_clause(server, boundary):
     assert _tts_texts(server) == [vc.speakable(head), tail.strip(), later]
 
 
+@pytest.mark.parametrize("enabled,advertised", [
+    (True, True), (False, True), (True, False), (True, None), (True, "true")])
+@pytest.mark.parametrize("fragmented", [False, True])
+def test_first_reply_keeps_commas_only_when_tts_streams(monkeypatch, enabled, advertised, fragmented):
+    monkeypatch.setattr(vc, "_tts_capabilities_cache", {})
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
+    monkeypatch.setattr(vc, "wait_tts_server", lambda *a: True)
+    config = {**DEFAULT_CONFIG, "language": "pt", "tts_stream": enabled}
+    health = {"ok": True}
+    if advertised is not None:
+        health["stream"] = advertised
+    vc._tts_capabilities_cache[config["tts_url"].rstrip("/")] = health
+    chunks = ["Claro, ", "posso ajudar com isso agora mesmo, ",
+              "é só me dizer o que precisa."]
+    sentence = "".join(chunks)
+    audio = (np.full(2400, 0.2, np.float32), 24000)
+    whole = MagicMock(return_value=audio)
+    streaming = MagicMock(side_effect=lambda *a: iter([audio]))
+    monkeypatch.setattr(vc, "synthesize", whole)
+    monkeypatch.setattr(vc, "synthesize_stream", streaming)
+    chat = vc.VoiceChat(config, play=lambda *a: None, log=lambda *a: None,
+                        llm=FakeLLM(chunks if fragmented else [sentence]))
+    chat.respond("explique")
+    if enabled and advertised is True:
+        assert [call.args[0] for call in streaming.call_args_list] == [sentence]
+        whole.assert_not_called()
+    else:
+        assert [call.args[0] for call in whole.call_args_list] == [
+            "Claro, posso ajudar com isso agora mesmo,", "é só me dizer o que precisa."]
+        streaming.assert_not_called()
+
+
 def test_first_chunk_uses_twelve_complete_words_without_punctuation():
     head = "uma duas três quatro cinco seis sete oito nove dez onze doze"
     assert vc.split_sentences(head + " tre", first=True) == ([head], "tre")
