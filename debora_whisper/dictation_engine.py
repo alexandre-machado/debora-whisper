@@ -672,6 +672,10 @@ def log_hardware_inventory(config: dict):
         try:
             inventory = probe_inventory(request, HARDWARE_INVENTORY)
             log(inventory_summary(inventory))
+            tts = inventory.get("observed", {}).get("tts")
+            if isinstance(tts, dict) and tts.get("status") == "ok" and tts.get("loaded") is True:
+                from debora_whisper.hardware_allocation import report_tts
+                report_tts(snapshot, tts)
             helpers = [f"{source} pid {report['worker_pid']}"
                        for source, report in inventory.get("observed", {}).items()
                        if report.get("worker_pid")]

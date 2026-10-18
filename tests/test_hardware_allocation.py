@@ -234,6 +234,7 @@ def test_claude_protocol_reports_actual_external_model_and_harness_pid():
     logs = []
     hw.allocation.configure({"voice_chat": True, "voice_chat_backend": "claude"}, logs.append)
     session = harness.HarnessSession.__new__(harness.HarnessSession)
+    session._allocation_owner = hw.allocation.claim("CLAUDE")
     session.process = SimpleNamespace(pid=7654, stdout=io.StringIO(
         '{"type":"system","subtype":"init","model":"claude-test"}\n'))
     session._events = queue.Queue()
@@ -277,3 +278,137 @@ def test_npu_probe_forwards_temporary_worker_allocation(monkeypatch):
     assert "mode=npu_probe" in logs[-1]
     assert detail in logs[-1]
     assert "temporary worker now exited" in logs[-1]
+
+
+@pytest.mark.parametrize("component", ["LLM", "CLAUDE"])
+def test_delayed_worker_reader_cannot_replace_or_remove_current_allocation(monkeypatch, tmp_path, component):
+    import io
+    import json
+    from debora_whisper import harness, voice_chat
+
+    logs = []
+    config = {**de.DEFAULT_CONFIG, "voice_chat": True, "harness_cwd": str(tmp_path)}
+    hw.allocation.configure(config, logs.append)
+    real_thread = threading.Thread
+    readers = []
+
+    def track_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        readers.append(thread)
+        return thread
+
+    monkeypatch.setattr(threading, "Thread", track_thread)
+    monkeypatch.setattr(harness, "_run_sessions", {})
+    monkeypatch.setattr(harness.paths, "CONFIG_DIR", tmp_path)
+    releases = []
+    workers = []
+
+    def start(pid):
+        ready, release = threading.Event(), threading.Event()
+        releases.append(release)
+        message = ({"loaded": "CPU", "allocation": {"target": "CPU test CPU"}}
+                   if component == "LLM" else
+                   {"type": "system", "subtype": "init", "model": f"claude-{pid}"})
+
+        def stdout():
+            yield json.dumps(message)
+            ready.set()
+            assert release.wait(10)
+            # Buffered startup output can also arrive after the replacement.
+            yield json.dumps(message)
+
+        process = SimpleNamespace(pid=pid, stdout=stdout(), stderr=io.StringIO(),
+                                  stdin=io.StringIO(), wait=Mock(return_value=0), poll=lambda: None)
+        if component == "LLM":
+            monkeypatch.setattr(voice_chat.subprocess, "Popen", lambda *a, **kw: process)
+            worker = voice_chat.LLMProcess((f"model-{pid}", "CPU"), ["fake"], logs.append)
+        else:
+            worker = harness.HarnessSession(config, logs.append,
+                process_factory=lambda *a, **kw: process,
+                command_factory=lambda *a: ["fake"], session_file=tmp_path / "session.json")
+        workers.append(worker)
+        assert ready.wait(5)
+        return worker
+
+    try:
+        old = start(1111)
+        old.stop()  # Process wait completes while stdout's reader is still blocked.
+        old_readers = list(readers)
+        current = start(2222)
+        expected = hw.allocation.rows[component]
+        assert "2222" in expected
+        count = len(logs)
+        releases[0].set()
+        for reader in old_readers:
+            reader.join(5)
+            assert not reader.is_alive()
+        assert hw.allocation.rows[component] == expected
+        assert not any(line.startswith("Hardware allocation") for line in logs[count:])
+        old.stop()  # A delayed stop/removal must also respect ownership.
+        assert hw.allocation.rows[component] == expected
+        current.stop()
+        assert component not in hw.allocation.rows
+        releases[1].set()
+        for reader in readers:
+            reader.join(5)
+        assert component not in hw.allocation.rows  # Stopped readers cannot resurrect rows.
+    finally:
+        for release in releases:
+            release.set()
+        for reader in readers:
+            reader.join(5)
+        for worker in workers:
+            worker.stop()
+
+
+@pytest.mark.parametrize("loaded,status", [(True, "ok"), (False, "ok"), (True, "unknown")])
+def test_dictation_startup_reports_only_confirmed_resident_tts(monkeypatch, loaded, status):
+    from debora_whisper import device_inventory, voice_chat
+
+    config = {**de.DEFAULT_CONFIG, "voice_chat": False}
+    logs = []
+    hw.allocation.configure(config, logs.append)
+    observed = {"tts": {"schema_version": 1, "status": status, "loaded": loaded,
+        "device": "CUDA", "device_id": "CUDA:0", "device_name": "Resident GPU",
+        "model": "Resident Chatterbox", "pid": 4321, "worker_pid": 9876, "versions": {}}}
+    monkeypatch.setattr(device_inventory, "probe_inventory",
+                        lambda *a: device_inventory.make_inventory(observed))
+    monkeypatch.setattr(de, "log", logs.append)
+    ensure = Mock(side_effect=AssertionError("Inventory must not start TTS"))
+    monkeypatch.setattr(voice_chat, "ensure_tts_server", ensure)
+    thread = de.log_hardware_inventory(config)
+    thread.join(5)
+    assert not thread.is_alive()
+    assert not any("failed:" in line.lower() for line in logs)
+    summaries = [line for line in logs if line.startswith("Hardware allocation")]
+    assert "mode=dictation" in summaries[-1]
+    if loaded and status == "ok":
+        assert "TTS  inactive in dictation; resident: Resident Chatterbox" in summaries[-1]
+        assert "CUDA:0 Resident GPU server pid 4321" in summaries[-1]
+        assert "9876" not in hw.allocation.rows["TTS"]
+    else:
+        assert "TTS" not in hw.allocation.rows
+    ensure.assert_not_called()
+
+
+@pytest.mark.parametrize("inventory", [None, {"loaded": True, "model": "Chatterbox", "pid": 4321}])
+@pytest.mark.parametrize("endpoint,origin", [
+    ("https://user-secret:pass-secret@voice.example:8443/path-secret?token=query-secret#fragment-secret",
+     "https://voice.example:8443"),
+    ("http://user-secret:pass-secret@[::1]:8765/path-secret?token=query-secret#fragment-secret",
+     "http://[::1]:8765"),
+    ("https://voice.example:port-secret/path-secret", "invalid endpoint"),
+    ("https://[invalid-secret/path-secret", "invalid endpoint"),
+])
+def test_tts_endpoint_secrets_never_reach_console_or_app_log(monkeypatch, tmp_path, capsys, inventory,
+                                                           endpoint, origin):
+    monkeypatch.setattr(de, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(de, "LOG_FILE", tmp_path / "app.log")
+    config = {"voice_chat": True, "tts_url": endpoint}
+    hw.allocation.configure(config, de.log)
+    hw.allocation.emit()  # Before any successful health check.
+    hw.report_tts(config, inventory)
+    output = capsys.readouterr().out
+    assert output == de.LOG_FILE.read_text(encoding="utf-8")
+    assert output.count(f"endpoint={origin}") == 2
+    assert "secret" not in output

@@ -50,6 +50,7 @@ def _reset_allocation_reporter():
     from debora_whisper.hardware_allocation import allocation
     with allocation.lock:
         allocation.rows = {}
+        allocation.owners = {}
         allocation.config = allocation.log = allocation.last = None
     yield
     with allocation.lock:

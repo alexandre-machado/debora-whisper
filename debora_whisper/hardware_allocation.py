@@ -6,10 +6,28 @@ Workers publish through their existing JSON/HTTP protocols to the main logger.
 import os
 import platform
 import threading
+from urllib.parse import urlsplit
 
 
 def one_line(value):
     return " ".join(str(value).split())
+
+
+def format_endpoint(value):
+    """Only expose an endpoint's origin, never credentials or URL payloads."""
+    if not value:
+        return "not configured"
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        if parsed.scheme not in ("http", "https") or not host:
+            return "invalid endpoint"
+        if ":" in host:
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return f"{parsed.scheme}://{host}{port}"
+    except (ValueError, TypeError, AttributeError):
+        return "invalid endpoint"
 
 
 def cpu_target():
@@ -101,7 +119,7 @@ def format_summary(config, rows):
             if component == "CLAUDE":
                 detail = f"external Claude Code; model={config.get('harness_model') or 'CLI default'}; not started"
             elif component == "TTS":
-                detail = f"not loaded/confirmed; endpoint={config.get('tts_url') or 'not configured'}"
+                detail = f"not loaded/confirmed; endpoint={format_endpoint(config.get('tts_url'))}"
             else:
                 detail = f"{config.get('llm_model', 'unknown')} not loaded"
         lines.append(f"  {component}  {one_line(detail)}")
@@ -116,6 +134,7 @@ class AllocationReporter:
         self.config = None
         self.log = None
         self.rows = {}
+        self.owners = {}
         self.last = None
 
     def configure(self, config, log):
@@ -126,10 +145,22 @@ class AllocationReporter:
                 self.rows.pop(key, None)
             self.last = None
 
-    def update(self, component, detail, *, emit=True):
+    def claim(self, component):
+        """Supersede earlier workers before starting a new reader thread."""
         with self.lock:
+            owner = object()
+            self.owners[component] = owner
+            self.rows.pop(component, None)
+            return owner
+
+    def update(self, component, detail, *, emit=True, owner=None):
+        with self.lock:
+            if owner is not None and self.owners.get(component) is not owner:
+                return
             if detail is None:
                 self.rows.pop(component, None)
+                # Revoke callbacks still queued by a stopped reader.
+                self.owners.pop(component, None)
             else:
                 self.rows[component] = one_line(detail)
             if emit:
@@ -150,7 +181,7 @@ allocation = AllocationReporter()
 
 def report_tts(config, inventory):
     """A server's PID/device belong to its environment, never to uv's PID."""
-    endpoint = config.get("tts_url", "unknown")
+    endpoint = format_endpoint(config.get("tts_url"))
     if not isinstance(inventory, dict) or inventory.get("loaded") is not True:
         detail = f"external endpoint={endpoint}; device/model/pid unreported"
     else:

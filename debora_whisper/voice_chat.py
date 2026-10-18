@@ -375,6 +375,7 @@ class LLMProcess:
             if log_path:
                 output.close()
         self._start = time.time()
+        self._allocation_owner = allocation.claim("LLM")
         threading.Thread(target=self._read, daemon=True).start()
 
     @property
@@ -401,7 +402,7 @@ class LLMProcess:
                 if report.get("fallbacks"):
                     detail += (f"; planned {report['planned']}, fell back to {target}: "
                                + "; ".join(report["fallbacks"]))
-                allocation.update("LLM", detail)
+                allocation.update("LLM", detail, owner=self._allocation_owner)
                 self.log(f"Voice chat: {self.key[0]} loaded on {self.device} in "
                          f"{time.time() - self._start:.1f}s (process {self.process.pid})")
                 self.loaded.set()
@@ -413,7 +414,8 @@ class LLMProcess:
         if self.error is None:
             self.error = f"the LLM process exited (code {code})"
         self.loaded.set()
-        allocation.update("LLM", f"unavailable; {self.error}  pid {self.process.pid}")
+        allocation.update("LLM", f"unavailable; {self.error}  pid {self.process.pid}",
+                          owner=self._allocation_owner)
         for replies in list(self._replies.values()):
             replies.put({"error": self.error})
 
@@ -478,6 +480,8 @@ class LLMProcess:
             self.process.wait(5)
         except subprocess.TimeoutExpired:
             kill_tree(self.process)
+        finally:
+            allocation.update("LLM", None, owner=self._allocation_owner)
 
 
 _llm_lock = threading.Lock()
@@ -522,7 +526,6 @@ def stop_llm():
         llm, _llm = _llm, None
     if llm is not None:
         llm.stop()
-        allocation.update("LLM", None)
 
 
 def generate_reply(messages: list[dict], config: dict, on_text, stop: threading.Event,
