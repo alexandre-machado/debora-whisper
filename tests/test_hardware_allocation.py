@@ -401,6 +401,7 @@ def test_dictation_startup_reports_only_confirmed_resident_tts(monkeypatch, load
     ensure.assert_not_called()
 
 
+@pytest.mark.parametrize("interleaved_log", [False, True])
 @pytest.mark.parametrize("inventory", [None, {"loaded": True, "model": "Chatterbox", "pid": 4321}])
 @pytest.mark.parametrize("endpoint,origin", [
     ("https://user-secret:pass-secret@voice.example:8443/path-secret?token=query-secret#fragment-secret",
@@ -411,7 +412,7 @@ def test_dictation_startup_reports_only_confirmed_resident_tts(monkeypatch, load
     ("https://[invalid-secret/path-secret", "invalid endpoint"),
 ])
 def test_tts_endpoint_secrets_never_reach_console_or_app_log(monkeypatch, tmp_path, capsys, inventory,
-                                                           endpoint, origin):
+                                                           endpoint, origin, interleaved_log):
     monkeypatch.setattr(de, "LOG_DIR", tmp_path)
     monkeypatch.setattr(de, "LOG_FILE", tmp_path / "app.log")
     config = {"voice_chat": True, "tts_url": endpoint}
@@ -419,6 +420,15 @@ def test_tts_endpoint_secrets_never_reach_console_or_app_log(monkeypatch, tmp_pa
     hw.allocation.emit()  # Before any successful health check.
     hw.report_tts(config, inventory)
     output = capsys.readouterr().out
-    assert output == de.LOG_FILE.read_text(encoding="utf-8")
-    assert output.count(f"endpoint={origin}") == 2
-    assert "secret" not in output
+    if interleaved_log:
+        # Deterministically reproduce a log arriving after console capture.
+        de.log("Unrelated background activity")
+    file_output = de.LOG_FILE.read_text(encoding="utf-8")
+    # Other threads may log between capture and read; only compare our rows.
+    def endpoint_lines(text):
+        return [line.split("] ", 1)[-1] for line in text.splitlines() if "endpoint=" in line]
+
+    assert endpoint_lines(output) == endpoint_lines(file_output)
+    for text in (output, file_output):
+        assert text.count(f"endpoint={origin}") == 2
+        assert "secret" not in text
