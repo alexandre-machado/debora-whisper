@@ -766,6 +766,10 @@ def _tts_capabilities(config):
         return _tts_capabilities_cache.get(config.get("tts_url", "").rstrip("/"), {}).copy()
 
 
+def _tts_streams(config):
+    return config.get("tts_stream", True) and _tts_capabilities(config).get("stream") is True
+
+
 def _tts_loading_health(config):
     with _tts_health_cache_lock:
         cached = _tts_health_cache.get(config.get("tts_url", "").rstrip("/"))
@@ -1497,7 +1501,8 @@ class VoiceChat:
             if claude:
                 chunk, state["markdown_pending"], state["fence"] = speech_markdown(
                     state["markdown_pending"] + chunk, state["fence"])
-            done, state["buffer"] = split_sentences(state["buffer"] + chunk, first=state["first"])
+            done, state["buffer"] = split_sentences(
+                state["buffer"] + chunk, first=state["first"] and not _tts_streams(self.config))
             for sentence in done:
                 if unwanted(sentence):
                     continue
@@ -1639,8 +1644,7 @@ class VoiceChat:
                                     timing["synth_start"] = time.perf_counter() - started
                                     self._playback.notify_all()
                                 try:
-                                    if (config.get("tts_stream", True)
-                                            and _tts_capabilities(config).get("stream") is True):
+                                    if _tts_streams(config):
                                         render_stream(spoken, config, timing)
                                     else:
                                         audio = synthesize(spoken, config)
