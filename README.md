@@ -515,8 +515,10 @@ first-audio latency depends on hardware and voice, and ~0.5 s is a target, not
 a measured guarantee. Warm-up and the waiting announcement still use WAV.
 See the [TTS HTTP protocol](docs/TTS-PROTOCOL.md) for framing and cancellation.
 
-`tts_reply_timeout_seconds` (positive number, default `900`) caps the entire
-reply when streaming is enabled, across sentences and pauses. The server also
+`tts_reply_timeout_seconds` (positive number, default `900`) limits each active speech burst, for streaming and WAV synthesis. Queued
+sentences, synthesis and playback share the budget; it resets when speech is idle.
+Silent LLM/tool work after a waiting announcement does not consume the answer’s
+budget. Expiry cancels speech only; reply text continues. The server also
 stops streams with no completed audio chunk for 120 seconds; ongoing synthesis
 can exceed that duration as long as chunks keep arriving.
 

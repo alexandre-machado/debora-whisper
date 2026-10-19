@@ -1382,7 +1382,17 @@ class VoiceChat:
         buffered = 0.0
         prebuffer = self.config.get("voice_chat_prebuffer", True)
         speech_started = None
-        streaming_started = threading.Event()
+        speech_pending = set()
+        playback_busy = False
+        playback_tail = 0.0
+
+        def reset_idle_budget():
+            nonlocal speech_started
+            # Called under _playback: include queued work, synthesis, playback
+            # and audio still buffered by the output device.
+            if (not speech_pending and clips.empty() and not playback_busy
+                    and time.monotonic() >= playback_tail):
+                speech_started = None
 
         def enqueue(sentence):
             nonlocal speech_started
@@ -1394,7 +1404,9 @@ class VoiceChat:
                           "spoken": spoken, "feedback": is_feedback}
                 timings.append(timing)
             with self._playback:
+                reset_idle_budget()
                 if any(c.isalnum() for c in spoken):
+                    speech_pending.add(timing["chunk"])
                     if speech_started is None:
                         speech_started = time.monotonic()
                     pending[timing["chunk"]] = timing
@@ -1439,7 +1451,8 @@ class VoiceChat:
             while not stop.is_set():
                 with self._playback:
                     remaining = None
-                    if streaming_started.is_set():
+                    reset_idle_budget()
+                    if speech_started is not None:
                         remaining = (speech_started + self.config.get(
                             "tts_reply_timeout_seconds", 900.0) - time.monotonic())
                     if remaining is not None and remaining <= 0:
@@ -1711,9 +1724,6 @@ class VoiceChat:
                                     # Read again after wait_tts_server: splitting may
                                     # have seen an empty cache before health arrived.
                                     if _tts_streams(config):
-                                        with self._playback:
-                                            streaming_started.set()
-                                            self._playback.notify_all()
                                         render_stream(spoken, config, timing)
                                     else:
                                         audio = synthesize(spoken, config)
@@ -1728,19 +1738,25 @@ class VoiceChat:
                                             spoken, timing["synth_end"] - timing["synth_start"],
                                             timing["audio"], timing["seconds"])
                         except TTSRejected as e:
-                            if timing.get("stream_queued"):
+                            if speech_stop.is_set():
+                                pass
+                            elif timing.get("stream_queued"):
                                 if not stop.is_set():
                                     self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
                             else:
                                 self.log(f"Voice chat: TTS skipped {spoken[:40]!r} ({e})")
                         except Exception as e:
                             # Keep showing the text even without a voice.
-                            tts_ok = False
-                            if not stop.is_set() and not _tts_stopping.is_set():
-                                self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
+                            if not speech_stop.is_set():
+                                tts_ok = False
+                                if not _tts_stopping.is_set():
+                                    self.log(f"Voice chat: TTS failed ({e}); showing the reply only.")
                     if stop.is_set():
                         return
                     if timing.get("stream_queued") and not speech_stop.is_set():
+                        with self._playback:
+                            speech_pending.discard(timing["chunk"])
+                            self._playback.notify_all()
                         if "play" in timing:
                             log_timing(timing)
                         continue
@@ -1758,17 +1774,20 @@ class VoiceChat:
                                     timing["audio"], timing.get("seconds", 0.0))
                             buffered += timing.get("seconds", 0.0)
                             pending.pop(timing["chunk"], None)
+                            speech_pending.discard(timing["chunk"])
                             clips.put((samples, audio[1], timing))
                             self._playback.notify_all()
                     else:
                         log_timing(timing)
                         with self._playback:
                             pending.pop(timing["chunk"], None)
+                            speech_pending.discard(timing["chunk"])
                             clips.put(((), None, timing))  # text only, in order
                             self._playback.notify_all()
             finally:
                 with self._playback:
                     pending.clear()
+                    speech_pending.clear()
                     clips.put(None)
                     self._playback.notify_all()
 
@@ -1811,17 +1830,19 @@ class VoiceChat:
                         replay_buffered()
                 while device_clips and device_clips[0][0] <= time.monotonic():
                     device_clips.popleft()
-                try:
+                with self._playback:
+                    playback_busy = False
+                    playback_tail = max(playback_tail, max(
+                        (expires for expires, _ in device_clips), default=0.0))
                     try:
                         clip = replay.popleft() if replay else clips.get_nowait()
                     except queue.Empty:
                         idle = True
-                        clip = clips.get(timeout=0.1)
-                except queue.Empty:
-                    # The last clip has played out; the next is still being
-                    # synthesized.
-                    self._show_audio(False)
-                    continue
+                        reset_idle_budget()
+                        self._show_audio(False)
+                        self._playback.wait(0.1)
+                        continue
+                    playback_busy = True
                 if clip is None or stop.is_set():
                     break
                 if speech_stop.is_set() or (not len(clip[0]) and not clip[2].get("last")):
@@ -1866,6 +1887,8 @@ class VoiceChat:
                                 play(clip[0], clip[1], clip_stop)
                         with self._playback:
                             cut = clip_stop.is_set()
+                            if not cut and len(clip[0]):
+                                playback_tail = time.monotonic() + getattr(play, "latency", 0.0)
                             if cut and not speech_stop.is_set():
                                 replay_buffered(clip)
                             elif not cut and len(clip[0]) and clip[2].get("streamed"):

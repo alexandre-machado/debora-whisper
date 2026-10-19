@@ -2440,7 +2440,8 @@ def test_stream_reply_deadline_spans_sentences(streaming_chat, monkeypatch):
     requests, logs = [], []
     expired = threading.Event()
     clock = [100.0]
-    monkeypatch.setattr(vc.time, "monotonic", lambda: clock[0])
+    from types import SimpleNamespace
+    monkeypatch.setattr(vc, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: clock[0]}))
 
     def log(line):
         logs.append(line)
@@ -2474,7 +2475,8 @@ def test_stream_deadline_cancels_speech_but_preserves_llm_turn(streaming_chat, m
     turn_stop = threading.Event()
     observed, played, shown = [], [], []
     clock = [100.0]
-    monkeypatch.setattr(vc.time, "monotonic", lambda: clock[0])
+    from types import SimpleNamespace
+    monkeypatch.setattr(vc, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: clock[0]}))
 
     def log(line):
         if "only speech cancelled" in line:
@@ -2508,6 +2510,81 @@ def test_stream_deadline_cancels_speech_but_preserves_llm_turn(streaming_chat, m
     assert len(played) == 1
     assert "Resposta depois do prazo." in reply
     assert "Resposta depois do prazo." in shown[-1]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("waiting", [False, True])
+def test_silent_gap_resets_speech_deadline(server, monkeypatch, streaming, waiting):
+    from types import SimpleNamespace
+    clock = [100.0]
+    monkeypatch.setattr(vc, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: clock[0]}))
+    heard, idle = threading.Event(), threading.Event()
+    requested, played, logs = [], [], []
+    audio = np.full(100, 0.2, np.float32), 1000
+
+    def synth(text, config):
+        requested.append(text)
+        clock[0] += 6
+        return audio
+
+    def llm(messages, on_text, stop):
+        if not waiting:
+            on_text("Vou rodar os testes. ")
+        assert idle.wait(4), "first speech burst did not finish"
+        clock[0] += 100
+        # Let the watchdog observe the silent interval before the next burst.
+        time.sleep(0.2)
+        on_text("Os testes passaram. ")
+
+    def play(samples, rate, stop):
+        played.append(samples)
+        heard.set()
+
+    config = {**DEFAULT_CONFIG, "tts_url": server.tts_url,
+              "tts_reply_timeout_seconds": 10, "voice_chat_prebuffer": False,
+              "voice_chat_backend": "claude" if waiting else "local"}
+    monkeypatch.setattr(vc, "wait_tts_server", lambda cfg: True)
+    monkeypatch.setattr(vc, "synthesize", synth)
+    monkeypatch.setattr(vc, "synthesize_stream", lambda text, cfg: iter([synth(text, cfg)]))
+    vc._cache_tts_health(config, {"ok": True, "stream": streaming})
+    chat = vc.VoiceChat(config, llm=llm, play=play, log=logs.append)
+    monkeypatch.setattr(chat, "_show_audio", lambda active: idle.set() if not active and heard.is_set() else None)
+    reply = chat.respond("oi")
+    assert "Os testes passaram." in reply
+    assert requested == ["Um instante." if waiting else "Vou rodar os testes.", "Os testes passaram."]
+    assert len(played) == 2
+    assert not any("deadline exceeded" in line for line in logs)
+
+
+def test_wav_reply_deadline_cancels_synthesis(server, monkeypatch):
+    from types import SimpleNamespace
+    clock = [100.0]
+    monkeypatch.setattr(vc, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: clock[0]}))
+    expired = threading.Event()
+    logs, played = [], []
+
+    def log(line):
+        logs.append(line)
+        if "reply deadline exceeded" in line:
+            expired.set()
+
+    def synth(text, config):
+        clock[0] += 11
+        with chat._playback:
+            chat._playback.notify_all()
+        assert expired.wait(3)
+        assert config["_tts_cancellation"].cancelled
+        raise OSError("cancelled socket")
+
+    config = {**DEFAULT_CONFIG, "tts_url": server.tts_url, "tts_reply_timeout_seconds": 10}
+    monkeypatch.setattr(vc, "wait_tts_server", lambda cfg: True)
+    monkeypatch.setattr(vc, "synthesize", synth)
+    vc._cache_tts_health(config, {"ok": True})
+    chat = vc.VoiceChat(config, llm=FakeLLM(["Uma frase longa."]),
+                        play=lambda *args: played.append(args), log=log)
+    assert chat.respond("oi") == "Uma frase longa."
+    assert expired.is_set() and not played
+    assert not any("TTS failed" in line for line in logs)
 
 
 def test_stream_all_silent_sentence_shows_text(streaming_chat, monkeypatch):
