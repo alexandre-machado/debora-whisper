@@ -10,6 +10,17 @@ from debora_whisper.dictation_engine import AppState, DictationApp, DEFAULT_CONF
 class TestTranscriptionThreading:
     """Verify transcription runs in background thread, not hotkey thread."""
 
+    def test_stop_unhooks_keyboard_before_joining_monitor(self):
+        app = DictationApp({**DEFAULT_CONFIG, "beep_on_start": False})
+        stop_monitoring = app.stop_monitoring
+        with patch("keyboard.unhook_all") as unhook:
+            def stop():
+                unhook.assert_called_once_with()
+                stop_monitoring()
+
+            with patch.object(app, "stop_monitoring", side_effect=stop):
+                app.stop()
+
     def test_toggle_recording_stop_does_not_block(self):
         """Stopping recording must return quickly (transcription in background)."""
         config = {**DEFAULT_CONFIG, "beep_on_start": False}

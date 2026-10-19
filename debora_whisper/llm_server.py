@@ -129,12 +129,10 @@ def serve(model_dir: str, device: str, cache_dir: str, stdin, stdout) -> int:
             elif "messages" in message:
                 cancelled[message["id"]] = threading.Event()
                 requests.put(message)
-    except BaseException:
+    finally:
         for event in list(cancelled.values()):
             event.set()
-        raise
-    finally:
-        # Drain accepted requests on EOF, then release the queue waiter.
+        # Cancel accepted requests on EOF or input failure, then release the waiter.
         requests.put(None)
         worker.join()
     return 0

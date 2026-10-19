@@ -421,8 +421,8 @@ def _query_process(source, request, deadline, events, cancelled):
         pass
     finally:
         if process is not None:
-            # kill_tree may itself stall in taskkill. This is a daemon worker;
-            # no startup path joins it or waits for native driver teardown.
+            # kill_tree may stall in taskkill; stop_inventory_workers bounds
+            # its join of this daemon worker during shutdown.
             kill_tree(process)
             if process.stdin is not None:
                 try:

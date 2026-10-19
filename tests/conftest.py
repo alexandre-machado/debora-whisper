@@ -81,6 +81,9 @@ def pytest_configure(config):
 def _thread_guard(request, monkeypatch):
     """Clean up owned services before monkeypatch teardown; report all survivors."""
     from debora_whisper import dictation_engine as engine, voice_chat, device_inventory
+    from tqdm import tqdm
+    # Progress accounting is synchronous; tests need no background UI refresh.
+    monkeypatch.setattr(tqdm, "monitor_interval", 0)
     before = set(threading.enumerate())
     apps = []
     initialize = engine.DictationApp.__init__

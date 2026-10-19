@@ -997,8 +997,7 @@ def wait_tts_server(config: dict, timeout=TTS_STARTUP_SECONDS) -> bool:
         time.sleep(0.5)
 
 
-def stop_tts_health_polls(timeout=TTS_HEALTH_SECONDS + 1.0):
-    """Cancel telemetry and wait outside its lock so pollers can finish."""
+def _cancel_tts_health_polls():
     with _tts_health_cache_lock:
         polls = list(_tts_health_polls.values())
         for cancelled, _ in polls:
@@ -1006,10 +1005,19 @@ def stop_tts_health_polls(timeout=TTS_HEALTH_SECONDS + 1.0):
         _tts_health_polls.clear()
         _tts_health_cache.clear()
         _tts_capabilities_cache.clear()
+    return polls
+
+
+def _join_tts_health_polls(polls, timeout=TTS_HEALTH_SECONDS + 1.0):
     deadline = _perf_counter() + timeout
     for _, worker in polls:
         if worker is not threading.current_thread():
             worker.join(max(0, deadline - _perf_counter()))
+
+
+def stop_tts_health_polls(timeout=TTS_HEALTH_SECONDS + 1.0):
+    """Cancel telemetry and wait outside its lock so pollers can finish."""
+    _join_tts_health_polls(_cancel_tts_health_polls(), timeout)
 
 
 def stop_tts_server():
@@ -1019,12 +1027,16 @@ def stop_tts_server():
         _tts_stopping.set()
         process, _tts_process = _tts_process, None
         _tts_server_key = None
-    stop_tts_health_polls()
+        polls = _cancel_tts_health_polls()
+    # End server work before waiting for health requests to return.
+    try:
+        if process is not None:
+            # uv launches a child server; terminate the whole process tree.
+            kill_tree(process)
+    finally:
+        _join_tts_health_polls(polls)
     if process is None:
         return
-    # uv runs the server as a child process: end the whole tree, or the
-    # server keeps its GPU memory after uv is gone.
-    kill_tree(process)
     allocation.update("TTS", None)
     try:
         process.wait(5)

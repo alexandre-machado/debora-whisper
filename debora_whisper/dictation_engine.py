@@ -3904,13 +3904,13 @@ class DictationApp:
         # after this line no transcription can be typed or added to history.
         with self._output_lock:
             self._stopping.set()
-        self.stop_monitoring()
-        self._interrupt_voice_reply()
         try:
             import keyboard
             keyboard.unhook_all()
         except Exception:
             pass
+        self.stop_monitoring()
+        self._interrupt_voice_reply()
         with self._audio_lifecycle_lock:
             self.is_recording = False
             try:
