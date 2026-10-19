@@ -452,8 +452,8 @@ def validate_config(config: dict):
         raise ValueError(f"tts_timeout_seconds must be a positive number, got {timeout!r}")
     timeout = config.get("tts_reply_timeout_seconds", DEFAULT_CONFIG["tts_reply_timeout_seconds"])
     if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-            or not 0 < timeout < float("inf")):
-        raise ValueError(f"tts_reply_timeout_seconds must be a finite positive number, got {timeout!r}")
+            or not 0 < timeout <= 86400):
+        raise ValueError(f"tts_reply_timeout_seconds must be positive and at most 86400, got {timeout!r}")
 
 
 # ---------------------------------------------------------------------------

@@ -2438,24 +2438,108 @@ def test_stream_pause_replays_previous_device_buffer(streaming_chat, stream, mon
 
 def test_stream_reply_deadline_spans_sentences(streaming_chat, monkeypatch):
     requests, logs = [], []
+    expired = threading.Event()
+    clock = [100.0]
+    monkeypatch.setattr(vc.time, "monotonic", lambda: clock[0])
+
+    def log(line):
+        logs.append(line)
+        if "reply deadline exceeded" in line:
+            expired.set()
 
     def synth(text, config):
         requests.append(text)
-        for _ in range(4):
-            time.sleep(0.03)
-            yield np.full(100, 0.2, np.float32), 1000
+        clock[0] += 6
+        if len(requests) == 2:
+            with chat._playback:
+                chat._playback.notify_all()
+            assert expired.wait(3)
+        yield np.full(100, 0.2, np.float32), 1000
 
     monkeypatch.setattr(vc, "synthesize_stream", synth)
-    chat = vc.VoiceChat({**DEFAULT_CONFIG, "tts_reply_timeout_seconds": 0.3},
-                        play=lambda *a: None, log=logs.append,
+    chat = vc.VoiceChat({**DEFAULT_CONFIG, "tts_reply_timeout_seconds": 10},
+                        play=lambda *a: None, log=log,
                         llm=FakeLLM(["Primeira frase longa. Segunda frase longa. Terceira frase longa. Quarta frase longa."]))
     # Keep startup time out of this short regression deadline.
     monkeypatch.setattr(vc, "wait_tts_server", lambda cfg: True)
     vc._cache_tts_health(chat.config, {"ok": True, "stream": True})
     chat.respond("oi")
-    assert 1 < len(requests) < 4
+    assert len(requests) == 2
     assert any("reply deadline exceeded" in line for line in logs)
     assert chat._tts_cancellation.cancelled
+
+
+def test_stream_deadline_cancels_speech_but_preserves_llm_turn(streaming_chat, monkeypatch):
+    expired = threading.Event()
+    turn_stop = threading.Event()
+    observed, played, shown = [], [], []
+    clock = [100.0]
+    monkeypatch.setattr(vc.time, "monotonic", lambda: clock[0])
+
+    def log(line):
+        if "only speech cancelled" in line:
+            expired.set()
+
+    def llm(messages, on_text, stop):
+        # Time spent in Claude before speech must not consume the TTS budget.
+        clock[0] += 100
+        on_text("Primeira frase longa. ")
+        assert expired.wait(3)
+        observed.append((stop is turn_stop, stop.is_set(), chat._tts_cancellation.cancelled))
+        on_text("Resposta depois do prazo.")
+
+    def synth(text, config):
+        yield np.full(100, 0.2, np.float32), 1000
+        assert expired.wait(3)
+
+    def play(samples, rate, stop):
+        played.append(samples)
+        clock[0] += 11
+        with chat._playback:
+            chat._playback.notify_all()
+        assert expired.wait(3)
+        observed.append(stop.is_set())
+
+    monkeypatch.setattr(vc, "synthesize_stream", synth)
+    chat = vc.VoiceChat({**DEFAULT_CONFIG, "tts_reply_timeout_seconds": 10},
+                        llm=llm, play=play, log=log)
+    reply = chat.respond("oi", stop=turn_stop, on_reply=lambda *args: shown.append(args[0]))
+    assert (True, False, True) in observed and True in observed
+    assert len(played) == 1
+    assert "Resposta depois do prazo." in reply
+    assert "Resposta depois do prazo." in shown[-1]
+
+
+def test_stream_all_silent_sentence_shows_text(streaming_chat, monkeypatch):
+    monkeypatch.setattr(vc, "synthesize_stream", lambda *a: iter([
+        (np.zeros(2400, np.float32), 24000)]))
+    played, shown = [], []
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), llm=FakeLLM(["Uma frase silenciosa."]),
+                        play=lambda *a: played.append(a), log=lambda *a: None)
+    assert chat.respond("oi", on_reply=lambda *a: shown.append(a[0])) == "Uma frase silenciosa."
+    assert shown == ["Uma frase silenciosa."]
+    assert played == []
+
+
+def test_stream_cold_cache_non_streaming_backend_keeps_first_sentence(server, monkeypatch):
+    server.health_body = json.dumps({"ok": True, "stream": False}).encode()
+    # Defer discovery until the renderer's readiness check so splitting really
+    # sees a cold cache, rather than health fetched by startup reconciliation.
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
+    whole = MagicMock(return_value=(np.full(2400, 0.2, np.float32), 24000))
+    streaming = MagicMock()
+    monkeypatch.setattr(vc, "synthesize", whole)
+    monkeypatch.setattr(vc, "synthesize_stream", streaming)
+    sentence = "Esta primeira parte tem palavras suficientes, e esta segunda termina a frase."
+    chat = vc.VoiceChat(_cfg(server), llm=FakeLLM([sentence]),
+                        play=lambda *a: None, log=lambda *a: None)
+    assert vc._tts_capabilities(chat.config) == {}
+    # Unknown capabilities preserve the full first sentence: a cold non-streaming
+    # backend trades early clause audio for avoiding fragmented streaming input.
+    chat.respond("oi")
+    assert whole.call_count == 1
+    assert whole.call_args.args[0] == sentence
+    streaming.assert_not_called()
 
 
 def test_stream_renderer_join_is_bounded(streaming_chat, monkeypatch):
