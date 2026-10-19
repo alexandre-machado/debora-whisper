@@ -70,6 +70,8 @@ def audio_backend(monkeypatch):
         play=MagicMock(),
     )
     monkeypatch.setitem(sys.modules, 'sounddevice', sd)
+    # keyboard.unhook_all() initializes real listener threads even without hooks.
+    monkeypatch.setitem(sys.modules, 'keyboard', MagicMock())
     monkeypatch.setattr(engine, 'log', MagicMock())
     return SimpleNamespace(sd=sd, streams=streams, Status=Status)
 

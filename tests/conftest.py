@@ -2,9 +2,14 @@
 import os
 import sys
 import tempfile
+import threading
+from time import monotonic
+import warnings
 from pathlib import Path
 
 import pytest
+
+_THREAD_JOIN_SECONDS = 2.0
 
 # Importing the package must never move the user's pre-rename folders, nor
 # create model or cache folders in the user's shared MODELS_DIR.
@@ -18,8 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 @pytest.fixture(autouse=True, scope="session")
 def _private_logs(tmp_path_factory):
     """Tests log to a temporary folder, never to the user's app.log, and
-    never record a lost NPU or a hardware inventory for the real app. Not restored afterwards: daemon
-    threads of finished tests may still log."""
+    never record a lost NPU or a hardware inventory for the real app."""
     from debora_whisper import dictation_engine as engine
     home = tmp_path_factory.mktemp("debora")
     engine.LOG_DIR = home / "logs"
@@ -69,6 +73,50 @@ def _reset_device_failure_latch():
 def pytest_configure(config):
     config.addinivalue_line(
         "markers", "shipped_defaults: sees DEFAULT_CONFIG as users get it")
+    config.addinivalue_line(
+        "markers", "allow_thread_leak: allow surviving threads (explain why in a comment)")
+
+
+@pytest.fixture(autouse=True)
+def _thread_guard(request, monkeypatch):
+    """Clean up owned services before monkeypatch teardown; report all survivors."""
+    from debora_whisper import dictation_engine as engine, voice_chat, device_inventory
+    from tqdm import tqdm
+    # Progress accounting is synchronous; tests need no background UI refresh.
+    monkeypatch.setattr(tqdm, "monitor_interval", 0)
+    before = set(threading.enumerate())
+    apps = []
+    initialize = engine.DictationApp.__init__
+
+    def track_app(self, *args, **kwargs):
+        apps.append(self)
+        initialize(self, *args, **kwargs)
+
+    monkeypatch.setattr(engine.DictationApp, "__init__", track_app)
+    yield
+    for app in apps:
+        if hasattr(app, "_stopping"):
+            app.stop_monitoring()
+    voice_chat.stop_tts_health_polls()
+    device_inventory.stop_inventory_workers()
+    # One shared budget, including children spawned while their parent exits.
+    deadline = monotonic() + _THREAD_JOIN_SECONDS
+    while True:
+        surviving = [t for t in threading.enumerate() if t not in before and t.is_alive()]
+        if not surviving or monotonic() >= deadline:
+            break
+        for worker in surviving:
+            worker.join(max(0, deadline - monotonic()))
+    if not surviving:
+        return
+    details = ", ".join(f"{t.name} (ident={t.ident}, daemon={t.daemon})" for t in surviving)
+    message = f"{request.node.nodeid}: new threads still alive after teardown: {details}"
+    if request.node.get_closest_marker("allow_thread_leak"):
+        warnings.warn(message, pytest.PytestWarning, stacklevel=1)
+    elif any(not t.daemon for t in surviving):
+        pytest.fail(message, pytrace=False)
+    else:
+        warnings.warn(message, pytest.PytestWarning, stacklevel=1)
 
 
 @pytest.fixture(autouse=True)

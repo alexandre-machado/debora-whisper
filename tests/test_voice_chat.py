@@ -988,7 +988,9 @@ def test_hotkey_while_speaking_interrupts_the_reply():
     start.assert_not_called()
 
 
-def test_stop_interrupts_the_reply():
+def test_stop_interrupts_the_reply(monkeypatch):
+    # keyboard.unhook_all starts global listener threads even with no hooks.
+    monkeypatch.setattr("keyboard.unhook_all", MagicMock())
     app = _app(voice_chat=True)
     with patch.object(app.voice_chat, "interrupt") as interrupt:
         app.stop()
@@ -1149,6 +1151,44 @@ def _closed_port_url():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return f"http://127.0.0.1:{s.getsockname()[1]}"
+
+
+def test_tts_stop_cancels_health_under_lock_and_kills_before_join(monkeypatch):
+    process = MagicMock()
+    cancelled = threading.Event()
+    worker = MagicMock()
+    order = []
+    monkeypatch.setattr(vc, "_tts_process", process)
+    monkeypatch.setattr(vc, "_tts_server_key", "old")
+    monkeypatch.setattr(vc, "_tts_health_polls", {"url": (cancelled, worker)})
+    monkeypatch.setattr(vc, "_tts_health_cache", {"url": {}})
+    monkeypatch.setattr(vc, "_tts_capabilities_cache", {"url": {}})
+    cancel_polls = vc._cancel_tts_health_polls
+
+    def cancel():
+        assert vc._tts_lock._is_owned()
+        return cancel_polls()
+
+    def kill(actual):
+        assert actual is process
+        assert cancelled.is_set()
+        assert not vc._tts_health_polls
+        assert not vc._tts_health_cache
+        assert not vc._tts_capabilities_cache
+        order.append("kill")
+
+    def join(timeout):
+        assert order == ["kill"]
+        assert 0 <= timeout <= vc.TTS_HEALTH_SECONDS + 1.0
+        order.append("join")
+
+    # Teardown also cancels health polls, independently of server shutdown.
+    with monkeypatch.context() as shutdown_patch:
+        shutdown_patch.setattr(vc, "_cancel_tts_health_polls", cancel)
+        shutdown_patch.setattr(vc, "kill_tree", kill)
+        worker.join.side_effect = join
+        vc.stop_tts_server()
+    assert order == ["kill", "join"]
 
 
 def test_tts_server_command_is_started_when_nothing_answers(no_tts_process, tmp_path):

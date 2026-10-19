@@ -57,8 +57,13 @@ def probe_npu(config: dict, model_path, timeout=NPU_PROBE_TIMEOUT, command=None)
     try:
         output, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        # Not waited for: a process stuck in the driver may never exit.
         kill_tree(process)
+        # Windows communicate() owns a reader thread. Drain it after killing
+        # the child, but bound the wait if native driver teardown is stuck.
+        try:
+            process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
         raise RuntimeError(f"no answer in {timeout}s (the NPU driver is probably "
                            f"hung); probe process {process.pid} killed") from None
     from debora_whisper.dictation_engine import log

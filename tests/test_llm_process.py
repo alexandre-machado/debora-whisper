@@ -77,6 +77,14 @@ class FakePipeline:
 
 @pytest.fixture
 def genai(monkeypatch):
+    from debora_whisper import device_queries
+
+    # Identity queries must use the same fake backend as model loading.
+    # Importing real OpenVINO starts its global telemetry executor.
+    core = MagicMock()
+    core.get_property.side_effect = lambda device, prop: (
+        "0" if prop == "DEVICE_ID" else "Test device")
+    monkeypatch.setattr(device_queries, "openvino_core", lambda: core)
     module = MagicMock()
     module.LLMPipeline = FakePipeline
     module.StreamingStatus.CANCEL, module.StreamingStatus.RUNNING = "CANCEL", "RUNNING"
@@ -86,10 +94,23 @@ def genai(monkeypatch):
 
 
 def _serve(*requests):
-    out = io.StringIO()
-    stdin = io.StringIO("".join(json.dumps(r) + "\n" for r in requests))
-    code = llm_server.serve("model", "GPU", "cache", stdin, out)
-    time.sleep(0.2)  # the worker answers after stdin is read
+    done = threading.Event()
+
+    class Output(io.StringIO):
+        def write(self, text):
+            result = super().write(text)
+            if '"done": true' in text:
+                done.set()
+            return result
+
+    def lines():
+        for request in requests:
+            done.clear()
+            yield json.dumps(request) + "\n"
+            assert done.wait(2), "Reply did not finish before closing input"
+
+    out = Output()
+    code = llm_server.serve("model", "GPU", "cache", lines(), out)
     return code, [json.loads(line) for line in out.getvalue().splitlines()]
 
 
@@ -100,6 +121,44 @@ def test_server_says_where_it_loaded_and_streams_the_reply(genai):
     assert out[0]["ready"] == "GPU"
     assert [m["text"] for m in out if "text" in m] == ["Olá", "!", " Tudo", " bem."]
     assert out[-1] == {"id": 1, "done": True}
+    assert out[0]["allocation"]["target"] == "OV:GPU.0 Test device"
+
+
+@pytest.mark.parametrize("broken_input", [False, True])
+def test_server_joins_worker_when_input_stops(genai, monkeypatch, broken_input):
+    workers = []
+    thread = threading.Thread
+    started = threading.Event()
+    cancellations = []
+
+    def generate(pipe, request, cancelled, say):
+        started.set()
+        cancellations.append((request["id"], cancelled.wait(1)))
+
+    def track_worker(*args, **kwargs):
+        worker = thread(*args, **kwargs)
+        workers.append(worker)
+        return worker
+
+    def lines():
+        yield json.dumps({"id": 1, "messages": [], "max_new_tokens": 9})
+        assert started.wait(2), "Generation did not start"
+        yield json.dumps({"id": 2, "messages": [], "max_new_tokens": 9})
+        if broken_input:
+            raise OSError("input closed")
+
+    monkeypatch.setattr(llm_server.threading, "Thread", track_worker)
+    monkeypatch.setattr(llm_server, "generate", generate)
+    start = time.monotonic()
+    if broken_input:
+        with pytest.raises(OSError, match="input closed"):
+            llm_server.serve("model", "GPU", "cache", lines(), io.StringIO())
+    else:
+        assert llm_server.serve("model", "GPU", "cache", lines(), io.StringIO()) == 0
+    assert workers
+    assert all(not worker.is_alive() for worker in workers)
+    assert cancellations == [(1, True), (2, True)]
+    assert time.monotonic() - start < 1
 
 
 def test_server_templates_without_thinking(genai):

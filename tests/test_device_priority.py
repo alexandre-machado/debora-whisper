@@ -384,7 +384,7 @@ def test_inventory_deadline_survives_hung_query_or_cache(monkeypatch, tmp_path, 
     written = threading.Event()
     observed = _observed()
 
-    def query(source, request, deadline, events):
+    def query(source, request, deadline, events, cancelled):
         if source == hung:
             # Native calls live in a child; this models the reader waiting
             # forever for that child, without running a real driver in tests.
@@ -457,7 +457,7 @@ def test_inventory_logging_is_one_line_and_does_not_select(monkeypatch, tmp_path
     config = _cfg()
     before = copy.deepcopy(config)
     result = {**inventory.make_inventory(_observed()), "elapsed_ms": 123.4, "timed_out": False}
-    monkeypatch.setattr(inventory, "probe_inventory", lambda *args: result)
+    monkeypatch.setattr(inventory, "probe_inventory", lambda *args, **kwargs: result)
     monkeypatch.setattr(de, "HARDWARE_INVENTORY", tmp_path / "inventory.json")
     logs = []
     monkeypatch.setattr(de, "log", logs.append)

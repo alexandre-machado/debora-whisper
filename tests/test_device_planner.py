@@ -393,7 +393,7 @@ def test_logging_hook_runs_in_background_without_changing_config(monkeypatch, mo
     def capture(*args, **kwargs):
         calls.append(threading.current_thread())
         return plan(*args, **kwargs)
-    monkeypatch.setattr(device_inventory, "probe_inventory", lambda *args: inventory)
+    monkeypatch.setattr(device_inventory, "probe_inventory", lambda *args, **kwargs: inventory)
     monkeypatch.setattr(device_planner, "plan", capture)
     monkeypatch.setattr(engine, "log", logs.append)
     thread = engine.log_hardware_inventory(config)
@@ -417,7 +417,7 @@ def test_logging_failure_is_contained(monkeypatch, failure):
     def fail(*args, **kwargs):
         raise RuntimeError("synthetic failure")
     monkeypatch.setattr(engine, "log", logs.append)
-    monkeypatch.setattr(device_inventory, "probe_inventory", fail if failure == "probe" else lambda *args: _inventory())
+    monkeypatch.setattr(device_inventory, "probe_inventory", fail if failure == "probe" else lambda *args, **kwargs: _inventory())
     if failure == "planner":
         monkeypatch.setattr(device_planner, "plan", fail)
     thread = engine.log_hardware_inventory(_config())
@@ -437,7 +437,7 @@ def test_logging_uses_one_snapshot_while_caller_changes_config(monkeypatch):
     started, release = threading.Event(), threading.Event()
     requests, calls, results, logs = [], [], [], []
 
-    def blocked_probe(request, cache_path):
+    def blocked_probe(request, cache_path, **kwargs):
         requests.append(request)
         started.set()
         assert release.wait(5)
@@ -506,7 +506,7 @@ def test_logging_reuses_live_tts_allocation(monkeypatch, kind, physical_id, expe
         results.append(result)
         return result
 
-    monkeypatch.setattr(device_inventory, "probe_inventory", lambda *args: inventory)
+    monkeypatch.setattr(device_inventory, "probe_inventory", lambda *args, **kwargs: inventory)
     monkeypatch.setattr(device_planner, "plan", capture)
     monkeypatch.setattr(engine, "log", logs.append)
     config = _config(voice_chat=True, voice_chat_backend="claude")

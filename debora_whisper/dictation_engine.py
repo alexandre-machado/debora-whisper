@@ -634,14 +634,17 @@ def apply_device_priority(config: dict):
 
 def log_hardware_inventory(config: dict):
     """Collect diagnostics only; keep preferences and all loaders untouched."""
-    from debora_whisper.device_inventory import probe_inventory, inventory_summary
+    from debora_whisper.device_inventory import probe_inventory, inventory_summary, start_inventory_worker
+    cancelled = threading.Event()
     snapshot = deepcopy(config)
     request = {"config": snapshot, "model_info": MODEL_REGISTRY[snapshot["model_size"]],
                "model_dir": str(MODEL_DIR), "npu_loss_file": str(NPU_LOST_FILE)}
     def probe():
         inventory = None
         try:
-            inventory = probe_inventory(request, HARDWARE_INVENTORY)
+            inventory = probe_inventory(request, HARDWARE_INVENTORY, cancelled=cancelled)
+            if cancelled.is_set():
+                return
             log(inventory_summary(inventory))
             tts = inventory.get("observed", {}).get("tts")
             if isinstance(tts, dict) and tts.get("status") == "ok" and tts.get("loaded") is True:
@@ -655,6 +658,8 @@ def log_hardware_inventory(config: dict):
                                   + "; temporary subprocesses, no model allocations")
         except Exception as e:
             log(f"Hardware inventory failed: {type(e).__name__}: {e}")
+        if cancelled.is_set():
+            return
         try:
             from debora_whisper.device_planner import plan, resident_tts
             mode = "dictation"
@@ -674,9 +679,7 @@ def log_hardware_inventory(config: dict):
             log(f"Device plan failed: {type(e).__name__}: {e}")
 
     # Startup never waits for it: it only informs, nothing reads it yet.
-    thread = threading.Thread(target=probe, name="hardware-inventory", daemon=True)
-    thread.start()
-    return thread
+    return start_inventory_worker(probe, cancelled=cancelled, name="hardware-inventory")
 
 
 def _failure_detail(exc: BaseException) -> str:
@@ -2613,7 +2616,8 @@ class DictationApp:
         self._voice_stop = None
         self._voice_worker = None
 
-        self._resource_thread = threading.Thread(target=self._monitor_resources, daemon=True)
+        self._resource_thread = threading.Thread(target=self._monitor_resources,
+                                                 name="resource-monitor", daemon=True)
         self._resource_thread.start()
         allocation.emit()
 
@@ -3887,18 +3891,26 @@ class DictationApp:
             gc.collect()
         return None
 
+    def stop_monitoring(self, timeout=2.0):
+        """Cancel and join telemetry, also usable without desktop shutdown."""
+        self._stopping.set()
+        worker = getattr(self, "_resource_thread", None)
+        if worker is not None and worker is not threading.current_thread() and worker.ident is not None:
+            worker.join(timeout)
+
     def stop(self):
         """Clean shutdown — unhook keyboard and stop recording if active."""
         # Taking the output lock orders this against a paste in progress:
         # after this line no transcription can be typed or added to history.
         with self._output_lock:
             self._stopping.set()
-        self._interrupt_voice_reply()
         try:
             import keyboard
             keyboard.unhook_all()
         except Exception:
             pass
+        self.stop_monitoring()
+        self._interrupt_voice_reply()
         with self._audio_lifecycle_lock:
             self.is_recording = False
             try:
