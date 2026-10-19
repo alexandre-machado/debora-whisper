@@ -26,6 +26,7 @@ import wave
 from dataclasses import dataclass
 # Bound at import: tests replace threading.Timer to drive reply feedback.
 from threading import Timer as _DeadlineTimer
+from time import perf_counter as _perf_counter
 from pathlib import Path
 
 from debora_whisper import paths
@@ -996,19 +997,29 @@ def wait_tts_server(config: dict, timeout=TTS_STARTUP_SECONDS) -> bool:
         time.sleep(0.5)
 
 
+def stop_tts_health_polls(timeout=TTS_HEALTH_SECONDS + 1.0):
+    """Cancel telemetry and wait outside its lock so pollers can finish."""
+    with _tts_health_cache_lock:
+        polls = list(_tts_health_polls.values())
+        for cancelled, _ in polls:
+            cancelled.set()
+        _tts_health_polls.clear()
+        _tts_health_cache.clear()
+        _tts_capabilities_cache.clear()
+    deadline = _perf_counter() + timeout
+    for _, worker in polls:
+        if worker is not threading.current_thread():
+            worker.join(max(0, deadline - _perf_counter()))
+
+
 def stop_tts_server():
     """Stop the TTS server this process started, if any."""
     global _tts_process, _tts_server_key
     with _tts_lock:
         _tts_stopping.set()
-        with _tts_health_cache_lock:
-            for cancelled, _ in _tts_health_polls.values():
-                cancelled.set()
-            _tts_health_polls.clear()
-            _tts_health_cache.clear()
-            _tts_capabilities_cache.clear()
         process, _tts_process = _tts_process, None
         _tts_server_key = None
+    stop_tts_health_polls()
     if process is None:
         return
     # uv runs the server as a child process: end the whole tree, or the

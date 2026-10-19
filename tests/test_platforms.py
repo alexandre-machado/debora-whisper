@@ -26,10 +26,11 @@ def test_generic_kill_tree(returncode):
 
 
 @pytest.mark.parametrize("returncode", [None, 0, 1])
-def test_windows_kill_tree(monkeypatch, returncode):
+@pytest.mark.parametrize("taskkill_status", [0, 1])
+def test_windows_kill_tree(monkeypatch, returncode, taskkill_status):
     # The provider module also imports on systems without Windows constants.
     monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
-    run = Mock()
+    run = Mock(return_value=Mock(returncode=taskkill_status))
     monkeypatch.setattr(subprocess, "run", run)
     process = Mock(pid=1234)
     process.poll.return_value = returncode
@@ -40,7 +41,10 @@ def test_windows_kill_tree(monkeypatch, returncode):
             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
     else:
         run.assert_not_called()
-    process.kill.assert_not_called()
+    if returncode is None and taskkill_status:
+        process.kill.assert_called_once_with()
+    else:
+        process.kill.assert_not_called()
 
 
 def test_no_window_comes_from_provider():

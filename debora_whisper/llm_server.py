@@ -115,19 +115,28 @@ def serve(model_dir: str, device: str, cache_dir: str, stdin, stdout) -> int:
             generate(pipe, request, cancelled[request["id"]], say)
             cancelled.pop(request["id"], None)
 
-    threading.Thread(target=work, daemon=True).start()
-    for line in stdin:
-        try:
-            message = json.loads(line)
-        except ValueError:
-            continue
-        if "cancel" in message:
-            if (event := cancelled.get(message["cancel"])) is not None:
-                event.set()
-        elif "messages" in message:
-            cancelled[message["id"]] = threading.Event()
-            requests.put(message)
-    # The app is gone: nobody reads the reply in progress.
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    try:
+        for line in stdin:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if "cancel" in message:
+                if (event := cancelled.get(message["cancel"])) is not None:
+                    event.set()
+            elif "messages" in message:
+                cancelled[message["id"]] = threading.Event()
+                requests.put(message)
+    except BaseException:
+        for event in list(cancelled.values()):
+            event.set()
+        raise
+    finally:
+        # Drain accepted requests on EOF, then release the queue waiter.
+        requests.put(None)
+        worker.join()
     return 0
 
 

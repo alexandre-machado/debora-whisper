@@ -26,6 +26,48 @@ UNKNOWN_DRIVER_TTL = 24 * 60 * 60
 MAX_CACHE_BYTES = 1_000_000
 SOURCES = ("system", "environment", "nvidia", "openvino", "tts")
 
+_workers_lock = threading.Lock()
+_workers = {}
+
+
+def start_inventory_worker(target, args=(), *, cancelled=None, name="device-inventory"):
+    """Retain diagnostic workers until they exit, including query children."""
+    if cancelled is None:
+        cancelled = threading.Event()
+
+    def run():
+        try:
+            if not cancelled.is_set():
+                target(*args)
+        finally:
+            with _workers_lock:
+                _workers.pop(threading.current_thread(), None)
+
+    worker = threading.Thread(target=run, name=name, daemon=True)
+    with _workers_lock:
+        _workers[worker] = cancelled
+        try:
+            worker.start()
+        except BaseException:
+            _workers.pop(worker, None)
+            raise
+    return worker
+
+
+def stop_inventory_workers(timeout=2.0):
+    """Cancel diagnostics and join them with one bounded shutdown budget."""
+    deadline = time.perf_counter() + timeout
+    while True:
+        with _workers_lock:
+            workers = list(_workers)
+            for cancelled in _workers.values():
+                cancelled.set()
+        workers = [worker for worker in workers if worker is not threading.current_thread()]
+        if not workers or time.perf_counter() >= deadline:
+            return
+        for worker in workers:
+            worker.join(max(0, deadline - time.perf_counter()))
+
 
 def _cpu():
     return {"id": "CPU", "kind": "CPU", "index": None, "physical_id": None,
@@ -331,11 +373,12 @@ def write_cache(path, inventory):
                 pass
 
 
-def _query_process(source, request, deadline, events):
+def _query_process(source, request, deadline, events, cancelled):
     from debora_whisper.processes import NO_WINDOW, kill_tree, python_executable
     process = None
+    reader = None
     try:
-        if time.monotonic() >= deadline:
+        if cancelled.is_set() or time.monotonic() >= deadline:
             return
         process = subprocess.Popen([python_executable(), "-m", __name__, source],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -356,14 +399,22 @@ def _query_process(source, request, deadline, events):
                 pass
             finally:
                 process.stdout.close()
-        reader = threading.Thread(target=read, daemon=True)
+        # The reader must run even if cancelled, to close/drain the pipe after
+        # process cleanup. Its parent stays registered until it is joined.
+        reader = threading.Thread(target=read, name=f"inventory-reader-{source}", daemon=True)
         reader.start()
-        if time.monotonic() >= deadline:
+        if cancelled.is_set() or time.monotonic() >= deadline:
             return
         process.stdin.write(json.dumps(request).encode())
         process.stdin.close()
-        process.wait(timeout=max(0, deadline - time.monotonic()))
-        reader.join(timeout=max(0, deadline - time.monotonic()))
+        while not cancelled.is_set() and time.monotonic() < deadline:
+            try:
+                process.wait(timeout=min(0.1, max(0, deadline - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        while reader.is_alive() and not cancelled.is_set() and time.monotonic() < deadline:
+            reader.join(timeout=min(0.1, max(0, deadline - time.monotonic())))
         if not reader.is_alive():
             events.put((source, None))
     except (OSError, subprocess.TimeoutExpired):
@@ -373,9 +424,16 @@ def _query_process(source, request, deadline, events):
             # kill_tree may itself stall in taskkill. This is a daemon worker;
             # no startup path joins it or waits for native driver teardown.
             kill_tree(process)
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            if reader is not None:
+                reader.join(timeout=1.0)
 
 
-def _collect(request, cache_path, deadline, state, done):
+def _collect(request, cache_path, deadline, state, done, cancelled):
     events = queue.Queue()
     observed = {}
     cached = None
@@ -384,15 +442,16 @@ def _collect(request, cache_path, deadline, state, done):
     def cache_reader():
         events.put(("cache", read_cache(cache_path)))
 
-    threading.Thread(target=cache_reader, daemon=True).start()
+    start_inventory_worker(cache_reader, cancelled=cancelled, name="inventory-cache")
     for source in SOURCES:
-        threading.Thread(target=_query_process, args=(source, request, deadline, events), daemon=True).start()
+        start_inventory_worker(_query_process, (source, request, deadline, events, cancelled),
+                               cancelled=cancelled, name=f"inventory-query-{source}")
     try:
-        while pending and time.monotonic() < deadline:
+        while pending and not cancelled.is_set() and time.monotonic() < deadline:
             try:
-                source, value = events.get(timeout=max(0, deadline - time.monotonic()))
+                source, value = events.get(timeout=min(0.1, max(0, deadline - time.monotonic())))
             except queue.Empty:
-                break
+                continue
             if source == "cache":
                 cached = value
                 pending.discard(source)
@@ -406,17 +465,23 @@ def _collect(request, cache_path, deadline, state, done):
         done.set()
     # The cache never authorizes presence or free memory: only this session's
     # observed data is returned. Writing is also outside the startup wait.
-    write_cache(cache_path, state[0])
+    if not cancelled.is_set():
+        write_cache(cache_path, state[0])
 
 
-def probe_inventory(request, cache_path, *, timeout=PROBE_BUDGET):
+def probe_inventory(request, cache_path, *, timeout=PROBE_BUDGET, cancelled=None):
     started = time.monotonic()
     # Leave a little room for returning a snapshot; no OS hard-real-time promise.
     deadline = started + max(0, min(timeout, PROBE_BUDGET) - 0.010)
     state = [make_inventory({})]
     done = threading.Event()
-    threading.Thread(target=_collect, args=(request, cache_path, deadline, state, done), daemon=True).start()
-    done.wait(max(0, deadline - time.monotonic()))
+    if cancelled is None:
+        cancelled = threading.Event()
+    start_inventory_worker(_collect, (request, cache_path, deadline, state, done, cancelled),
+                           cancelled=cancelled)
+    while not cancelled.is_set() and time.monotonic() < deadline:
+        if done.wait(min(0.1, max(0, deadline - time.monotonic()))):
+            break
     result = {**state[0]}
     result["elapsed_ms"] = round((time.monotonic() - started) * 1000, 1)
     result["timed_out"] = not done.is_set() or bool(result.get("pending"))

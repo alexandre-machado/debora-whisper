@@ -457,7 +457,8 @@ def test_tts_poll_outlives_startup_deadline(monkeypatch, managed, ending):
     monkeypatch.setattr(vc, "_tts_health_polls", {})
     now = [0]
     monkeypatch.setattr(vc, "time", SimpleNamespace(
-        time=lambda: now[0], monotonic=lambda: now[0], sleep=vc.time.sleep))
+        time=lambda: now[0], monotonic=lambda: now[0], sleep=vc.time.sleep,
+        perf_counter=vc.time.perf_counter))
     refreshed, finish = threading.Event(), threading.Event()
     calls = []
 
@@ -499,6 +500,22 @@ def test_tts_poll_outlives_startup_deadline(monkeypatch, managed, ending):
         vc.stop_tts_server()
         if worker is not None:
             worker.join(3)
+
+
+def test_stopping_tts_polls_with_replaced_time(monkeypatch):
+    cancelled = threading.Event()
+    worker = threading.Thread(target=cancelled.wait)
+    monkeypatch.setattr(vc, "_tts_health_polls", {"test": (cancelled, worker)})
+    monkeypatch.setattr(vc, "time", SimpleNamespace())
+    worker.start()
+    try:
+        vc.stop_tts_health_polls()
+        assert cancelled.is_set()
+        assert not worker.is_alive()
+        assert not vc._tts_health_polls
+    finally:
+        cancelled.set()
+        worker.join(3)
 
 
 def test_stopping_tts_discards_inflight_health_response(monkeypatch):

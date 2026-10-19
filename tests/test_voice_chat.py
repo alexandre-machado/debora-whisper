@@ -988,7 +988,9 @@ def test_hotkey_while_speaking_interrupts_the_reply():
     start.assert_not_called()
 
 
-def test_stop_interrupts_the_reply():
+def test_stop_interrupts_the_reply(monkeypatch):
+    # keyboard.unhook_all starts global listener threads even with no hooks.
+    monkeypatch.setattr("keyboard.unhook_all", MagicMock())
     app = _app(voice_chat=True)
     with patch.object(app.voice_chat, "interrupt") as interrupt:
         app.stop()

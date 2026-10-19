@@ -121,8 +121,13 @@ class WindowsPlatform(Platform):
         GPU or NPU."""
         if process.poll() is not None:
             return
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
-                       capture_output=True, creationflags=self.no_window)
+        result = subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                                capture_output=True, creationflags=self.no_window)
+        if result.returncode != 0 and process.poll() is None:
+            # taskkill may be denied process enumeration even though our
+            # existing Popen handle can terminate the child. Otherwise its
+            # pipe readers survive the shutdown as well.
+            process.kill()
 
     def output_is_headphones(self, name=None):
         name = self.default_output_name() if name is None else name

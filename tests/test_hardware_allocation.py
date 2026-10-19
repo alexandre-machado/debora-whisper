@@ -382,7 +382,7 @@ def test_dictation_startup_reports_only_confirmed_resident_tts(monkeypatch, load
         "model": "Resident Chatterbox", "pid": 4321, "worker_pid": 9876, "versions": {}}}
     inventory = {**device_inventory.make_inventory(observed),
                  "timed_out": False, "elapsed_ms": 0.0}
-    monkeypatch.setattr(device_inventory, "probe_inventory", lambda *a: inventory)
+    monkeypatch.setattr(device_inventory, "probe_inventory", lambda *a, **kw: inventory)
     monkeypatch.setattr(de, "log", logs.append)
     ensure = Mock(side_effect=AssertionError("Inventory must not start TTS"))
     monkeypatch.setattr(voice_chat, "ensure_tts_server", ensure)
