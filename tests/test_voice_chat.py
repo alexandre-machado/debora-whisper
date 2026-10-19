@@ -1630,6 +1630,7 @@ def test_only_the_first_reply_chunk_splits_at_a_clause(server, boundary):
     tail = " porque temos bastante tempo para conversar. "
     later = "Agora temos outra frase, que deve continuar inteira."
     chat, _ = _chat(server, FakeLLM([head + " ", tail, later]))
+    vc._cache_tts_health(chat.config, {"ok": True, "stream": False})
     chat.respond("explique")
     assert _tts_texts(server) == [vc.speakable(head), tail.strip(), later]
 
@@ -1674,6 +1675,27 @@ def test_first_chunk_uses_twelve_complete_words_without_punctuation():
     assert vc.split_sentences(head + " treze quatorze, depois", first=True) == (
         [head], "treze quatorze, depois")
     assert vc.split_sentences("Eu vi, mas ainda não terminei", first=True)[0] == []
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_first_sentence_with_empty_capabilities_cache(monkeypatch, enabled):
+    assert vc._tts_capabilities_cache == {}
+    monkeypatch.setattr(vc, "ensure_tts_server", lambda *a: None)
+
+    def ready(config):
+        vc._cache_tts_health(config, {"ok": True, "stream": True})
+        return True
+
+    monkeypatch.setattr(vc, "wait_tts_server", ready)
+    chunks = ["Claro, posso ajudar com isso agora mesmo, ", "é só me dizer o que precisa."]
+    requests = []
+    audio = np.full(2400, 0.2, np.float32), 24000
+    monkeypatch.setattr(vc, "synthesize_stream", lambda text, cfg: requests.append(text) or iter([audio]))
+    monkeypatch.setattr(vc, "synthesize", lambda text, cfg: requests.append(text) or audio)
+    chat = vc.VoiceChat({**DEFAULT_CONFIG, "tts_stream": enabled}, play=lambda *a: None,
+                        log=lambda *a: None, llm=FakeLLM(chunks))
+    chat.respond("oi")
+    assert requests == (["".join(chunks)] if enabled else [c.strip() for c in chunks])
     assert vc.split_sentences("Eu posso explicar — depois", first=True)[0] == []
     assert vc.split_sentences("a b c d, resto", first=True)[0] == []
 
@@ -2207,7 +2229,7 @@ def test_stream_playback_starts_before_generation_ends(streaming_chat, stream, m
     chat.respond("oi", on_reply=lambda *args: shown.append(args))
     assert requests == ended == ["Primeira frase longa.", "Segunda frase longa."]
     assert len(shown) == 2
-    assert chat._remember_spoken.call_count == 6  # every clip, including continuations
+    assert chat._remember_spoken.call_count == 4  # every speech clip, including continuations
     assert sum(call.args[1] for call in chat._remember_spoken.call_args_list) == pytest.approx(0.6)
     assert chat._synthesis_model.update.call_count == 2
     for call in chat._synthesis_model.update.call_args_list:
@@ -2276,6 +2298,16 @@ def test_stream_requires_config_and_health(server, monkeypatch, enabled, adverti
 @pytest.mark.parametrize("paused_clip", [0, 1])
 def test_stream_pause_resume_restores_echo_intervals(streaming_chat, monkeypatch, paused_clip):
     clock = [100.0]
+    resumed_trims = []
+    original_trim = vc.trim_silence
+
+    def trim(samples, rate, **kwargs):
+        result = original_trim(samples, rate, **kwargs)
+        if not kwargs:  # default leading/trailing (including hiss) trim on replay
+            resumed_trims.append(result)
+        return result
+
+    monkeypatch.setattr(vc, "trim_silence", trim)
     # Replace only voice_chat's clock so thread/event deadlines still use real time.
     from types import SimpleNamespace
     monkeypatch.setattr(vc, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: clock[0]}))
@@ -2285,11 +2317,15 @@ def test_stream_pause_resume_restores_echo_intervals(streaming_chat, monkeypatch
     spoken = "Primeira frase longa."
     calls, shown, logs = [], [], []
     paused = False
+    resumed_at = []
 
     def play(samples, rate, stop):
         nonlocal paused
         calls.append(samples.copy())
         begin = clock[0]
+        if paused:
+            assert chat._spoken[-1][0] >= resumed_at[0]
+            assert len(chat._spoken) == 2  # a fresh interval, not one spanning the pause
         # A one-word echo requires coverage throughout the capture, avoiding
         # a false pass from the two-second room tail of an earlier interval.
         assert chat.is_echo("Primeira", begin + 0.01, begin + len(samples) / rate)
@@ -2301,14 +2337,17 @@ def test_stream_pause_resume_restores_echo_intervals(streaming_chat, monkeypatch
             clock[0] += 5  # beyond any echo tail from before the pause
             assert not chat.is_echo(spoken, clock[0], clock[0] + 0.01)
             assert chat.resume()
+            resumed_at.append(clock[0])
             paused = True
         else:
             clock[0] += len(samples) / rate
 
     chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=play, log=logs.append, llm=FakeLLM([spoken]))
     chat.respond("oi", on_reply=lambda *args: shown.append(args))
-    assert paused and len(calls) == 4  # three clips plus the replay
+    assert paused and len(calls) == 3  # two speech clips plus the replay
     np.testing.assert_array_equal(calls[paused_clip], calls[paused_clip + 1])
+    assert len(resumed_trims) == 1
+    np.testing.assert_array_equal(resumed_trims[0], calls[paused_clip + 1])
     assert len(shown) == 1
     assert sum(" chunk=" in line for line in logs) == 1
 
@@ -2336,6 +2375,156 @@ def test_stream_single_chunk_trims_long_final_silence(streaming_chat, monkeypatc
                         llm=FakeLLM(["Primeira frase longa."]), log=lambda *a: None)
     chat.respond("oi")
     np.testing.assert_array_equal(np.concatenate(played), vc.trim_silence(samples, 1000))
+
+
+def test_stream_releases_speech_before_waiting_for_tail(streaming_chat, monkeypatch):
+    heard = threading.Event()
+    speech = np.full(200, 0.2, np.float32)
+    played = []
+
+    def synth(*args):
+        yield np.r_[speech, np.zeros(400)].astype(np.float32), 1000
+        assert heard.wait(3), "speech was held with its silent tail"
+        np.testing.assert_array_equal(np.concatenate(played), speech)
+        yield np.zeros(200, np.float32), 1000
+
+    def play(samples, *args):
+        played.append(samples.copy())
+        heard.set()
+
+    monkeypatch.setattr(vc, "synthesize_stream", synth)
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=play, llm=FakeLLM(["Uma frase longa."]), log=lambda *a: None)
+    chat.respond("oi")
+    assert len(np.concatenate(played)) == 250
+
+
+@pytest.mark.parametrize("chunk_size", [100, 2000])
+def test_stream_trims_hiss_after_acoustic_pause(streaming_chat, monkeypatch, chunk_size):
+    samples = np.r_[np.full(200, 0.2), np.zeros(1000), np.full(400, 0.008)].astype(np.float32)
+    monkeypatch.setattr(vc, "synthesize_stream", lambda *a: iter(
+        (samples[i:i + chunk_size], 1000) for i in range(0, len(samples), chunk_size)))
+    played = []
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=lambda s, *a: played.append(s),
+                        llm=FakeLLM(["Uma frase longa."]), log=lambda *a: None)
+    chat.respond("oi")
+    np.testing.assert_array_equal(np.concatenate(played), vc.trim_silence(samples, 1000))
+
+
+def test_stream_pause_replays_previous_device_buffer(streaming_chat, stream, monkeypatch):
+    chunks = [np.full(2400, value, np.float32) for value in (0.2, 0.3)]
+    monkeypatch.setattr(vc, "synthesize_stream", lambda *a: iter((s, 24000) for s in chunks))
+    original_init, original_write = FakeStream.__init__, FakeStream.write
+    captured = []
+
+    def init(output, *args, **kwargs):
+        original_init(output, *args, **kwargs)
+        output.latency = 1.0 if len(stream) == 1 else 0
+        captured.append([])
+
+    def write(output, data):
+        original_write(output, data)
+        captured[-1].append(data.ravel().copy())
+        if len(stream) == 1 and np.any(data == np.float32(0.3)):
+            assert chat.pause()
+            assert chat.resume()
+
+    monkeypatch.setattr(FakeStream, "__init__", init)
+    monkeypatch.setattr(FakeStream, "write", write)
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), llm=FakeLLM(["Uma frase longa."]), log=lambda *a: None)
+    chat.respond("oi")
+    assert len(stream) == 2 and stream[0].ended == "dropped"
+    np.testing.assert_array_equal(np.concatenate(captured[1]), np.concatenate(chunks))
+
+
+def test_stream_reply_deadline_spans_sentences(streaming_chat, monkeypatch):
+    requests, logs = [], []
+
+    def synth(text, config):
+        requests.append(text)
+        for _ in range(4):
+            time.sleep(0.03)
+            yield np.full(100, 0.2, np.float32), 1000
+
+    monkeypatch.setattr(vc, "synthesize_stream", synth)
+    chat = vc.VoiceChat({**DEFAULT_CONFIG, "tts_reply_timeout_seconds": 0.3},
+                        play=lambda *a: None, log=logs.append,
+                        llm=FakeLLM(["Primeira frase longa. Segunda frase longa. Terceira frase longa. Quarta frase longa."]))
+    # Keep startup time out of this short regression deadline.
+    monkeypatch.setattr(vc, "wait_tts_server", lambda cfg: True)
+    vc._cache_tts_health(chat.config, {"ok": True, "stream": True})
+    chat.respond("oi")
+    assert 1 < len(requests) < 4
+    assert any("reply deadline exceeded" in line for line in logs)
+    assert chat._tts_cancellation.cancelled
+
+
+def test_stream_renderer_join_is_bounded(streaming_chat, monkeypatch):
+    release = threading.Event()
+    logs = []
+    monkeypatch.setattr(vc, "TTS_RENDER_JOIN_SECONDS", 0.02)
+
+    def synth(*args):
+        yield np.full(100, 0.2, np.float32), 1000
+        release.wait(3)
+
+    monkeypatch.setattr(vc, "synthesize_stream", synth)
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=lambda *a: chat.interrupt(),
+                        log=logs.append, llm=FakeLLM(["Uma frase longa."]))
+    try:
+        began = time.monotonic()
+        chat.respond("oi")
+        assert time.monotonic() - began < 2
+        assert any("renderer did not finish" in line for line in logs)
+    finally:
+        release.set()
+
+
+def test_reply_deadline_interrupts_stalled_stream_read(pcm_server, monkeypatch):
+    pcm_server.chunks = [b"\x00\x10" * 2400] * 2
+    pcm_server.gate = threading.Event()
+    logs, played = [], []
+    config = _cfg(pcm_server, tts_reply_timeout_seconds=0.25)
+    vc._cache_tts_health(config, {"ok": True, "stream": True})
+    monkeypatch.setattr(vc, "wait_tts_server", lambda *a: True)
+    chat = vc.VoiceChat(config, play=lambda s, *a: played.append(s),
+                        log=logs.append, llm=FakeLLM(["Uma frase longa."]))
+    try:
+        began = time.monotonic()
+        chat.respond("oi")
+        assert time.monotonic() - began < 2
+        assert played and any("reply deadline exceeded" in line for line in logs)
+        assert chat._tts_cancellation.cancelled and not chat._tts_cancellation._sockets
+    finally:
+        pcm_server.gate.set()
+
+
+def test_cancellation_serializes_shutdown_before_close(monkeypatch):
+    cancellation = vc.TTSCancellation()
+    calls = []
+
+    class Socket:
+        def shutdown(self, how):
+            assert cancellation._lock.locked()
+            calls.append("shutdown")
+
+        def detach(self):
+            assert cancellation._lock.locked()
+            calls.append("detach")
+            return 123 if calls.count("detach") == 1 else -1
+
+    sock = Socket()
+    cancellation.attach(sock)
+    monkeypatch.setattr(vc.socket, "close", lambda handle: calls.append("close"))
+    workers = [threading.Thread(target=cancellation.cancel) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(1)
+        assert not worker.is_alive()
+    assert calls[:3] == ["shutdown", "detach", "close"]
+    assert calls.count("close") == 1
+    with pytest.raises(vc.TTSRejected, match="cancelled"):
+        cancellation.attach(Socket())
 
 
 def test_stream_trims_final_silence_spanning_chunks_like_whole_wav(streaming_chat, monkeypatch):

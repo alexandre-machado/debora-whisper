@@ -423,6 +423,7 @@ loaded until the app exits, so switching back is instant.
   "tts_stream": true,
   "tts_url": "http://127.0.0.1:8765",
   "tts_timeout_seconds": 60,
+  "tts_reply_timeout_seconds": 900,
   "tts_server_command": null
 }
 ```
@@ -513,6 +514,11 @@ WAV playback. Streaming retains the final second for the artifact check above;
 first-audio latency depends on hardware and voice, and ~0.5 s is a target, not
 a measured guarantee. Warm-up and the waiting announcement still use WAV.
 See the [TTS HTTP protocol](docs/TTS-PROTOCOL.md) for framing and cancellation.
+
+`tts_reply_timeout_seconds` (positive number, default `900`) caps the entire
+reply when streaming is enabled, across sentences and pauses. The server also
+stops streams with no completed audio chunk for 120 seconds; ongoing synthesis
+can exceed that duration as long as chunks keep arriving.
 
 For Chatterbox, Qwen and XTTS-v2, `tts_voice` clones a voice from clean speech: a WAV path, or a name
 looked up as `<name>.wav` in the voices folder (see File Paths), then among

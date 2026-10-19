@@ -585,3 +585,15 @@ def test_tts_stream_bool_config(value):
 def test_tts_stream_rejects_non_bool(value):
     with pytest.raises(ValueError, match="tts_stream must be a bool"):
         de.validate_config({**de.DEFAULT_CONFIG, "tts_stream": value})
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, "900", None, float("nan"), float("inf")])
+def test_tts_reply_timeout_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="tts_reply_timeout_seconds"):
+        de.validate_config({**de.DEFAULT_CONFIG, "tts_reply_timeout_seconds": value})
+
+
+@pytest.mark.parametrize("value", [0.5, 900, 3600])
+def test_tts_reply_timeout_accepts_finite_positive_values(value):
+    assert de.DEFAULT_CONFIG["tts_reply_timeout_seconds"] == 900
+    de.validate_config({**de.DEFAULT_CONFIG, "tts_reply_timeout_seconds": value})

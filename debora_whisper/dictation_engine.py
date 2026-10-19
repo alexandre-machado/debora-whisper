@@ -122,6 +122,7 @@ DEFAULT_CONFIG = {
     "tts_stream": True,
     "tts_url": "http://127.0.0.1:8765",
     "tts_timeout_seconds": 60,
+    "tts_reply_timeout_seconds": 900,
     # Command that starts the TTS server when nothing answers at tts_url.
     # null: uv runs the script selected by tts_backend with tts_voice.
     "tts_server_command": None,
@@ -449,6 +450,10 @@ def validate_config(config: dict):
     timeout = config.get("tts_timeout_seconds", DEFAULT_CONFIG["tts_timeout_seconds"])
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         raise ValueError(f"tts_timeout_seconds must be a positive number, got {timeout!r}")
+    timeout = config.get("tts_reply_timeout_seconds", DEFAULT_CONFIG["tts_reply_timeout_seconds"])
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not 0 < timeout < float("inf")):
+        raise ValueError(f"tts_reply_timeout_seconds must be a finite positive number, got {timeout!r}")
 
 
 # ---------------------------------------------------------------------------
