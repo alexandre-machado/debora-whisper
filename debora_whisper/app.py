@@ -108,6 +108,11 @@ class GUIApp:
         the global keyboard hook and the tray icon stay alive until the
         process dies.
         """
+        def wake():
+            # Python handles a signal (Ctrl+C, SIGTERM on Linux) only when
+            # its main thread runs; an idle Tk would hold it indefinitely.
+            self._root.after(250, wake)
+        self._root.after(250, wake)
         try:
             self._root.mainloop()
         except KeyboardInterrupt:
@@ -578,9 +583,9 @@ class GUIApp:
             except Exception as exc:
                 log(f"Error stopping {name} during shutdown: {exc}")
         try:
-            import keyboard
             from debora_whisper import platforms
-            platforms.current().stop_keyboard_listener(keyboard, final=True)
+            provider = platforms.current()
+            provider.stop_keyboard_listener(provider.keyboard(), final=True)
         except Exception as exc:
             log(f"Error stopping keyboard listener during shutdown: {exc}")
 
@@ -602,6 +607,10 @@ def _claim_single_instance(name: str = INSTANCE_MUTEX) -> bool:
     """One tray app per user session: a second one (say, a Start Menu click
     while the Startup shortcut already launched one) would hook the same
     hotkey and record twice. The named mutex dies with the process."""
+    from debora_whisper import platforms
+    provider = platforms.current()
+    if provider.name != "windows":
+        return provider.claim_single_instance(name)
     import ctypes
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.restype = ctypes.c_void_p  # a HANDLE, not an int
@@ -689,6 +698,8 @@ def main():
         apply_device_priority(config)
     check_npu = avoid_lost_npu(config)
 
+    from debora_whisper import platforms
+    platforms.current().handle_termination()
     app = GUIApp(config)
     app._engine.warm_voice_chat = warm_voice_chat
     if check_npu:

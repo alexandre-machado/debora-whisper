@@ -1,4 +1,5 @@
 """Tests for DictationApp transcription threading."""
+import importlib
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -66,6 +67,7 @@ def test_hook_recovery_replaces_only_owned_registrations_and_stops():
     keyboard.hook.side_effect = lambda callback, **kw: register(callback)
     keyboard.add_hotkey.side_effect = lambda key, callback, **kw: register(callback)
     provider = MagicMock()
+    provider.keyboard.return_value = keyboard
     watchdog = KeyboardHookWatchdog(app._stopping, app._recover_hotkeys, MagicMock(),
                                     probe=lambda: (10, False))
     provider.keyboard_watchdog.return_value = watchdog
@@ -95,6 +97,7 @@ def test_shutdown_orders_unhook_after_inflight_recovery():
     app = DictationApp({**DEFAULT_CONFIG, "beep_on_start": False})
     entered, release = threading.Event(), threading.Event()
     provider = MagicMock()
+    provider.keyboard.side_effect = lambda: importlib.import_module("keyboard")
 
     def restart(*args):
         entered.set()

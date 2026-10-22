@@ -126,6 +126,52 @@ def drop_attention_spies(model):
         model.t3.tfmr.layers[idx].self_attn._forward_hooks.clear()
 
 
+def cpu_name():
+    """hardware_allocation.cpu_name(), which this environment cannot import."""
+    import platform
+    name = platform.processor()
+    if name and name != platform.machine():
+        return name
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return name or "name unavailable"
+
+
+def preload_cuda_libraries():
+    """Load the pip-installed cuDNN (nvidia/cudnn/lib) globally, on Linux.
+
+    cuDNN 9 opens its sub-libraries (libcudnn_graph...) by name and finds
+    them through its own $ORIGIN. A library in LD_PRELOAD that wraps dlopen,
+    such as NoMachine's libnxegl.so, becomes the caller instead and the
+    lookup fails: torch aborted on its first cuDNN call. A library already
+    loaded is found by name whoever asks."""
+    if not sys.platform.startswith("linux"):
+        return
+    import ctypes
+    import glob
+    import site
+    for root in site.getsitepackages():
+        # cuDNN only: the rest is linked with torch's RUNPATH, and libnvblas
+        # would take over the CPU's BLAS calls.
+        pending = sorted(glob.glob(os.path.join(root, "nvidia", "cudnn", "lib", "lib*.so*")))
+        # Dependencies first: retry what failed until no progress is made.
+        while pending:
+            failed = []
+            for lib in pending:
+                try:
+                    ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    failed.append(lib)
+            if len(failed) == len(pending):
+                break
+            pending = failed
+
+
 def load_model(device: str, voice: str | None):
     sys.modules["sklearn"] = None
     import torch
@@ -140,10 +186,9 @@ def load_model(device: str, voice: str | None):
     # Report the device actually loaded, without another CUDA probe. The UI's
     # STT environment cannot infer this server's PyTorch capabilities.
     model._debora_device = device.upper()
-    import platform
     model._debora_allocation = {
         "pid": os.getpid(), "requested_device": requested_device.upper(),
-        "device_id": "CPU", "device_name": platform.processor() or "name unavailable",
+        "device_id": "CPU", "device_name": cpu_name(),
         "fallback_reason": "CUDA unavailable in TTS worker" if device != requested_device else None,
     }
     if device == "cuda":
@@ -533,6 +578,7 @@ def loading_server(address, loader, language, *, adapter=True):
 
     def load():
         try:
+            preload_cuda_libraries()
             with track_hf_downloads(progress):
                 model, error = loader()
             handler = make_handler(model, language, adapter=adapter, error=error)

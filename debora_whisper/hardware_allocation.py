@@ -30,8 +30,23 @@ def format_endpoint(value):
         return "invalid endpoint"
 
 
+def cpu_name():
+    """The CPU's model name; platform.processor() is empty on most Linux."""
+    name = platform.processor()
+    if name and name != platform.machine():
+        return name
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return name or "name unavailable"
+
+
 def cpu_target():
-    return "CPU " + (platform.processor() or "name unavailable")
+    return "CPU " + cpu_name()
 
 
 def cuda_target(index=0, fallback_name=None):

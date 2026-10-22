@@ -12,6 +12,7 @@ import pytest
 
 from debora_whisper import device_queries as queries, dictation_engine as de, platforms, processes
 from debora_whisper.platforms.base import Platform
+from debora_whisper.platforms.linux import LinuxPlatform
 from debora_whisper.platforms.windows import WindowsPlatform
 from debora_whisper.platforms import windows, windows_text
 
@@ -279,7 +280,8 @@ def test_kill_tree_delegates_to_current_provider(monkeypatch):
 
 def test_audio_fixture_keeps_real_provider():
     provider = platforms.current()
-    assert type(provider) is (WindowsPlatform if sys.platform == "win32" else Platform)
+    expected = {"win32": WindowsPlatform, "linux": LinuxPlatform}.get(sys.platform, Platform)
+    assert type(provider) is expected
     assert provider.default_output_name() is None
     assert provider.output_is_headphones("Headphones") is None
 
@@ -390,7 +392,8 @@ def test_accelerator_memory_absolute_path(monkeypatch, tmp_path, result):
 @pytest.mark.parametrize("failure", [False, True])
 def test_cuda_pipeline_adds_package_bins_through_provider(monkeypatch, tmp_path, failure):
     import site
-    bins = [tmp_path / "nvidia" / package / "bin" for package in ("cublas", "cudnn")]
+    sub = platforms.current().library_dir_names[0]  # bin on Windows, lib on Linux
+    bins = [tmp_path / "nvidia" / package / sub for package in ("cublas", "cudnn")]
     for path in bins:
         path.mkdir(parents=True)
     (tmp_path / "nvidia" / "without-bin").mkdir()

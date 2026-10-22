@@ -88,7 +88,13 @@ class TestStateTransitions:
         states = []
         app.add_callback(lambda s, d: states.append(s))
 
-        with patch.object(app._stopping, 'wait', return_value=False):
+        # Only the loader's waits return at once: the resource monitor shares
+        # the event, and spinning it ran telemetry (an OpenVINO Core) in a
+        # tight loop beside the loader, which crashed the process on Linux.
+        real_wait = app._stopping.wait
+        loader = threading.current_thread()
+        with patch.object(app._stopping, 'wait', side_effect=lambda timeout=None: (
+                False if threading.current_thread() is loader else real_wait(timeout))):
             app._load_model_background()
 
         assert AppState.LOADING in states

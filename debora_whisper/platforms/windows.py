@@ -407,6 +407,12 @@ class WindowsPlatform(Platform):
         if hasattr(os, "add_dll_directory"):
             os.add_dll_directory(str(path))
 
+    def boot_time(self):
+        import ctypes
+        import time
+        ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_uint64
+        return time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000
+
     @property
     def no_window(self):
         return subprocess.CREATE_NO_WINDOW
