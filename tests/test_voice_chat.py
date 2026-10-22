@@ -838,22 +838,38 @@ def test_split_sentences(buffer, done, rest):
 
 # --- The LLM model files ---------------------------------------------------
 
-def test_hub_model_is_downloaded_once(monkeypatch):
+def test_hub_model_is_downloaded_once(monkeypatch, tmp_path):
     calls = []
 
     def snapshot_download(repo, local_files_only=False):
         calls.append(local_files_only)
         if local_files_only and len(calls) == 1:
             raise FileNotFoundError(repo)
-        return "/hub/" + repo
+        (tmp_path / "openvino_model.bin").write_bytes(b"weights")
+        return str(tmp_path)
 
     monkeypatch.setitem(sys.modules, "huggingface_hub",
                         MagicMock(snapshot_download=snapshot_download))
-    assert vc._model_path("OpenVINO/Qwen3-8B-int4-cw-ov", log=lambda m: None) == \
-        "/hub/OpenVINO/Qwen3-8B-int4-cw-ov"
-    assert vc._model_path("OpenVINO/Qwen3-8B-int4-cw-ov", log=lambda m: None) == \
-        "/hub/OpenVINO/Qwen3-8B-int4-cw-ov"
+    assert vc._model_path("OpenVINO/Qwen3-8B-int4-cw-ov", log=lambda m: None) == str(tmp_path)
+    assert vc._model_path("OpenVINO/Qwen3-8B-int4-cw-ov", log=lambda m: None) == str(tmp_path)
     assert calls == [True, False, True]  # the second load stays offline
+
+
+def test_interrupted_hub_download_is_resumed(monkeypatch, tmp_path):
+    calls = []
+
+    def snapshot_download(repo, local_files_only=False):
+        calls.append(local_files_only)
+        if not local_files_only:
+            (tmp_path / "openvino_model.bin").write_bytes(b"weights")
+        return str(tmp_path)  # the offline lookup finds the snapshot without weights
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub",
+                        MagicMock(snapshot_download=snapshot_download))
+    logs = []
+    assert vc._model_path("OpenVINO/Qwen3-8B-int4-cw-ov", log=logs.append) == str(tmp_path)
+    assert calls == [True, False]
+    assert "incomplete" in logs[0]
 
 
 # --- In the dictation flow ---------------------------------------------------
