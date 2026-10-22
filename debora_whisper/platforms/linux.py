@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 from debora_whisper.platforms.base import Platform
+from debora_whisper.platforms import linux_text
 
 # cuDNN 9 opens its sub-libraries (ops, cnn, adv...) by name at run time:
 # preloading only libcudnn.so.9 is not enough.
@@ -77,19 +78,71 @@ class LinuxPlatform(Platform):
     def __init__(self):
         avoid_level_zero_crash()
         self._preloaded = set()
+        self._paste_overrides = {}
+        self._focus = None
         self._instance_locks = []
+
+    def apply_config(self, config):
+        self._paste_overrides = dict(config.get("paste_hotkeys") or {})
 
     def keyboard(self):
         from debora_whisper.platforms import linux_keyboard
         return linux_keyboard
 
+    def _focused(self):
+        if self._focus is None:
+            from debora_whisper.platforms.kwin_focus import KWinFocus
+            self._focus = KWinFocus()
+            from debora_whisper.dictation_engine import log
+            if self._focus.start():
+                log("Window in focus tracked through KWin; terminals paste with Ctrl+Shift+V.")
+            else:
+                log(f"{self._focus.error}; pasting with {linux_text.UNKNOWN_PASTE}.")
+        return self._focus.window()
+
+    def paste_key(self):
+        return linux_text.paste_key(self._focused(), self._paste_overrides)
+
+    def type_text(self, text: str, auto_enter: bool = False):
+        return linux_text.type_text(text, self.paste_key(), auto_enter)
+
+    def type_draft(self, text: str):
+        return self.type_text(text)
+
+    def type_draft_keys(self, text: str):
+        """Typing arbitrary characters needs the layout; paste instead."""
+        return self.type_text(text)
+
+    def backspace_text(self, count: int):
+        return linux_text.backspace_text(count)
+
+    def delete_text(self, count: int):
+        return linux_text.delete_text(count)
+
+    def press_enter(self):
+        return linux_text.press_enter()
+
+    def input_target(self):
+        """The KWin window id; None outside KDE. Fields inside one window
+        cannot be told apart."""
+        window = self._focused()
+        return window.id if window is not None else None
+
+    def same_input_target(self, a, b) -> bool:
+        return a is not None and a == b
+
     def handle_termination(self):
         """SIGTERM (logout, kill, systemd) and SIGHUP (closed terminal)
-        would end the process without cleanup, leaving the TTS server
-        running: raise KeyboardInterrupt instead."""
+        would end the process without cleanup, leaving the KWin script and
+        the TTS server running: raise KeyboardInterrupt instead."""
         import signal
         for name in ("SIGTERM", "SIGHUP"):
             signal.signal(getattr(signal, name), signal.default_int_handler)
+
+    def close(self):
+        if self._focus is not None:
+            self._focus.close()
+            self._focus = None
 
     library_dir_names = ("lib",)
 

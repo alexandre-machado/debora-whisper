@@ -156,3 +156,21 @@ def _unknown_audio_output(monkeypatch):
     # hand out the evdev module, which reads the developer's real keyboard.
     import importlib
     monkeypatch.setattr(provider, "keyboard", lambda: importlib.import_module("keyboard"))
+    # Nor ask KWin which window has focus.
+    if hasattr(provider, "_focused"):
+        monkeypatch.setattr(provider, "_focused", lambda: None)
+
+
+@pytest.fixture
+def windows_text_provider(monkeypatch):
+    """The Windows text path on any OS: tests of the clipboard/keyboard
+    drafts mock its keys and UIA, so they run on Linux too."""
+    from debora_whisper import platforms
+    from debora_whisper.platforms.windows import WindowsPlatform
+    provider = WindowsPlatform()
+    monkeypatch.setattr(platforms, "_current", provider)
+    monkeypatch.setattr(provider, "default_output_name", lambda: None)
+    monkeypatch.setattr(provider, "output_is_headphones", lambda name=None: None)
+    monkeypatch.setattr(provider, "text_before_caret", lambda count: None)
+    monkeypatch.setattr(provider, "keyboard", lambda: __import__("keyboard"))
+    return provider

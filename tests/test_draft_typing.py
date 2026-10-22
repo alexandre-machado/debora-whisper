@@ -1,4 +1,5 @@
 """Live drafts typed into the target window and corrected in place."""
+import sys
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
@@ -9,6 +10,9 @@ from debora_whisper.dictation_engine import AppState, DictationApp, DEFAULT_CONF
 from debora_whisper.platforms.base import CaretReadStatus
 
 AUDIO = np.zeros(16000, dtype=np.float32)
+pytestmark = pytest.mark.usefixtures("windows_text_provider")
+# SendInput's INPUT layout (and its size) only holds with Windows' C longs.
+SEND_INPUT = pytest.mark.skipif(sys.platform != "win32", reason="Windows SendInput layout")
 
 
 class Screen:
@@ -164,7 +168,10 @@ def test_claude_code_growing_drafts_leave_only_final_text(terminal):
     assert len(terminal.pasted) == 1
 
 
-@pytest.mark.parametrize("legacy", [False, True], ids=["clipboard-fix", "pr45-replay"])
+@pytest.mark.parametrize("legacy", [
+    pytest.param(False, id="clipboard-fix"),
+    pytest.param(True, id="pr45-replay", marks=SEND_INPUT),
+])
 @pytest.mark.parametrize("second, tail, deletes, final_tail", [
     ("Oi Débora, tudo bem", "tudo bem... ", 4, "? "),
     ("Oi Débora, tudo bem?", "tudo bem? ", 0, ""),
@@ -372,6 +379,7 @@ def test_terminal_can_paste_complex_unicode_in_final(terminal):
     assert terminal.text == "Olá 👍 cafe\u0301 "
 
 
+@SEND_INPUT
 def test_native_backspace_fallback_sends_only_backspace(monkeypatch):
     import ctypes
     import sys
@@ -989,6 +997,7 @@ def test_push_to_talk_final_still_shows_transcribing_and_done(screen):
     assert states == [AppState.PROCESSING, AppState.READY]
 
 
+@SEND_INPUT
 @pytest.mark.parametrize("text", ["é👍", "Oi Débora, ", "tudo bem... ", "tudo bem? "])
 def test_unicode_typing_sends_utf16_units(monkeypatch, text):
     import ctypes
