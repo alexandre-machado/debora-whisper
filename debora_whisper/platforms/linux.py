@@ -131,6 +131,12 @@ class LinuxPlatform(Platform):
     def same_input_target(self, a, b) -> bool:
         return a is not None and a == b
 
+    def tray_icon_class(self):
+        """The D-Bus tray icon when the desktop has a StatusNotifierWatcher;
+        pystray's (X11, no menu) otherwise."""
+        from debora_whisper.platforms import linux_tray
+        return linux_tray.SniIcon if linux_tray.watcher_available() else None
+
     def handle_termination(self):
         """SIGTERM (logout, kill, systemd) and SIGHUP (closed terminal)
         would end the process without cleanup, leaving the KWin script and
@@ -228,3 +234,10 @@ class LinuxPlatform(Platform):
                                              self.default_output_name()):
             return None
         return default_sink_headphones()
+
+    def open_folder(self, path):
+        opener = shutil.which("xdg-open")
+        if not opener:
+            raise OSError("xdg-open not found")
+        subprocess.Popen([opener, str(path)], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)

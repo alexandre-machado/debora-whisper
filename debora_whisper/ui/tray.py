@@ -5,6 +5,16 @@ import pystray
 from debora_whisper.ui.icons import get_icon, get_volume_icon
 
 
+def backend_title(title: str, icon_class=None) -> str:
+    """The tooltip as the tray backend can show it. pystray's X11 one (Linux
+    without a StatusNotifierWatcher) sets a Latin-1 window name and raised on
+    the em dash; accented Latin letters still fit."""
+    if not (icon_class or pystray.Icon).__module__.endswith("_xorg"):
+        return title
+    return title.replace("\u2014", "-").replace("\u2013", "-").encode(
+        "latin-1", "replace").decode("latin-1")
+
+
 class TrayManager:
     """Manages the system tray icon and context menu."""
 
@@ -92,11 +102,13 @@ class TrayManager:
 
     def start(self):
         """Start the tray icon in a daemon thread."""
+        from debora_whisper import platforms
         initial_icon = get_icon(self._state, voice_chat=self._voice_chat_on())
-        self._icon = pystray.Icon(
+        icon_class = platforms.current().tray_icon_class() or pystray.Icon
+        self._icon = icon_class(
             name="debora-whisper",
             icon=initial_icon,
-            title=self._tooltip,
+            title=backend_title(self._tooltip, icon_class),
             menu=self._build_menu(),
         )
 
@@ -155,7 +167,7 @@ class TrayManager:
                         icon.icon = image
                         shown_image = image
                     if title != shown_title:
-                        icon.title = title
+                        icon.title = backend_title(title, type(icon))
                         shown_title = title
                     if state != shown_state or voice_chat != shown_voice_chat:
                         # Rebuild so the dynamic menu text follows the state.
