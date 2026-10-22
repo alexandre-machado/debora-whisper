@@ -79,6 +79,10 @@ class LinuxPlatform(Platform):
         self._preloaded = set()
         self._instance_locks = []
 
+    def keyboard(self):
+        from debora_whisper.platforms import linux_keyboard
+        return linux_keyboard
+
     def handle_termination(self):
         """SIGTERM (logout, kill, systemd) and SIGHUP (closed terminal)
         would end the process without cleanup, leaving the TTS server

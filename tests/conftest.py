@@ -152,3 +152,7 @@ def _unknown_audio_output(monkeypatch):
     monkeypatch.setattr(provider, "output_is_headphones", lambda name=None: None)
     # Engine tests must not inspect the developer's focused text box.
     monkeypatch.setattr(provider, "text_before_caret", lambda count: None)
+    # Engine tests mock the keyboard package; on Linux the provider would
+    # hand out the evdev module, which reads the developer's real keyboard.
+    import importlib
+    monkeypatch.setattr(provider, "keyboard", lambda: importlib.import_module("keyboard"))
