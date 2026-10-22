@@ -97,6 +97,44 @@ def test_stream_flag_falls_back_to_wav(streaming_server):
         conn.close()
 
 
+def test_successful_stream_does_not_log_client_close_as_cancellation(streaming_server, monkeypatch):
+    logs = []
+    complete, finished = threading.Event(), threading.Event()
+    srv, _ = streaming_server(lambda *a, **kw: iter([np.ones(2400, np.float32)]))
+    original_stream = srv.RequestHandlerClass._stream
+    original_finish = srv.RequestHandlerClass.finish
+    original_check = server.check_connection
+
+    def stream(handler, *args):
+        original_stream(handler, *args)
+        complete.set()  # client can disconnect immediately after receiving EOF
+
+    def check(connection):
+        if complete.is_set():
+            raise server.SynthesisCancelled()
+        original_check(connection)
+
+    def finish(handler):
+        try:
+            original_finish(handler)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(srv.RequestHandlerClass, "_stream", stream)
+    monkeypatch.setattr(srv.RequestHandlerClass, "finish", finish)
+    monkeypatch.setattr(server, "check_connection", check)
+    monkeypatch.setattr(server, "log", logs.append)
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=3)
+    try:
+        conn.request("POST", "/tts", '{"text":"Hello", "stream":true}',
+                     {"Content-Type": "application/json"})
+        assert len(conn.getresponse().read()) == 4800
+        assert finished.wait(3) and complete.is_set()
+        assert not any("Cancelled" in line for line in logs)
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("after_first", [False, True])
 def test_stream_generation_error_framing(streaming_server, after_first):
     def chunks(*args, **kwargs):
@@ -176,7 +214,7 @@ def test_stream_disconnect_closes_generator(streaming_server, monkeypatch):
 @pytest.mark.parametrize("limit", ["write", "deadline"])
 def test_stalled_stream_releases_synthesis_lock(streaming_server, monkeypatch, limit):
     monkeypatch.setattr(server, "STREAM_WRITE_TIMEOUT_SECONDS", 0.2 if limit == "write" else 10)
-    monkeypatch.setattr(server, "STREAM_DEADLINE_SECONDS", 10 if limit == "write" else 0.2)
+    monkeypatch.setattr(server, "STREAM_INACTIVITY_SECONDS", 10 if limit == "write" else 0.2)
     began, closed, cleanup = threading.Event(), threading.Event(), threading.Event()
 
     def chunks(*args, **kwargs):
@@ -222,14 +260,14 @@ def test_stalled_stream_releases_synthesis_lock(streaming_server, monkeypatch, l
         next_request.close()
 
 
-def test_stream_deadline_bounds_continuous_progress(streaming_server, monkeypatch):
+def test_stream_inactivity_allows_continuous_progress(streaming_server, monkeypatch):
     monkeypatch.setattr(server, "STREAM_WRITE_TIMEOUT_SECONDS", 10)
-    monkeypatch.setattr(server, "STREAM_DEADLINE_SECONDS", 0.3)
+    monkeypatch.setattr(server, "STREAM_INACTIVITY_SECONDS", 0.3)
     closed, cleanup = threading.Event(), threading.Event()
 
     def chunks(*args, **kwargs):
         try:
-            while not cleanup.is_set():
+            for _ in range(25):
                 yield np.ones(2400, dtype=np.float32)
                 cleanup.wait(0.02)
         finally:
@@ -244,11 +282,9 @@ def test_stream_deadline_bounds_continuous_progress(streaming_server, monkeypatc
                      {"Content-Type": "application/json"})
         reply = conn.getresponse()
         assert reply.status == 200
-        with pytest.raises(http.client.IncompleteRead) as error:
-            reply.read()  # Keep draining: no individual write should time out.
-        assert error.value.partial
+        assert len(reply.read()) == 25 * 2400 * 2
         assert closed.wait(3)
-        assert time.monotonic() - began < 3
+        assert 0.3 < time.monotonic() - began < 3
         conn.request("POST", "/tts", '{"text":"Next"}', {"Content-Type": "application/json"})
         response = conn.getresponse()
         assert response.status == 200 and response.read().startswith(b"RIFF")

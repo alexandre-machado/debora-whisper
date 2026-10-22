@@ -137,6 +137,12 @@ def _no_real_uia(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_tts_capabilities(monkeypatch):
+    from debora_whisper import voice_chat
+    monkeypatch.setattr(voice_chat, "_tts_capabilities_cache", {})
+
+
+@pytest.fixture(autouse=True)
 def _unknown_audio_output(monkeypatch):
     """The developer's headphones must not switch the echo filter off."""
     from debora_whisper import platforms

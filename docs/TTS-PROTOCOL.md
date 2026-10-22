@@ -23,6 +23,15 @@ Voice preparation and the entire generator share the synthesis lock and
 inference/cancellation contexts. Logs include total audio, synthesis time and
 time to first chunk.
 
+Stream writes have a bounded socket timeout. The server also cancels after
+120 seconds without a completed audio chunk, resetting that inactivity budget
+after each chunk. The client limits each active speech burst with
+`tts_reply_timeout_seconds` (default 900 seconds), for both streaming and WAV.
+The budget runs while sentences are queued, synthesizing or playing, and resets
+when speech is idle. Silent LLM/tool work, including gaps after the waiting
+announcement, does not consume the next burst’s budget. Expiry interrupts pending
+HTTP reads and playback only; LLM work and reply text continue.
+
 The client opts in only when `tts_stream` is true (the default) and cached health
 advertises streaming. It also accepts a WAV fallback from a streaming request,
 bounds total response bytes, and rejects odd or truncated PCM bodies. Audio
