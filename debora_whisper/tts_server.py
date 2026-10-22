@@ -60,7 +60,7 @@ else:  # uv run --script: sibling modules are available without the app.
 MAX_TEXT_CHARS = 1000
 MAX_BODY_BYTES = 64_000
 STREAM_WRITE_TIMEOUT_SECONDS = 5.0
-STREAM_DEADLINE_SECONDS = 120.0
+STREAM_INACTIVITY_SECONDS = 120.0
 VOICE_SUFFIXES = (".wav", ".flac", ".mp3", ".ogg")
 # Prepared voices kept in memory (a few MB each on the GPU).
 MAX_CACHED_VOICES = 8
@@ -238,7 +238,7 @@ def check_connection(connection):
 
 
 @contextmanager
-def cancellable_synthesis(model, connection, modules=None):
+def cancellable_synthesis(model, connection, modules=None, *, check_after=True):
     """Check between speech tokens and flow steps; always remove our hooks."""
     last_check = 0.0
     def check(*args):
@@ -268,7 +268,8 @@ def cancellable_synthesis(model, connection, modules=None):
             except (AttributeError, IndexError, TypeError):
                 pass  # another Chatterbox layout: synthesize without cancelling
         yield
-        check()
+        if check_after:
+            check()
     finally:
         for hook in hooks:
             hook.remove()
@@ -322,9 +323,11 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
 
         def _stream(self, text, language, start):
             import numpy as np
-            # Bound both a stalled write and a peer that reads just fast enough
-            # to avoid individual write timeouts while holding the GPU lock.
-            deadline = time.monotonic() + STREAM_DEADLINE_SECONDS
+            # Slow CPU synthesis may take minutes while still making progress.
+            # Bound inactivity, including blocked generation and socket writes.
+            deadline = time.monotonic() + STREAM_INACTIVITY_SECONDS
+            progress = threading.Condition()
+            finished = False
 
             def bound_write():
                 remaining = deadline - time.monotonic()
@@ -340,9 +343,17 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                 except OSError:
                     pass
 
-            timer = threading.Timer(STREAM_DEADLINE_SECONDS, shutdown)
-            timer.daemon = True
-            timer.start()
+            def watch():
+                with progress:
+                    while not finished:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            shutdown()
+                            return
+                        progress.wait(remaining)
+
+            watchdog = threading.Thread(target=watch, daemon=True)
+            watchdog.start()
             chunks = None
             total = 0
             first = None
@@ -379,8 +390,11 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                     except OSError as e:
                         raise SynthesisCancelled() from e
                     total += len(samples)
+                    with progress:
+                        deadline = time.monotonic() + STREAM_INACTIVITY_SECONDS
                 if first is None:
                     raise ValueError("generation returned no audio")
+                check_connection(self.connection)
                 bound_write()
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
@@ -392,8 +406,10 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                     if hasattr(chunks, "close"):
                         chunks.close()
                 finally:
-                    timer.cancel()
-                    timer.join()
+                    with progress:
+                        finished = True
+                        progress.notify_all()
+                    watchdog.join()
             log(f"{total / model.sr:.1f}s of audio in {time.time() - start:.1f}s "
                 f"(first chunk {first:.3f}s): {text[:300]!r}")
 
@@ -445,12 +461,15 @@ def make_handler(model, default_language: str, *, adapter=False, error=None):
                     if not adapter:
                         drop_attention_spies(model)
                     modules = model.cancel_modules if adapter else None
-                    with cancellable_synthesis(model, self.connection, modules), torch.inference_mode():
+                    streaming = (request.get("stream") is True
+                                 and callable(getattr(model, "generate_stream", None)))
+                    # _stream checks before sending EOF. A client may close as
+                    # soon as it sees EOF, which is successful completion.
+                    with cancellable_synthesis(model, self.connection, modules,
+                                               check_after=not streaming), torch.inference_mode():
                         # Reference encoding also needs cancellation on new voices.
                         if adapter:
                             model.prepare_voice()
-                        streaming = (request.get("stream") is True
-                                     and callable(getattr(model, "generate_stream", None)))
                         if streaming:
                             self._stream(text, language, start)
                         else:
