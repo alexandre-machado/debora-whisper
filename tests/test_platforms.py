@@ -4,6 +4,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
@@ -12,6 +14,172 @@ from debora_whisper import device_queries as queries, dictation_engine as de, pl
 from debora_whisper.platforms.base import Platform
 from debora_whisper.platforms.windows import WindowsPlatform
 from debora_whisper.platforms import windows_text
+
+
+def test_generic_platform_has_no_keyboard_watchdog():
+    assert Platform().keyboard_watchdog(None, None, None) is None
+
+
+@pytest.mark.parametrize("healthy,keyboard_input", [(True, True), (False, False), (False, True)])
+def test_keyboard_watchdog_requires_missing_events_and_keyboard_input(healthy, keyboard_input):
+    from debora_whisper.platforms.windows import KeyboardHookWatchdog
+    clock = [0.0]
+    stop, recover, log = threading.Event(), Mock(return_value=True), Mock()
+    watchdog = KeyboardHookWatchdog(stop, recover, log, clock=lambda: clock[0],
+                                    probe=lambda: (0.1, keyboard_input))
+    for now in (4.0, 4.5, 5.0, 6.0, 10.0, 20.0):
+        clock[0] = now
+        if healthy:
+            watchdog.observe(None)
+        watchdog.poll()
+    if healthy or not keyboard_input:
+        recover.assert_not_called()
+        log.assert_not_called()
+    else:
+        recover.assert_called_once()
+        log.assert_called_once_with("Keyboard hook lost; hotkeys re-registered.")
+        clock[0] = 35.0
+        watchdog.poll()
+        clock[0] = 36.0
+        watchdog.poll()
+        assert recover.call_count == 2
+    stop.set()
+    clock[0] = 100.0
+    watchdog.poll()
+    clock[0] = 102.0
+    watchdog.poll()
+    assert recover.call_count == (2 if keyboard_input and not healthy else 0)
+
+
+def test_keyboard_watchdog_allows_delayed_hook_event():
+    from debora_whisper.platforms.windows import KeyboardHookWatchdog
+    clock, recover = [0.0], Mock()
+    watchdog = KeyboardHookWatchdog(threading.Event(), recover, Mock(),
+                                    clock=lambda: clock[0], probe=lambda: (0.1, True))
+    clock[0] = 4.0
+    watchdog.poll()
+    clock[0] = 4.5
+    watchdog.observe(None)
+    clock[0] = 5.0
+    watchdog.poll()
+    recover.assert_not_called()
+
+
+def test_keyboard_watchdog_throttles_failed_recovery_and_stops_thread():
+    from debora_whisper.platforms.windows import KeyboardHookWatchdog
+    clock, stop = [0.0], threading.Event()
+    recover = Mock(side_effect=RuntimeError("busy"))
+    watchdog = KeyboardHookWatchdog(stop, recover, Mock(), clock=lambda: clock[0],
+                                    probe=lambda: (0.1, True))
+    clock[0] = 4.0
+    watchdog.poll()
+    clock[0] = 5.0
+    with pytest.raises(RuntimeError, match="busy"):
+        watchdog.poll()
+    clock[0] = 6.0
+    watchdog.poll()
+    recover.assert_called_once()
+    watchdog.start()
+    stop.set()
+    watchdog.join(2)
+    assert not watchdog._thread.is_alive()
+
+
+def test_windows_keyboard_probe_ignores_mouse_and_handles_tick_wrap(monkeypatch):
+    from debora_whisper.platforms.windows import KeyboardHookWatchdog
+    api = Mock()
+    pressed = {65: 0x8000}
+    api.user32.GetAsyncKeyState.side_effect = lambda key: pressed.get(key, 0)
+
+    def last_input(info):
+        info._obj.dwTime = 0xfffffff0
+        return True
+
+    api.user32.GetLastInputInfo.side_effect = last_input
+    api.kernel32.GetTickCount.return_value = 0x10
+    monkeypatch.setattr(ctypes, "windll", api, raising=False)
+    watchdog = KeyboardHookWatchdog(threading.Event(), Mock(), Mock())
+    assert watchdog._input_state() == (0.032, True)
+    assert watchdog._input_state() == (0.032, False)  # held key + mouse isn't typing
+    pressed.clear()
+    pressed[1] = 0x8001  # mouse button
+    assert watchdog._input_state() == (0.032, False)
+    pressed[66] = 1  # short key press between polls
+    assert watchdog._input_state() == (0.032, True)
+    api.user32.GetLastInputInfo.return_value = False
+    api.user32.GetLastInputInfo.side_effect = None
+    assert watchdog._input_state() == (float("inf"), False)
+
+
+@pytest.mark.parametrize("hung,stopping", [(False, False), (True, False), (False, True)])
+def test_windows_restarts_native_listener_without_clearing_callbacks(monkeypatch, hung, stopping):
+    api, old, new = Mock(), Mock(native_id=42), Mock()
+    old.is_alive.side_effect = [True, hung]
+    listener = SimpleNamespace(lock=threading.Lock(), listening_thread=old,
+                               active_modifiers={29}, modifier_states={29: "pending"},
+                               listen=Mock(), handlers=[object()], blocking_hotkeys={1: object()})
+    keyboard = SimpleNamespace(_listener=listener, _pressed_events_lock=threading.Lock(),
+                               _pressed_events={29: object()}, _logically_pressed_keys={29: object()},
+                               _os_keyboard=SimpleNamespace())
+    monkeypatch.setattr(ctypes, "windll", api, raising=False)
+    factory = Mock(return_value=new)
+    monkeypatch.setattr(threading, "Thread", factory)
+    stop = threading.Event()
+    if stopping:
+        stop.set()
+    if hung:
+        with pytest.raises(RuntimeError, match="did not stop"):
+            WindowsPlatform().restart_keyboard_listener(keyboard, stop)
+        factory.assert_not_called()
+    else:
+        WindowsPlatform().restart_keyboard_listener(keyboard, stop)
+        assert not keyboard._pressed_events
+        assert not keyboard._logically_pressed_keys
+        assert not listener.active_modifiers
+        assert not listener.modifier_states
+        if stopping:
+            factory.assert_not_called()
+        else:
+            assert listener.listening_thread is new
+            new.start.assert_called_once()
+    assert len(listener.handlers) == len(listener.blocking_hotkeys) == 1
+    assert api.user32.PostThreadMessageW.call_args_list == [call(42, 0, 0, 0), call(42, 18, 0, 0)]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real Windows hook lifecycle")
+def test_native_keyboard_hook_can_be_reinstalled_in_isolated_process():
+    # No synthetic keystrokes or suppression. Keep keyboard's process-global
+    # listener/processor out of pytest and terminate them with the subprocess.
+    script = """
+import threading
+import keyboard
+from debora_whisper.platforms.windows import WindowsPlatform
+backend = keyboard._os_keyboard
+install = backend.SetWindowsHookEx
+installed = threading.Event()
+handles = []
+def capture(*args):
+    handle = install(*args)
+    assert handle
+    handles.append(handle)
+    installed.set()
+    return handle
+backend.SetWindowsHookEx = capture
+keyboard.hook(lambda event: None)
+assert installed.wait(5)
+old = keyboard._listener.listening_thread
+assert backend.UnhookWindowsHookEx(handles[0])
+installed.clear()
+WindowsPlatform().restart_keyboard_listener(keyboard, threading.Event())
+assert not old.is_alive()
+assert installed.wait(5)
+assert len(handles) == 2
+assert keyboard._listener.listening_thread.is_alive()
+assert backend.UnhookWindowsHookEx(handles[1])
+"""
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                            text=True, timeout=20, creationflags=processes.NO_WINDOW)
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("returncode", [None, 0, 1])

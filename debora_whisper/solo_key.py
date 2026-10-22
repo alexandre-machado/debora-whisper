@@ -15,7 +15,8 @@ class SoloKeyTap:
 
     The key is never suppressed, so AltGr+Q still types "/" and Ctrl+Alt
     shortcuts keep working; only a tap of the key alone counts. Feed it
-    every event from ``keyboard.hook``.
+    every event from ``keyboard.hook``. ``on_tap`` must only enqueue work;
+    audio, UI, locks and thread startup belong in the consumer.
     """
 
     def __init__(self, key: str, on_tap, max_seconds: float = 0.6,

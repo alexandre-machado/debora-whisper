@@ -385,9 +385,8 @@ def test_apply_reconciles_managed_tts_in_dictation(
     monkeypatch.setitem(gui._on_settings_apply.__globals__, "OnboardingWindow", onboarding)
     for name, method in zip(("start_background", "_warm_up_voice_chat"), engine_startup):
         monkeypatch.setattr(de.DictationApp, name, method)
-    for name in ("_start_loader", "_start_segment_consumer", "_register_voice_chat_hotkey"):
+    for name in ("_start_loader", "_start_segment_consumer", "_start_hotkeys"):
         monkeypatch.setattr(de.DictationApp, name, MagicMock())
-    monkeypatch.setattr("keyboard.add_hotkey", MagicMock())
     monkeypatch.setattr(vc.VoiceChat, "warm_tts", MagicMock())
     # Run the real background paths and join them before restoring fixtures.
     thread_class = threading.Thread
@@ -406,14 +405,15 @@ def test_apply_reconciles_managed_tts_in_dictation(
             assert gui._engine is previous
             onboarding.call_args.kwargs["on_done"]()
     finally:
-        # Resource telemetry and TTS health polling live until fixture teardown;
+        # Engine services and TTS health polling live until fixture teardown;
         # only startup/reconciliation workers must have finished at this point.
+        services = (gui._engine._resource_thread, gui._engine._hotkey_worker)
         for worker in workers:
-            if worker is not gui._engine._resource_thread and worker.name != "tts-health":
+            if worker not in services and worker.name != "tts-health":
                 worker.join(5)
     # Reconciliation can append a poller while the parent worker is being joined.
     assert all(not worker.is_alive() for worker in workers
-               if worker is not gui._engine._resource_thread and worker.name != "tts-health")
+               if worker not in services and worker.name != "tts-health")
     assert (gui._engine is not previous) is download
     if not download:
         assert gui._engine.warm_voice_chat is warm_voice_chat

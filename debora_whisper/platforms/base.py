@@ -17,6 +17,13 @@ class Platform:
     name = "generic"
     no_window = 0
 
+    def keyboard_watchdog(self, stopping, recover, log):
+        """Native hook health is unknown on this platform."""
+        return None
+
+    def restart_keyboard_listener(self, keyboard, stopping):
+        """No native listener recovery on this platform."""
+
     def type_text(self, text: str, auto_enter: bool = False):
         """Keep the portable clipboard/keyboard path; native support is unknown."""
         from debora_whisper.platforms import windows_text
