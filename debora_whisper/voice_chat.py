@@ -344,10 +344,15 @@ def _model_path(model: str, log) -> str:
         return model
     from huggingface_hub import snapshot_download
     try:
-        return snapshot_download(model, local_files_only=True)
+        local = snapshot_download(model, local_files_only=True)
+        # An interrupted download leaves a snapshot without the weights,
+        # which the offline lookup still returns; downloading again resumes.
+        if os.path.isfile(os.path.join(local, "openvino_model.bin")):
+            return local
+        log(f"Voice chat: {model} is incomplete; resuming its download...")
     except Exception:
         log(f"Voice chat: downloading {model} (first use, several GB)...")
-        return snapshot_download(model)
+    return snapshot_download(model)
 
 
 def download_llm(config: dict, log=print) -> str:
