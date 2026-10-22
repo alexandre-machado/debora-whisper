@@ -981,9 +981,15 @@ def test_failed_reply_warns(typed):
 def test_hotkey_while_speaking_interrupts_the_reply():
     app = _app(voice_chat=True)
     app.voice_chat.speaking = True
+    watched = threading.Event()
     with patch.object(app.voice_chat, "interrupt") as interrupt, \
-            patch.object(app, "_watch_key"), patch.object(app, "_start_recording") as start:
-        app.toggle_recording()
+            patch.object(app, "_watch_key", side_effect=lambda *args: watched.set()), \
+            patch.object(app, "_start_recording") as start:
+        try:
+            app.toggle_recording()
+            assert watched.wait(2)
+        finally:
+            app.stop_monitoring()
     interrupt.assert_called_once()
     start.assert_not_called()
 

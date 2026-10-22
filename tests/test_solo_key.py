@@ -1,5 +1,6 @@
 """Right Alt tapped alone switches voice chat; AltGr combos keep typing."""
 import time
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -130,14 +131,41 @@ def test_up_without_down_is_ignored():
 def test_engine_hotkey_calls_app_callback(key):
     app = DictationApp({**DEFAULT_CONFIG, "beep_on_start": False,
                         "voice_chat_hotkey": key})
-    app.on_voice_chat_toggle = MagicMock()
+    called = threading.Event()
+    app.on_voice_chat_toggle = MagicMock(side_effect=called.set)
     keyboard = MagicMock()
     app._register_voice_chat_hotkey(keyboard)
     keyboard.key_to_scan_codes.assert_called_once_with(key)
     handler = keyboard.hook.call_args.args[0]
     handler(SimpleNamespace(name="alt gr", event_type="down", scan_code=541))
     handler(SimpleNamespace(name="alt gr", event_type="up", scan_code=541))
+    assert called.wait(2)
     app.on_voice_chat_toggle.assert_called_once()
+
+
+def test_solo_hook_does_not_wait_for_ui():
+    app = DictationApp({**DEFAULT_CONFIG, "beep_on_start": False})
+    keyboard = MagicMock()
+    entered, release = threading.Event(), threading.Event()
+    callback_threads = []
+
+    def slow_ui():
+        callback_threads.append(threading.get_ident())
+        entered.set()
+        assert release.wait(2)
+
+    app.on_voice_chat_toggle = slow_ui
+    app._register_voice_chat_hotkey(keyboard)
+    handler = keyboard.hook.call_args.args[0]
+    try:
+        handler(SimpleNamespace(name="alt gr", event_type="down", scan_code=541))
+        handler(SimpleNamespace(name="alt gr", event_type="up", scan_code=541))
+        assert entered.wait(2)
+        assert callback_threads == [app._hotkey_worker.ident]
+        assert callback_threads != [threading.get_ident()]
+    finally:
+        release.set()
+        app.stop_monitoring()
 
 
 def test_engine_unknown_hotkey_is_disabled():

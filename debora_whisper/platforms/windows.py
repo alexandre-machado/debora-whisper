@@ -5,6 +5,9 @@ headphones from speakers needs no extra package.
 """
 import os
 import subprocess
+import ctypes
+import threading
+import time
 from pathlib import Path
 
 from debora_whisper.platforms.base import CaretReadStatus, Platform
@@ -19,6 +22,111 @@ _ACTIVE = 1
 _HEADPHONES, _HEADSET = 3, 5
 # MME, sounddevice's default host API, cuts device names at 31 characters.
 _MME_NAME_CHARS = 31
+_user32 = ctypes.WinDLL("user32", use_last_error=True) if os.name == "nt" else None
+if _user32 is not None:
+    _user32.PostThreadMessageW.argtypes = [ctypes.c_ulong, ctypes.c_uint,
+                                         ctypes.c_size_t, ctypes.c_ssize_t]
+    _user32.PostThreadMessageW.restype = ctypes.c_int
+
+
+def _listen_safely(listen):
+    try:
+        listen()
+    except OSError:
+        from debora_whisper.dictation_engine import log
+        log("Keyboard listener stopped after a Windows message-loop error.")
+
+
+class KeyboardHookWatchdog:
+    """Confirm missing hook events against independent Windows input state.
+
+    Mouse input alone never triggers recovery. Give a detected key one second
+    to reach the hook, then replace the native listener as well as our bindings:
+    keyboard.add_hotkey alone cannot revive a WH_KEYBOARD_LL removed by Windows.
+    The same check covers input after sleep/unlock without a hidden window.
+    """
+    STALE_SECONDS = 3.0
+    RETRY_SECONDS = 30.0
+
+    def __init__(self, stopping, recover, log, *, clock=time.monotonic, probe=None):
+        self._stopping, self._recover, self._log = stopping, recover, log
+        self._clock = clock
+        self._probe = probe or self._input_state
+        self._last_event = clock()
+        self._last_attempt = float("-inf")
+        self._suspect = None
+        self._keys_down = set()
+        self._thread = None
+
+    def observe(self, event):
+        self._last_event = self._clock()
+
+    def _input_state(self):
+        from ctypes import wintypes
+
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+        user32 = ctypes.windll.user32
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not user32.GetLastInputInfo(ctypes.byref(info)):
+            return float("inf"), False
+        # Both counters are DWORD milliseconds, including across the 49-day wrap.
+        age = ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xffffffff) / 1000
+        # Derive only pressed/not-pressed; raw key states are never logged or
+        # stored beyond this poll (held keys are compared with the next poll).
+        states = {key: user32.GetAsyncKeyState(key) for key in range(8, 255)}
+        down = {key for key, state in states.items() if state & 0x8000}
+        # The low bit can miss a quick tap (another process may consume it).
+        # Newly held keys provide an independent fallback; mouse buttons excluded.
+        pressed = bool(down - self._keys_down) or any(state & 1 for state in states.values())
+        self._keys_down = down
+        return age, pressed
+
+    def poll(self):
+        now = self._clock()
+        if self._stopping.is_set():
+            return
+        age, key_pressed = self._probe()
+        if now - self._last_event < self.STALE_SECONDS:
+            self._suspect = None
+            return
+        if now - self._last_attempt < self.RETRY_SECONDS:
+            return
+        if self._suspect is None:
+            if key_pressed and age < 1.0:
+                self._suspect = (now, self._last_event)
+            return
+        since, last_event = self._suspect
+        if self._last_event != last_event:
+            self._suspect = None
+            return
+        if now - since < 1.0:
+            return
+        self._last_attempt = now
+        self._suspect = None
+        if self._recover():
+            self._last_event = now
+            self._log("Keyboard hook lost; hotkeys re-registered.")
+
+    def _run(self):
+        while not self._stopping.wait(0.5):
+            try:
+                self.poll()
+            except Exception as exc:
+                now = self._clock()
+                if now - getattr(self, "_last_error", float("-inf")) >= self.RETRY_SECONDS:
+                    self._last_error = now
+                    self._log(f"Keyboard hook recovery failed: {exc}")
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="keyboard-watchdog", daemon=True)
+        self._thread.start()
+
+    def join(self, timeout):
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout)
 
 
 def render_endpoints():
@@ -71,14 +179,63 @@ def is_headphones(name, endpoints):
 class WindowsPlatform(Platform):
     name = "windows"
 
+    def keyboard_watchdog(self, stopping, recover, log):
+        self._watchdog = KeyboardHookWatchdog(stopping, recover, log)
+        return self._watchdog
+
+    def restart_keyboard_listener(self, keyboard, stopping):
+        # keyboard 0.13.x owns one native hook on listening_thread. Its public
+        # unhook APIs only remove Python callbacks. Exiting the installing thread
+        # removes that thread's native hook; retain the processing thread and
+        # unrelated registrations. In 0.13.5, GetMessage receives a NULL LPMSG;
+        # WM_NULL causes an access violation, converted by ctypes to OSError,
+        # which ends the old thread. The replacement wrapper logs it concisely.
+        # WM_QUIT also handles a corrected message loop.
+        listener = keyboard._listener
+        with listener.lock:
+            old = listener.listening_thread
+            if old.is_alive():
+                post = _user32.PostThreadMessageW
+                post(old.native_id, 0, 0, 0)  # WM_NULL
+                post(old.native_id, 0x0012, 0, 0)  # WM_QUIT
+                old.join(1.0)
+                if old.is_alive():
+                    raise RuntimeError("keyboard listener did not stop")
+            # Lost up events otherwise leave Ctrl/Alt or a suppressed hotkey stuck.
+            with keyboard._pressed_events_lock:
+                keyboard._pressed_events.clear()
+                keyboard._logically_pressed_keys.clear()
+            listener.active_modifiers.clear()
+            listener.modifier_states.clear()
+            backend = keyboard._os_keyboard
+            backend.shift_is_pressed = backend.altgr_is_pressed = False
+            backend.ignore_next_right_alt = False
+            if stopping.is_set():
+                return
+            listener.listening_thread = threading.Thread(
+                target=_listen_safely, args=(listener.listen,),
+                name="keyboard-listener", daemon=True)
+            listener.listening_thread.start()
+
     def type_text(self, text: str, auto_enter: bool = False):
-        return windows_text.type_text(text, auto_enter)
+        return self._observe_typing(windows_text.type_text, text, auto_enter)
+
+    def _observe_typing(self, type_text, *args):
+        watchdog = getattr(self, "_watchdog", None)
+        # Replayed keys and VK_PACKET bypass the passive keyboard observer.
+        if watchdog is not None:
+            watchdog.observe(None)
+        try:
+            return type_text(*args)
+        finally:
+            if watchdog is not None:
+                watchdog.observe(None)
 
     def _type_text_ctypes(self, text: str):
-        return windows_text._type_text_ctypes(text)
+        return self._observe_typing(windows_text._type_text_ctypes, text)
 
     def type_draft(self, text: str):
-        return windows_text.type_draft(text)
+        return self._observe_typing(windows_text.type_draft, text)
 
     def delete_text(self, count: int):
         return windows_text.delete_text(count)

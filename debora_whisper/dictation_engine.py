@@ -15,6 +15,7 @@ import inspect
 import unicodedata
 from copy import deepcopy
 import threading
+import queue
 import zlib
 from collections import deque
 from enum import Enum
@@ -2561,6 +2562,13 @@ class DictationApp:
         self.warm_voice_chat = False
         self._audio_lifecycle_lock = threading.Lock()
         self._stopping = threading.Event()
+        self._hotkey_lock = threading.Lock()
+        self._hotkey_removers = []
+        self._hook_watchdog = None
+        self._hotkey_held = False
+        self._hotkey_released_at = None
+        self._hotkey_codes = frozenset()
+        self._hotkey_actions = queue.SimpleQueue()
         # Orders the final "still running?" check plus paste/history against
         # stop(). Only type_text and the history append run under it, never a
         # state callback, so a callback that calls stop() cannot deadlock.
@@ -2620,6 +2628,10 @@ class DictationApp:
         self._voice_active = None
         self._voice_stop = None
         self._voice_worker = None
+
+        self._hotkey_worker = threading.Thread(target=self._consume_hotkeys,
+                                               name="hotkey-actions", daemon=True)
+        self._hotkey_worker.start()
 
         self._resource_thread = threading.Thread(target=self._monitor_resources,
                                                  name="resource-monitor", daemon=True)
@@ -3477,16 +3489,33 @@ class DictationApp:
         return self._continuous
 
     def toggle_recording(self):
+        """Hook callback: capture the press; never start threads or do I/O here."""
+        if self._stopping.is_set() or self._hotkey_held:
+            return
+        self._hotkey_held = True
+        self._hotkey_released_at = None
+        self._hotkey_actions.put((self._handle_hotkey_press, (time.time(), time.perf_counter())))
+
+    def _consume_hotkeys(self):
+        while not self._stopping.is_set():
+            try:
+                callback, args = self._hotkey_actions.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if self._stopping.is_set():
+                return
+            try:
+                callback(*args)
+            except Exception as exc:
+                self._hotkey_held = False
+                log(f"Hotkey action failed: {exc}")
+
+    def _handle_hotkey_press(self, press_time, press_perf):
         """Hotkey press. Holding is push-to-talk; a tap starts continuous
         listening (tap_action "continuous") or starts/stops a recording
         ("toggle"). Any press while continuous listening is on stops it."""
         if self._stopping.is_set():
             return
-        if getattr(self, "_hotkey_held", False):
-            # Ignore auto-repeat while the key is physically held
-            return
-
-        press_time = time.time()
         if self.voice_chat.speaking or self._voice_active is not None:
             # A press while the reply is on its way only cuts it short.
             self._hotkey_held = True
@@ -3501,6 +3530,7 @@ class DictationApp:
             return
 
         if self._transcribing:
+            self._hotkey_held = False
             return
         self._hotkey_held = True
         if self.is_recording:
@@ -3509,7 +3539,7 @@ class DictationApp:
             threading.Thread(target=self._watch_key, args=(press_time,), daemon=True).start()
         else:
             starter = threading.Thread(target=self._start_recording,
-                                       args=(time.perf_counter(),), daemon=True)
+                                       args=(press_perf,), daemon=True)
             starter.start()
             threading.Thread(target=self._watch_key, args=(press_time, starter),
                              daemon=True).start()
@@ -3578,13 +3608,19 @@ class DictationApp:
         """Wait for the hotkey release, then settle what a starting press
         meant: held = push-to-talk (stop and transcribe), tap = tap_action."""
         import keyboard
-        while keyboard.is_pressed(self.config["hotkey"]):
-            time.sleep(0.05)
+        while self._hotkey_released_at is None and keyboard.is_pressed(self.config["hotkey"]):
+            if self._stopping.wait(0.05):
+                self._hotkey_held = False
+                return
+        released_at = self._hotkey_released_at or time.time()
         if starter is None:
             self._hotkey_held = False
             return
         starter.join()
-        if time.time() - press_time > self.HOLD_SECONDS:
+        if self._stopping.is_set():
+            self._hotkey_held = False
+            return
+        if released_at - press_time > self.HOLD_SECONDS:
             self._hotkey_held = False
             self._finish_recording()
             return
@@ -3677,10 +3713,7 @@ class DictationApp:
         """
         import keyboard
 
-        hotkey = self.config["hotkey"]
-        keyboard.add_hotkey(hotkey, self.toggle_recording, suppress=True)
-        log(f"Hotkey {hotkey} registered.")
-        self._register_voice_chat_hotkey(keyboard)
+        self._start_hotkeys(keyboard)
 
         log("Loading model in background (first time may take several minutes)...")
         self._start_loader()
@@ -3696,7 +3729,53 @@ class DictationApp:
             ).start()
         self._start_segment_consumer()
 
-    def _register_voice_chat_hotkey(self, keyboard):
+    def _observe_keyboard(self, event):
+        # Run before suppression, so even a held Ctrl+Space proves liveness.
+        if self._hook_watchdog is not None:
+            self._hook_watchdog.observe(event)
+        if (event.event_type == "up" and event.scan_code in self._hotkey_codes
+                and self._hotkey_held and self._hotkey_released_at is None):
+            self._hotkey_released_at = time.time()
+        return True  # This observer never suppresses input.
+
+    def _install_hotkeys(self, keyboard, *, announce=True):
+        for remove in self._hotkey_removers:
+            remove()
+        self._hotkey_removers.clear()
+        hotkey = self.config["hotkey"]
+        self._hotkey_codes = frozenset(code for step in keyboard.parse_hotkey(hotkey)
+                                      for keys in step for code in keys)
+        self._hotkey_removers.append(keyboard.hook(self._observe_keyboard, suppress=True))
+        self._hotkey_removers.append(
+            keyboard.add_hotkey(hotkey, self.toggle_recording, suppress=True))
+        if announce:
+            log(f"Hotkey {hotkey} registered.")
+        self._register_voice_chat_hotkey(keyboard, announce=announce)
+
+    def _start_hotkeys(self, keyboard):
+        with self._hotkey_lock:
+            if self._stopping.is_set() or self._hotkey_removers:
+                return
+            self._hook_watchdog = platforms.current().keyboard_watchdog(
+                self._stopping, self._recover_hotkeys, log)
+            self._install_hotkeys(keyboard)
+            if self._hook_watchdog is not None:
+                self._hook_watchdog.start()
+
+    def _recover_hotkeys(self):
+        import keyboard
+        with self._hotkey_lock:
+            if self._stopping.is_set():
+                return False
+            platforms.current().restart_keyboard_listener(keyboard, self._stopping)
+            if self._stopping.is_set():
+                return False
+            # A key-up may have disappeared with the native hook.
+            self._hotkey_released_at = time.time()
+            self._install_hotkeys(keyboard, announce=False)
+            return True
+
+    def _register_voice_chat_hotkey(self, keyboard, *, announce=True):
         key = self.config.get("voice_chat_hotkey", "").strip()
         if not key:
             return
@@ -3705,17 +3784,21 @@ class DictationApp:
         except ValueError:
             log(f"Voice chat hotkey {key!r} is not a key; voice chat hotkey disabled.")
             return
-        keyboard.hook(SoloKeyTap(key, self._on_voice_chat_hotkey).handle)
-        log(f"Voice chat hotkey {key} registered (tap it alone).")
+        self._hotkey_removers.append(
+            keyboard.hook(SoloKeyTap(key, self._on_voice_chat_hotkey).handle))
+        if announce:
+            log(f"Voice chat hotkey {key} registered (tap it alone).")
 
     def _on_voice_chat_hotkey(self):
-        """On the keyboard hook's thread, which must return quickly."""
+        if not self._stopping.is_set():
+            self._hotkey_actions.put((self._handle_voice_chat_hotkey, ()))
+
+    def _handle_voice_chat_hotkey(self):
         if self.on_voice_chat_toggle:
             self.on_voice_chat_toggle()
         else:
             enabled = not self.config.get("voice_chat")
-            threading.Thread(target=self.set_voice_chat, args=(enabled, True),
-                             daemon=True).start()
+            self.set_voice_chat(enabled, True)
 
     def set_voice_chat(self, enabled: bool, listen: bool = False):
         """Switch voice chat while running. On: the TTS server and the LLM
@@ -3899,6 +3982,12 @@ class DictationApp:
     def stop_monitoring(self, timeout=2.0):
         """Cancel and join telemetry, also usable without desktop shutdown."""
         self._stopping.set()
+        watchdog = self._hook_watchdog
+        if watchdog is not None:
+            watchdog.join(timeout)
+        worker = self._hotkey_worker
+        if worker is not threading.current_thread():
+            worker.join(timeout)
         worker = getattr(self, "_resource_thread", None)
         if worker is not None and worker is not threading.current_thread() and worker.ident is not None:
             worker.join(timeout)
@@ -3911,7 +4000,9 @@ class DictationApp:
             self._stopping.set()
         try:
             import keyboard
-            keyboard.unhook_all()
+            with self._hotkey_lock:
+                keyboard.unhook_all()
+                self._hotkey_removers.clear()
         except Exception:
             pass
         self.stop_monitoring()
@@ -3952,8 +4043,7 @@ class DictationApp:
         log("")
 
         # Register global hotkey immediately so it's responsive during loading
-        keyboard.add_hotkey(hotkey, self.toggle_recording, suppress=True)
-        self._register_voice_chat_hotkey(keyboard)
+        self._start_hotkeys(keyboard)
 
         # Load model in background so hotkey is responsive during load
         log("Loading model in background (first time may take several minutes)...")
