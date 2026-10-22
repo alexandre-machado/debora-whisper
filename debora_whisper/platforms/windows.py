@@ -22,6 +22,19 @@ _ACTIVE = 1
 _HEADPHONES, _HEADSET = 3, 5
 # MME, sounddevice's default host API, cuts device names at 31 characters.
 _MME_NAME_CHARS = 31
+_user32 = ctypes.WinDLL("user32", use_last_error=True) if os.name == "nt" else None
+if _user32 is not None:
+    _user32.PostThreadMessageW.argtypes = [ctypes.c_ulong, ctypes.c_uint,
+                                         ctypes.c_size_t, ctypes.c_ssize_t]
+    _user32.PostThreadMessageW.restype = ctypes.c_int
+
+
+def _listen_safely(listen):
+    try:
+        listen()
+    except OSError:
+        from debora_whisper.dictation_engine import log
+        log("Keyboard listener stopped after a Windows message-loop error.")
 
 
 class KeyboardHookWatchdog:
@@ -61,6 +74,8 @@ class KeyboardHookWatchdog:
             return float("inf"), False
         # Both counters are DWORD milliseconds, including across the 49-day wrap.
         age = ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xffffffff) / 1000
+        # Derive only pressed/not-pressed; raw key states are never logged or
+        # stored beyond this poll (held keys are compared with the next poll).
         states = {key: user32.GetAsyncKeyState(key) for key in range(8, 255)}
         down = {key for key, state in states.items() if state & 0x8000}
         # The low bit can miss a quick tap (another process may consume it).
@@ -165,21 +180,22 @@ class WindowsPlatform(Platform):
     name = "windows"
 
     def keyboard_watchdog(self, stopping, recover, log):
-        return KeyboardHookWatchdog(stopping, recover, log)
+        self._watchdog = KeyboardHookWatchdog(stopping, recover, log)
+        return self._watchdog
 
     def restart_keyboard_listener(self, keyboard, stopping):
         # keyboard 0.13.x owns one native hook on listening_thread. Its public
         # unhook APIs only remove Python callbacks. Exiting the installing thread
         # removes that thread's native hook; retain the processing thread and
-        # unrelated registrations. WM_NULL wakes 0.13.x's inverted GetMessage
-        # loop, WM_QUIT also handles a corrected message loop.
+        # unrelated registrations. In 0.13.5, GetMessage receives a NULL LPMSG;
+        # WM_NULL causes an access violation, converted by ctypes to OSError,
+        # which ends the old thread. The replacement wrapper logs it concisely.
+        # WM_QUIT also handles a corrected message loop.
         listener = keyboard._listener
         with listener.lock:
             old = listener.listening_thread
             if old.is_alive():
-                post = ctypes.windll.user32.PostThreadMessageW
-                post.argtypes = [ctypes.c_ulong, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
-                post.restype = ctypes.c_int
+                post = _user32.PostThreadMessageW
                 post(old.native_id, 0, 0, 0)  # WM_NULL
                 post(old.native_id, 0x0012, 0, 0)  # WM_QUIT
                 old.join(1.0)
@@ -197,17 +213,29 @@ class WindowsPlatform(Platform):
             if stopping.is_set():
                 return
             listener.listening_thread = threading.Thread(
-                target=listener.listen, name="keyboard-listener", daemon=True)
+                target=_listen_safely, args=(listener.listen,),
+                name="keyboard-listener", daemon=True)
             listener.listening_thread.start()
 
     def type_text(self, text: str, auto_enter: bool = False):
-        return windows_text.type_text(text, auto_enter)
+        return self._observe_typing(windows_text.type_text, text, auto_enter)
+
+    def _observe_typing(self, type_text, *args):
+        watchdog = getattr(self, "_watchdog", None)
+        # Replayed keys and VK_PACKET bypass the passive keyboard observer.
+        if watchdog is not None:
+            watchdog.observe(None)
+        try:
+            return type_text(*args)
+        finally:
+            if watchdog is not None:
+                watchdog.observe(None)
 
     def _type_text_ctypes(self, text: str):
-        return windows_text._type_text_ctypes(text)
+        return self._observe_typing(windows_text._type_text_ctypes, text)
 
     def type_draft(self, text: str):
-        return windows_text.type_draft(text)
+        return self._observe_typing(windows_text.type_draft, text)
 
     def delete_text(self, count: int):
         return windows_text.delete_text(count)

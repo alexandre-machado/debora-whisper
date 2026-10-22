@@ -13,11 +13,58 @@ import pytest
 from debora_whisper import device_queries as queries, dictation_engine as de, platforms, processes
 from debora_whisper.platforms.base import Platform
 from debora_whisper.platforms.windows import WindowsPlatform
-from debora_whisper.platforms import windows_text
+from debora_whisper.platforms import windows, windows_text
 
 
 def test_generic_platform_has_no_keyboard_watchdog():
     assert Platform().keyboard_watchdog(None, None, None) is None
+
+
+@pytest.mark.parametrize("error", [None, OSError("access violation writing 0x0")])
+def test_windows_listener_wrapper_logs_oserror_once(monkeypatch, error):
+    log = Mock()
+    monkeypatch.setattr(de, "log", log)
+    listen = Mock(side_effect=error)
+    windows._listen_safely(listen)
+    listen.assert_called_once_with()
+    if error:
+        log.assert_called_once_with(
+            "Keyboard listener stopped after a Windows message-loop error.")
+    else:
+        log.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["type_text", "_type_text_ctypes", "type_draft"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_windows_typed_output_refreshes_watchdog(monkeypatch, method, fails):
+    provider = WindowsPlatform()
+    recover = Mock()
+    watchdog = provider.keyboard_watchdog(threading.Event(), recover, Mock())
+    now = [10.0]
+    watchdog._clock = lambda: now[0]
+    watchdog._last_event = 0.0
+    watchdog._probe = lambda: (0.0, True)
+
+    def inject(*args):
+        assert watchdog._last_event == 10.0
+        watchdog.poll()  # Injection updates Windows input but bypasses the hook.
+        assert watchdog._suspect is None
+        now[0] = 12.0
+        if fails:
+            raise RuntimeError("injection failed")
+        return "typed"
+
+    monkeypatch.setattr(windows_text, method, inject)
+    if fails:
+        with pytest.raises(RuntimeError, match="injection failed"):
+            getattr(provider, method)("text")
+    else:
+        assert getattr(provider, method)("text") == "typed"
+    assert watchdog._last_event == 12.0
+    now[0] = 13.0
+    watchdog.poll()
+    assert watchdog._suspect is None
+    recover.assert_not_called()
 
 
 @pytest.mark.parametrize("healthy,keyboard_input", [(True, True), (False, False), (False, True)])
@@ -122,6 +169,8 @@ def test_windows_restarts_native_listener_without_clearing_callbacks(monkeypatch
                                _pressed_events={29: object()}, _logically_pressed_keys={29: object()},
                                _os_keyboard=SimpleNamespace())
     monkeypatch.setattr(ctypes, "windll", api, raising=False)
+    private_api = Mock()
+    monkeypatch.setattr(windows, "_user32", private_api)
     factory = Mock(return_value=new)
     monkeypatch.setattr(threading, "Thread", factory)
     stop = threading.Event()
@@ -141,9 +190,12 @@ def test_windows_restarts_native_listener_without_clearing_callbacks(monkeypatch
             factory.assert_not_called()
         else:
             assert listener.listening_thread is new
+            assert factory.call_args.kwargs["target"] is windows._listen_safely
+            assert factory.call_args.kwargs["args"] == (listener.listen,)
             new.start.assert_called_once()
     assert len(listener.handlers) == len(listener.blocking_hotkeys) == 1
-    assert api.user32.PostThreadMessageW.call_args_list == [call(42, 0, 0, 0), call(42, 18, 0, 0)]
+    assert private_api.PostThreadMessageW.call_args_list == [call(42, 0, 0, 0), call(42, 18, 0, 0)]
+    api.user32.PostThreadMessageW.assert_not_called()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="real Windows hook lifecycle")
