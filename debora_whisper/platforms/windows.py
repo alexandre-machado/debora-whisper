@@ -8,7 +8,10 @@ import subprocess
 import ctypes
 import threading
 import time
+from ctypes import wintypes
+from functools import lru_cache
 from pathlib import Path
+from types import FunctionType, SimpleNamespace
 
 from debora_whisper.platforms.base import CaretReadStatus, Platform
 from debora_whisper.platforms import windows_text, windows_uia
@@ -23,18 +26,117 @@ _HEADPHONES, _HEADSET = 3, 5
 # MME, sounddevice's default host API, cuts device names at 31 characters.
 _MME_NAME_CHARS = 31
 _user32 = ctypes.WinDLL("user32", use_last_error=True) if os.name == "nt" else None
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) if os.name == "nt" else None
+_advapi32 = ctypes.WinDLL("advapi32", use_last_error=True) if os.name == "nt" else None
 if _user32 is not None:
     _user32.PostThreadMessageW.argtypes = [ctypes.c_ulong, ctypes.c_uint,
                                          ctypes.c_size_t, ctypes.c_ssize_t]
     _user32.PostThreadMessageW.restype = ctypes.c_int
+    _user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                   wintypes.UINT, wintypes.UINT]
+    _user32.GetMessageW.restype = wintypes.BOOL
+    _user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    _user32.TranslateMessage.restype = wintypes.BOOL
+    _user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    _user32.DispatchMessageW.restype = ctypes.c_ssize_t
+    _user32.GetForegroundWindow.argtypes = []
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                         ctypes.POINTER(wintypes.HANDLE)]
+    _advapi32.OpenProcessToken.restype = wintypes.BOOL
+    _advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                            wintypes.LPVOID, wintypes.DWORD,
+                                            ctypes.POINTER(wintypes.DWORD)]
+    _advapi32.GetTokenInformation.restype = wintypes.BOOL
 
 
-def _listen_safely(listen):
+def _process_elevated(pid):
+    """Return None on failure, so inaccessible tokens don't suppress recovery."""
+    if _kernel32 is None:
+        return None
     try:
-        listen()
+        process = _kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not process:
+            return None
+        try:
+            token = wintypes.HANDLE()
+            if not _advapi32.OpenProcessToken(process, 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+                return None
+            try:
+                elevated, size = wintypes.DWORD(), wintypes.DWORD()
+                if not _advapi32.GetTokenInformation(
+                        token, 20, ctypes.byref(elevated), ctypes.sizeof(elevated),
+                        ctypes.byref(size)):  # TokenElevation
+                    return None
+                return bool(elevated.value)
+            finally:
+                _kernel32.CloseHandle(token)
+        finally:
+            _kernel32.CloseHandle(process)
     except OSError:
-        from debora_whisper.dictation_engine import log
-        log("Keyboard listener stopped after a Windows message-loop error.")
+        return None
+
+
+@lru_cache(maxsize=1)
+def _self_elevated():
+    return _process_elevated(os.getpid())
+
+
+def _foreground_elevated():
+    if _user32 is None:
+        return False
+    try:
+        window = _user32.GetForegroundWindow()
+        pid = wintypes.DWORD()
+        if not window or not _user32.GetWindowThreadProcessId(window, ctypes.byref(pid)) or not pid.value:
+            return False
+        return _process_elevated(pid.value) is True
+    except OSError:
+        return False
+
+
+def _keyboard_hook_args(backend, callback):
+    # keyboard 0.13.x builds its decoder closure inside prepare_intercept and
+    # retains each native callback via atexit. Run that builder with private
+    # globals to capture the install arguments without installing or registering
+    # cleanup. No package globals are patched; the listener retains ONE callback
+    # for every recovery, and our loop owns the hook handle and its cleanup.
+    captured = []
+    namespace = dict(backend.prepare_intercept.__globals__)
+    namespace.update(SetWindowsHookEx=lambda *args: captured.append(args),
+                     atexit=SimpleNamespace(register=lambda *args: None))
+    FunctionType(backend.prepare_intercept.__code__, namespace)(callback)
+    return captured[0], namespace
+
+
+def _listen_safely(backend, listener):
+    if not hasattr(listener, "_debora_hook_args"):
+        listener._debora_hook_args, listener._debora_hook_globals = _keyboard_hook_args(
+            backend, listener.direct_callback)
+    # The decoder closure uses these private globals for its modifier state.
+    listener._debora_hook_globals.update(shift_is_pressed=False, altgr_is_pressed=False,
+                                         ignore_next_right_alt=False)
+    hook = backend.SetWindowsHookEx(*listener._debora_hook_args)
+    if not hook:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        message = wintypes.MSG()
+        while True:
+            result = _user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+            if result == 0:  # WM_QUIT
+                return
+            if result == -1:
+                raise ctypes.WinError(ctypes.get_last_error())
+            _user32.TranslateMessage(ctypes.byref(message))
+            _user32.DispatchMessageW(ctypes.byref(message))
+    finally:
+        backend.UnhookWindowsHookEx(hook)
 
 
 class KeyboardHookWatchdog:
@@ -57,6 +159,7 @@ class KeyboardHookWatchdog:
         self._suspect = None
         self._keys_down = set()
         self._thread = None
+        self._elevated = _self_elevated()
 
     def observe(self, event):
         self._last_event = self._clock()
@@ -90,6 +193,9 @@ class KeyboardHookWatchdog:
             return
         age, key_pressed = self._probe()
         if now - self._last_event < self.STALE_SECONDS:
+            self._suspect = None
+            return
+        if self._elevated is False and _foreground_elevated():
             self._suspect = None
             return
         if now - self._last_attempt < self.RETRY_SECONDS:
@@ -184,21 +290,31 @@ class WindowsPlatform(Platform):
         return self._watchdog
 
     def restart_keyboard_listener(self, keyboard, stopping):
-        # keyboard 0.13.x owns one native hook on listening_thread. Its public
-        # unhook APIs only remove Python callbacks. Exiting the installing thread
-        # removes that thread's native hook; retain the processing thread and
-        # unrelated registrations. In 0.13.5, GetMessage receives a NULL LPMSG;
-        # WM_NULL causes an access violation, converted by ctypes to OSError,
-        # which ends the old thread. The replacement wrapper logs it concisely.
-        # WM_QUIT also handles a corrected message loop.
+        # Keep the processing thread and unrelated registrations. Only the first
+        # listener uses keyboard 0.13.x's NULL LPMSG: wake it with WM_NULL and
+        # quietly consume its expected ctypes OSError during shutdown. All our
+        # replacements own a real MSG and unhook cleanly on WM_QUIT.
         listener = keyboard._listener
         with listener.lock:
             old = listener.listening_thread
             if old.is_alive():
-                post = _user32.PostThreadMessageW
-                post(old.native_id, 0, 0, 0)  # WM_NULL
-                post(old.native_id, 0x0012, 0, 0)  # WM_QUIT
-                old.join(1.0)
+                legacy = getattr(old, "_debora_message_loop", False) is not True
+                previous_hook = threading.excepthook
+
+                def quiet_old_listener(args):
+                    if args.thread is old and issubclass(args.exc_type, OSError):
+                        return
+                    previous_hook(args)
+
+                try:
+                    if legacy:
+                        threading.excepthook = quiet_old_listener
+                        _user32.PostThreadMessageW(old.native_id, 0, 0, 0)  # WM_NULL
+                    _user32.PostThreadMessageW(old.native_id, 0x0012, 0, 0)  # WM_QUIT
+                    old.join(1.0)
+                finally:
+                    if legacy:
+                        threading.excepthook = previous_hook
                 if old.is_alive():
                     raise RuntimeError("keyboard listener did not stop")
             # Lost up events otherwise leave Ctrl/Alt or a suppressed hotkey stuck.
@@ -213,8 +329,9 @@ class WindowsPlatform(Platform):
             if stopping.is_set():
                 return
             listener.listening_thread = threading.Thread(
-                target=_listen_safely, args=(listener.listen,),
+                target=_listen_safely, args=(backend, listener),
                 name="keyboard-listener", daemon=True)
+            listener.listening_thread._debora_message_loop = True
             listener.listening_thread.start()
 
     def type_text(self, text: str, auto_enter: bool = False):
@@ -238,7 +355,7 @@ class WindowsPlatform(Platform):
         return self._observe_typing(windows_text.type_draft, text)
 
     def delete_text(self, count: int):
-        return windows_text.delete_text(count)
+        return self._observe_typing(windows_text.delete_text, count)
 
     def _delete_text_ctypes(self, count: int):
         return windows_text._delete_text_ctypes(count)

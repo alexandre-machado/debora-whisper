@@ -20,21 +20,12 @@ def test_generic_platform_has_no_keyboard_watchdog():
     assert Platform().keyboard_watchdog(None, None, None) is None
 
 
-@pytest.mark.parametrize("error", [None, OSError("access violation writing 0x0")])
-def test_windows_listener_wrapper_logs_oserror_once(monkeypatch, error):
-    log = Mock()
-    monkeypatch.setattr(de, "log", log)
-    listen = Mock(side_effect=error)
-    windows._listen_safely(listen)
-    listen.assert_called_once_with()
-    if error:
-        log.assert_called_once_with(
-            "Keyboard listener stopped after a Windows message-loop error.")
-    else:
-        log.assert_not_called()
+@pytest.fixture(autouse=True)
+def _no_real_elevation_queries(monkeypatch):
+    monkeypatch.setattr(windows, "_self_elevated", lambda: True)
 
 
-@pytest.mark.parametrize("method", ["type_text", "_type_text_ctypes", "type_draft"])
+@pytest.mark.parametrize("method", ["type_text", "_type_text_ctypes", "type_draft", "delete_text"])
 @pytest.mark.parametrize("fails", [False, True])
 def test_windows_typed_output_refreshes_watchdog(monkeypatch, method, fails):
     provider = WindowsPlatform()
@@ -55,11 +46,12 @@ def test_windows_typed_output_refreshes_watchdog(monkeypatch, method, fails):
         return "typed"
 
     monkeypatch.setattr(windows_text, method, inject)
+    value = 3 if method == "delete_text" else "text"
     if fails:
         with pytest.raises(RuntimeError, match="injection failed"):
-            getattr(provider, method)("text")
+            getattr(provider, method)(value)
     else:
-        assert getattr(provider, method)("text") == "typed"
+        assert getattr(provider, method)(value) == "typed"
     assert watchdog._last_event == 12.0
     now[0] = 13.0
     watchdog.poll()
@@ -191,7 +183,8 @@ def test_windows_restarts_native_listener_without_clearing_callbacks(monkeypatch
         else:
             assert listener.listening_thread is new
             assert factory.call_args.kwargs["target"] is windows._listen_safely
-            assert factory.call_args.kwargs["args"] == (listener.listen,)
+            assert factory.call_args.kwargs["args"] == (keyboard._os_keyboard, listener)
+            assert new._debora_message_loop is True
             new.start.assert_called_once()
     assert len(listener.handlers) == len(listener.blocking_hotkeys) == 1
     assert private_api.PostThreadMessageW.call_args_list == [call(42, 0, 0, 0), call(42, 18, 0, 0)]
