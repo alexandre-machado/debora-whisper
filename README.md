@@ -166,6 +166,8 @@ Stored at `~/.debora/config.json`:
 }
 ```
 
+When unset, `language` follows the system UI language (falling back to `"en"`); a fixed language can make Whisper translate speech in another language.
+
 `device_priority` is the order devices are tried in. At startup the app uses
 the first one present on the machine that can run the model (`CUDA` = NVIDIA
 RTX via faster-whisper, Whisper models only; `GPU` = Intel iGPU). When the
