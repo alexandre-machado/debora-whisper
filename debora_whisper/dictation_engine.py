@@ -1750,9 +1750,14 @@ def _log_audio_stream(sd, stream, direction):
         f"blocksize={stream.blocksize}")
 
 
+def silero_vad_model_path() -> Path:
+    """Shared cache lookup for continuous listening and push-to-talk."""
+    return MODEL_DIR / "silero_vad" / "silero_vad.onnx"
+
+
 class NeuralVAD:
     """Silero VAD ONNX wrapper for robust voice activity detection."""
-    def __init__(self, sample_rate=16000):
+    def __init__(self, sample_rate=16000, *, allow_download=True):
         self.sample_rate = sample_rate
         self.session = None
         self.state = None
@@ -1760,11 +1765,12 @@ class NeuralVAD:
         import numpy as np
         import onnxruntime as ort
         
-        model_dir = MODEL_DIR / "silero_vad"
-        model_path = model_dir / "silero_vad.onnx"
+        model_path = silero_vad_model_path()
         
         if not model_path.exists():
-            model_dir.mkdir(parents=True, exist_ok=True)
+            if not allow_download:
+                raise FileNotFoundError(model_path)
+            model_path.parent.mkdir(parents=True, exist_ok=True)
             log("Downloading Silero VAD v5 ONNX model...")
             import urllib.request
             url = "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
@@ -2034,6 +2040,38 @@ class AudioRecorder:
             if (self._stream is None or not self._stream.active or
                     self._last_callback is None or time.perf_counter() - self._last_callback > 0.5):
                 raise RuntimeError("Microphone audio stream is inactive or stalled")
+
+    def ptt_has_speech(self, audio) -> bool | None:
+        """Check a clip with cached Silero; None preserves behavior if unavailable."""
+        import copy
+        import numpy as np
+
+        try:
+            if self.neural_vad is None:
+                if not silero_vad_model_path().is_file():
+                    return None
+                self.neural_vad = NeuralVAD(sample_rate=self.sample_rate, allow_download=False)
+                allocation.update("VAD", f"Silero (ONNX Runtime) -> {cpu_target()}  pid {os.getpid()}")
+            # Share the session, but never change the continuous listener's state.
+            vad = copy.copy(self.neural_vad)
+            vad.reset_state()
+            # PTT words can be shorter than continuous mode's segment minimum.
+            minimum = min(self.min_speech_frames, int(self.sample_rate * 0.2))
+            voiced_frames = 0
+            for start in range(0, len(audio), 512):
+                block = audio[start:start + 512].flatten()
+                frames = len(block)
+                block = block - np.mean(block)
+                if frames < 512:
+                    block = np.pad(block, (0, 512 - frames))
+                if vad.process(block) > self.vad_threshold:
+                    voiced_frames += frames
+                    if voiced_frames >= minimum:
+                        return True
+            return False
+        except Exception as e:
+            log(f"PTT speech check unavailable; transcribing as usual: {e}")
+            return None
 
     def _block_is_speech(self, block, is_speaking: bool) -> bool:
         """Classify one 512-sample block; Silero when loaded, else RMS."""
@@ -3167,6 +3205,13 @@ class DictationApp:
                 self._set_state(AppState.PROCESSING)
 
             try:
+                if is_final and not vad_segment and self.recorder.ptt_has_speech(audio) is False:
+                    duration = len(audio) / self.config["sample_rate"]
+                    log(f"PTT dropped: no speech detected (duration={duration:.2f}s).")
+                    if self.config.get("voice_chat"):
+                        self.voice_chat.resume("no speech")
+                    self._set_state(AppState.RECORDING if continuous else AppState.READY)
+                    return
                 if not self._model_ready.is_set():
                     log("Waiting for model to be ready before transcription...")
                 if not self._model_ready.wait(self.MODEL_WAIT_SECONDS):

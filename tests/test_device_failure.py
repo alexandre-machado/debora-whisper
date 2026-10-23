@@ -119,6 +119,9 @@ class FakeRecorder:
     def stop(self):
         return np.zeros(int(16000 * 16.3), dtype=np.float32)
 
+    def ptt_has_speech(self, audio):
+        return None
+
     def close(self):
         pass
 
