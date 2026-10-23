@@ -2064,7 +2064,10 @@ class AudioRecorder:
                 block = block - np.mean(block)
                 if frames < 512:
                     block = np.pad(block, (0, 512 - frames))
-                if vad.process(block) > self.vad_threshold:
+                # Same hysteresis as the listener: once speech starts, the
+                # lower threshold keeps a soft "sim" from being dropped.
+                if vad.process(block) > (self.vad_neg_threshold if voiced_frames
+                                         else self.vad_threshold):
                     voiced_frames += frames
                     if voiced_frames >= minimum:
                         return True

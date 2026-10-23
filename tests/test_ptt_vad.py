@@ -153,8 +153,24 @@ def test_vad_failure_keeps_existing_behavior(app, monkeypatch, failure):
 def test_speech_minimum_counts_real_samples_not_padding(app, frames, expected):
     set_vad(app, 0.3)
     app.recorder.vad_threshold = 0.25
+    app.recorder.vad_neg_threshold = 0.1
 
     assert app.recorder.ptt_has_speech(np.zeros(frames, np.float32)) is expected
+
+
+@pytest.mark.parametrize("probabilities, expected", [
+    ([0.6] + [0.4] * 6, True),   # onset, then a soft tail above the lower threshold
+    ([0.4] * 7, False),          # never crosses the onset threshold
+])
+def test_speech_keeps_listener_hysteresis(app, probabilities, expected):
+    vad = set_vad(app, 0.0)
+    scores = iter(probabilities)
+    vad.session.run.side_effect = lambda _, feeds: (
+        np.array([[next(scores)]], np.float32), feeds["state"])
+    app.recorder.vad_threshold = 0.5
+    app.recorder.vad_neg_threshold = 0.35
+
+    assert app.recorder.ptt_has_speech(np.zeros(512 * 7, np.float32)) is expected
 
 
 def test_continuous_final_does_not_run_ptt_check(app):
