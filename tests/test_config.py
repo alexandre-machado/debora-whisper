@@ -136,6 +136,32 @@ def test_missing_language_uses_system_ui_language(saved_config, monkeypatch, sav
     assert json.loads(saved_config.read_text())["language"] == expected
 
 
+def test_regional_ui_language_missing_from_locale_table(saved_config, monkeypatch):
+    import ctypes
+    import locale
+    from types import SimpleNamespace
+    from debora_whisper import dictation_engine as de, platforms
+
+    monkeypatch.setattr(platforms, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(kernel32=SimpleNamespace(
+        GetUserDefaultUILanguage=lambda: 0x580A)), raising=False)  # es-419
+    monkeypatch.delitem(locale.windows_locale, 0x580A, raising=False)
+    monkeypatch.setitem(locale.windows_locale, 0x040A, "es_ES")
+
+    assert de.load_config()["language"] == "es"
+
+
+def test_detected_language_unsupported_by_saved_model_uses_english(saved_config,
+                                                                  monkeypatch):
+    from debora_whisper import dictation_engine as de, platforms
+
+    monkeypatch.setattr(platforms, "default_language", lambda languages: "ja")
+    saved_config.write_text(json.dumps({"model_size": "parakeet"}))
+
+    assert "parakeet" not in de.get_models_for_language("ja")
+    assert de.load_config()["language"] == "en"
+
+
 @pytest.mark.parametrize("language", ["en", "auto"])
 def test_explicit_language_skips_detection(saved_config, monkeypatch, language):
     from debora_whisper import dictation_engine as de, platforms

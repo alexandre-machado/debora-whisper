@@ -319,7 +319,11 @@ def load_config() -> dict:
             saved = json.load(f)
     config = {**DEFAULT_CONFIG, **saved}
     if "language" not in saved:
-        config["language"] = platforms.default_language(LANGUAGES)
+        language = platforms.default_language(LANGUAGES)
+        # Settings never offers a model without the language; keep to that.
+        if config["model_size"] not in get_models_for_language(language):
+            language = "en"
+        config["language"] = language
     return config
 
 
