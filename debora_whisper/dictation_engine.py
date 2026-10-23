@@ -3217,7 +3217,7 @@ class DictationApp:
                     self._voice_chat_turn(text.strip(), audio, is_final, captured_at)
                     return
 
-                if not vad_segment and is_final and not text.strip():
+                if is_final and not text.strip():
                     text = ""
 
                 if text:
@@ -3238,7 +3238,9 @@ class DictationApp:
                         typed_text = text
                         if vad_segment and not typed_text.endswith(' '):
                             typed_text += ' '
-                        elif not vad_segment and is_final and not typed_text[-1].isspace():
+                        elif (not vad_segment and is_final and not typed_text[-1].isspace()
+                                and not self.config.get("auto_enter")):
+                            # With auto_enter each dictation is sent on its own.
                             typed_text += ' '
                                 
                         # Rewrite only what differs from the draft already

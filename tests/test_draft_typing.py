@@ -87,7 +87,7 @@ def test_consecutive_ptt_finals_are_separated(screen):
 
 @pytest.mark.parametrize("ptt", [True, False])
 def test_final_separator_is_only_typed(screen, ptt):
-    app = _app(continuous_listening=False, auto_enter=True)
+    app = _app(continuous_listening=False)
     received = []
     app.add_callback(lambda state, data: received.append((state, data)))
 
@@ -95,10 +95,26 @@ def test_final_separator_is_only_typed(screen, ptt):
         _say(app, "Pronto.", is_final=True, ptt=ptt)
 
     assert screen.pasted == ["Pronto. "]
-    assert screen.enters == 1
+    assert screen.enters == 0
     assert app.history[0]["text"] == "Pronto."
     assert received[-1] == (AppState.READY, {"text": "Pronto."})
     log.assert_any_call("Final transcription: Pronto.")
+
+
+def test_ptt_final_with_auto_enter_sends_no_separator(screen):
+    app = _app(continuous_listening=False, auto_enter=True)
+    _say(app, "Pronto.", is_final=True, ptt=True)
+
+    assert screen.pasted == ["Pronto."]
+    assert screen.enters == 1
+
+
+def test_blank_continuous_final_types_nothing(screen):
+    app = _app(continuous_listening=False)
+    _say(app, "  ", is_final=True, ptt=False)
+
+    assert screen.pasted == []
+    assert app._history == []
 
 
 @pytest.mark.parametrize("suffix", [" ", "\t", "\n", "\u00a0"])
@@ -126,14 +142,14 @@ def test_empty_ptt_final_types_nothing(screen, text):
     ("Olá tudo", "Olá tudo bem.", " bem. ", 4),
 ])
 def test_ptt_final_reuses_typed_draft(screen, draft, final, tail, deleted):
-    app = _app(continuous_listening=False, auto_enter=True)
+    app = _app(continuous_listening=False)
     _say(app, draft, is_final=False)
     _say(app, final, is_final=True, ptt=True)
 
     assert screen.text == final + " "
     assert screen.pasted == ([tail] if tail else [])
     de.delete_text.assert_called_once_with(deleted)
-    assert screen.enters == 1
+    assert screen.enters == 0
     assert app._draft_typed_text == ""
     assert app.history[-1]["text"] == final
 
