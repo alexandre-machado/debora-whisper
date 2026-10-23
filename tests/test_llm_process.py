@@ -208,6 +208,17 @@ def test_cancelled_reply_stops(genai):
     assert out == [{"id": 3, "done": True}]
 
 
+def test_already_cancelled_reply_never_enters_pipeline(genai):
+    cancelled, out = threading.Event(), []
+    cancelled.set()
+    pipe = MagicMock()
+    llm_server.generate(pipe, {"id": 3, "messages": [], "max_new_tokens": 9},
+                        cancelled, out.append)
+    pipe.get_tokenizer.assert_not_called()
+    pipe.generate.assert_not_called()
+    assert out == [{"id": 3, "done": True}]
+
+
 # --- The client, with a real process -------------------------------------------
 
 @pytest.fixture
