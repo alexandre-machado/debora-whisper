@@ -263,7 +263,7 @@ def test_timeout_transcribes_captured_audio_once(audio_backend, monkeypatch):
     app._finish_recording()
     app.whisper.transcribe.assert_called_once()
     np.testing.assert_array_equal(app.whisper.transcribe.call_args.args[0][-8000:], speech)
-    paste.assert_called_once_with('captured speech', auto_enter=False)
+    paste.assert_called_once_with('captured speech ', auto_enter=False)
     assert app.state == engine.AppState.READY
     assert not app.is_recording
     assert not app._transcribing

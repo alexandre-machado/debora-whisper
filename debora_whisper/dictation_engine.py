@@ -3217,6 +3217,9 @@ class DictationApp:
                     self._voice_chat_turn(text.strip(), audio, is_final, captured_at)
                     return
 
+                if not vad_segment and is_final and not text.strip():
+                    text = ""
+
                 if text:
                     # The final stop check and the paste are one step with
                     # respect to stop(): once stop() returns, nothing pastes.
@@ -3226,28 +3229,30 @@ class DictationApp:
                             log("Engine stopped; discarding late transcription.")
                             return
                             
-                        # Append a trailing space in continuous mode so next phrase doesn't stick
-                        # e.g., "legal" -> "legal ". If they manually type punctuation later,
-                        # Windows handles it naturally, but this prevents "legalFicou".
+                        # Keep the separator out of history, callbacks and logs.
+                        # Only typing and draft comparisons include it.
                         if vad_segment:
                             stripped = text.strip()
                             if not is_final and stripped and not re.search(r'[.,!?;\:]$', stripped):
-                                text = stripped + '... '
-                            elif not text.endswith(' '):
-                                text += ' '
+                                text = stripped + '...'
+                        typed_text = text
+                        if vad_segment and not typed_text.endswith(' '):
+                            typed_text += ' '
+                        elif not vad_segment and is_final and not typed_text[-1].isspace():
+                            typed_text += ' '
                                 
                         # Rewrite only what differs from the draft already
                         # typed, if keys still land where it was typed.
                         target = get_input_target()
-                        text_to_type = text
+                        text_to_type = typed_text
                         if (not is_final and self.config.get("inline_drafts")
                                 and not self._inline_drafts_abandoned):
                             if self._draft_strategy is None:
                                 self._choose_draft_strategy_locked()
                             if ((self._draft_strategy == "backspace"
-                                    and not platforms.current().can_backspace_draft(text))
+                                    and not platforms.current().can_backspace_draft(typed_text))
                                     or (self._draft_strategy == "verified"
-                                        and not _draft_read_matches(text, text)[1])):
+                                        and not _draft_read_matches(typed_text, typed_text)[1])):
                                 # Remove only the previous, simple-character draft.
                                 # Never inline text whose deletion count is ambiguous.
                                 # Even an exact read must authorize its later removal.
@@ -3259,9 +3264,9 @@ class DictationApp:
                         if self._draft_typed_text:
                             if same_input_target(target, self._draft_target):
                                 if self._verify_draft_locked():
-                                    common = os.path.commonprefix([self._draft_typed_text, text])
+                                    common = os.path.commonprefix([self._draft_typed_text, typed_text])
                                     self._delete_draft_tail_locked(len(self._draft_typed_text) - len(common))
-                                    text_to_type = text[len(common):]
+                                    text_to_type = typed_text[len(common):]
                             else:
                                 log("Input focus changed; leaving the draft where it was typed.")
                                 self._draft_typed_text = ""
@@ -3297,7 +3302,7 @@ class DictationApp:
                             # Avoid the Unicode-packet path implicated in the
                             # Notepad report; serialize draft and final pastes.
                             type_draft_text(text_to_type)
-                            self._draft_typed_text = text
+                            self._draft_typed_text = typed_text
                             self._draft_target = target
 
                     # Re-read rather than reuse `continuous`: a tap may have

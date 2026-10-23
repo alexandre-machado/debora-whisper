@@ -61,13 +61,103 @@ def _app(**config):
     return app
 
 
-def _say(app, text, is_final):
+def _say(app, text, is_final, ptt=False):
     if isinstance(text, Exception):
         app.whisper.transcribe.side_effect = text
     else:
         app.whisper.transcribe.side_effect = None
         app.whisper.transcribe.return_value = text
-    app._finish_recording(audio=AUDIO, is_final=is_final)
+    if ptt:
+        app.is_recording = True
+        app.recorder.stop.return_value = AUDIO
+        app._finish_recording(is_final=is_final)
+    else:
+        app._finish_recording(audio=AUDIO, is_final=is_final)
+
+
+def test_consecutive_ptt_finals_are_separated(screen):
+    app = _app(continuous_listening=False)
+    _say(app, "O céu está nublado.", is_final=True, ptt=True)
+    _say(app, "Preciso comprar pão.", is_final=True, ptt=True)
+
+    assert screen.text == "O céu está nublado. Preciso comprar pão. "
+    assert screen.pasted == ["O céu está nublado. ", "Preciso comprar pão. "]
+    assert app.recorder.stop.call_count == 2
+
+
+@pytest.mark.parametrize("ptt", [True, False])
+def test_final_separator_is_only_typed(screen, ptt):
+    app = _app(continuous_listening=False, auto_enter=True)
+    received = []
+    app.add_callback(lambda state, data: received.append((state, data)))
+
+    with patch.object(de, "log") as log:
+        _say(app, "Pronto.", is_final=True, ptt=ptt)
+
+    assert screen.pasted == ["Pronto. "]
+    assert screen.enters == 1
+    assert app.history[0]["text"] == "Pronto."
+    assert received[-1] == (AppState.READY, {"text": "Pronto."})
+    log.assert_any_call("Final transcription: Pronto.")
+
+
+@pytest.mark.parametrize("suffix", [" ", "\t", "\n", "\u00a0"])
+def test_ptt_final_preserves_existing_whitespace(screen, suffix):
+    app = _app(continuous_listening=False)
+    _say(app, "Pronto." + suffix, is_final=True, ptt=True)
+
+    assert screen.pasted == ["Pronto." + suffix]
+    assert app.history[0]["text"] == "Pronto." + suffix
+
+
+@pytest.mark.parametrize("text", ["", " ", "\t\n", "\u00a0"])
+def test_empty_ptt_final_types_nothing(screen, text):
+    app = _app(continuous_listening=False, auto_enter=True)
+    _say(app, text, is_final=True, ptt=True)
+
+    assert screen.text == ""
+    assert screen.pasted == []
+    assert screen.enters == 0
+    assert app._history == []
+
+
+@pytest.mark.parametrize("draft, final, tail, deleted", [
+    ("Pronto.", "Pronto.", "", 0),
+    ("Olá tudo", "Olá tudo bem.", " bem. ", 4),
+])
+def test_ptt_final_reuses_typed_draft(screen, draft, final, tail, deleted):
+    app = _app(continuous_listening=False, auto_enter=True)
+    _say(app, draft, is_final=False)
+    _say(app, final, is_final=True, ptt=True)
+
+    assert screen.text == final + " "
+    assert screen.pasted == ([tail] if tail else [])
+    de.delete_text.assert_called_once_with(deleted)
+    assert screen.enters == 1
+    assert app._draft_typed_text == ""
+    assert app.history[-1]["text"] == final
+
+
+def test_ptt_final_after_focus_change_stays_in_history(screen):
+    app = _app(continuous_listening=False)
+    _say(app, "Primeira parte", is_final=False)
+    screen.target = ("other window", "field")
+    screen.text = "Texto do usuário"
+    _say(app, "Primeira parte.", is_final=True, ptt=True)
+
+    assert screen.text == "Texto do usuário"
+    assert screen.pasted == []
+    assert app._history[-1]["text"] == "Primeira parte."
+
+
+def test_ptt_voice_chat_final_types_nothing(screen):
+    app = _app(continuous_listening=False, voice_chat=True)
+    with patch.object(app, "_voice_chat_turn") as turn:
+        _say(app, "Como está o tempo?", is_final=True, ptt=True)
+
+    assert turn.call_args.args[0] == "Como está o tempo?"
+    assert screen.pasted == []
+    assert screen.text == ""
 
 
 def test_draft_is_corrected_in_place(screen):
@@ -86,7 +176,7 @@ def test_draft_is_corrected_in_place(screen):
 def test_drafts_stay_in_overlay_by_default(screen):
     app = _app(inline_drafts=DEFAULT_CONFIG["inline_drafts"])
     _say(app, "Olá tudo", is_final=False)
-    assert app.last_draft_text == "Olá tudo... "
+    assert app.last_draft_text == "Olá tudo..."
     _say(app, "Olá, tudo bem?", is_final=True)
 
     assert screen.drafted == []
@@ -291,7 +381,7 @@ def test_readable_complex_unicode_switches_to_overlay(screen, complex_text, prev
 
     assert screen.text == prefix
     assert screen.drafted == (["Olá tudo... "] if previous else [])
-    assert app.last_draft_text == complex_text + "... "
+    assert app.last_draft_text == complex_text + "..."
     assert app._draft_strategy == "overlay"
     assert app._inline_drafts_abandoned
     assert not app._draft_final_suppressed
@@ -303,7 +393,7 @@ def test_readable_complex_unicode_switches_to_overlay(screen, complex_text, prev
 
     _say(app, "Simple update", is_final=False)
     assert screen.text == prefix
-    assert app.last_draft_text == "Simple update... "
+    assert app.last_draft_text == "Simple update..."
     final = complex_text + " completo! "
     _say(app, final, is_final=True)
     assert screen.text == prefix + final
@@ -340,7 +430,7 @@ def test_readable_complex_transition_keeps_unremovable_draft(screen, monkeypatch
     assert screen.drafted == ["Olá tudo... "]
     assert screen.pasted == []
     assert screen.enters == 0
-    assert app._history[-1]["text"] == "cafe\u0301 completo! "
+    assert app._history[-1]["text"] == "cafe\u0301 completo!"
 
 
 def test_terminal_focus_change_leaves_draft_and_abandons_segment(terminal):
@@ -422,8 +512,8 @@ def test_unreadable_target_keeps_drafts_in_overlay(screen, monkeypatch, capsys, 
         assert app._inline_drafts_abandoned
         assert app._draft_typed_text == ""
         assert app._draft_target is None
-        assert states[-1]["draft_text"] == "Olá tudo bem... "
-        assert app.last_draft_text == "Olá tudo bem... "
+        assert states[-1]["draft_text"] == "Olá tudo bem..."
+        assert app.last_draft_text == "Olá tudo bem..."
         assert screen.drafted == []
         _say(app, "Olá, tudo bem?", is_final=True)
         # The final needs no additional caret read, including after a timeout.
@@ -504,7 +594,7 @@ def test_changed_draft_abandons_segment(screen, monkeypatch, capsys, observed, s
         _say(app, "Olá tudo bem hoje", is_final=False)
         assert screen.text == kept
         assert app._inline_drafts_abandoned
-        assert states[-1]["draft_text"] == "Olá tudo bem hoje... "
+        assert states[-1]["draft_text"] == "Olá tudo bem hoje..."
     _say(app, "Olá, tudo bem?", is_final=True)
     assert screen.text == kept
     assert screen.drafted == ["Olá tudo... "]
@@ -590,7 +680,7 @@ def test_word_extra_trailing_marks_preserve_draft_without_duplicate(screen, monk
     assert screen.pasted == []
     assert screen.enters == 0
     de.delete_text.assert_not_called()
-    assert app._history[-1]["text"] == "Minha frase completa! "
+    assert app._history[-1]["text"] == "Minha frase completa!"
 
 
 @pytest.mark.parametrize("actually_trimmed", [False, True])
@@ -677,7 +767,7 @@ def test_grapheme_movement_never_deletes_preceding_user_text(screen, monkeypatch
     assert screen.drafted == [cluster + "... "]
     assert screen.pasted == []
     assert screen.enters == 0
-    assert app._history[-1]["text"] == "Replacement final! "
+    assert app._history[-1]["text"] == "Replacement final!"
 
 
 def test_unsafe_selection_is_not_retried_or_overwritten(screen, monkeypatch):
@@ -846,7 +936,7 @@ def test_focus_change_leaves_old_draft_and_suppresses_final(screen):
 
     assert screen.text == "código do usuário"
     assert screen.pasted == []
-    assert app._history[-1]["text"] == "Primeira parte. "
+    assert app._history[-1]["text"] == "Primeira parte."
     assert typed_in_old_window == "Primeira parte... "
 
 
