@@ -60,6 +60,9 @@ def load(model_dir: str, device: str, cache_dir: str, say):
 def generate(pipe, request: dict, cancelled: threading.Event, say):
     import openvino_genai as ov_genai
     rid = request["id"]
+    if cancelled.is_set():
+        say({"id": rid, "done": True})
+        return
     try:
         # Qwen3's template turns thinking off with enable_thinking; other
         # templates ignore the variable.

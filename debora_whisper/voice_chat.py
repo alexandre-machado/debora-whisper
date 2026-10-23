@@ -1808,6 +1808,7 @@ class VoiceChat:
         self.speaking = True
         play = self._play or StreamPlayer()
         idle = True
+        idle_since = None
         from collections import deque
         replay = deque()
         device_clips = deque()
@@ -1844,10 +1845,20 @@ class VoiceChat:
                     except queue.Empty:
                         idle = True
                         reset_idle_budget()
-                        self._show_audio(False)
+                        if idle_since is None:
+                            idle_since = max(time.monotonic(), playback_tail)
                         self._playback.wait(0.1)
-                        continue
-                    playback_busy = True
+                        show_idle = (clips.empty() and not replay
+                                     and time.monotonic() - idle_since >= 0.1)
+                        clip_available = False
+                    else:
+                        idle_since = None
+                        playback_busy = True
+                        clip_available = True
+                if not clip_available:
+                    if show_idle:
+                        self._show_audio(False)
+                    continue
                 if clip is None or stop.is_set():
                     break
                 if speech_stop.is_set() or (not len(clip[0]) and not clip[2].get("last")):

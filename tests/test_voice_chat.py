@@ -2266,6 +2266,52 @@ def test_stream_playback_starts_before_generation_ends(streaming_chat, stream, m
         assert times["audio"] == pytest.approx(0.3)
 
 
+def test_stream_audio_indicator_bridges_fifty_ms_gaps(streaming_chat, monkeypatch):
+    from types import SimpleNamespace
+    clock = [100.0]
+    monkeypatch.setattr(vc, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: clock[0]}))
+    gaps = [threading.Event() for _ in range(3)]
+    quiet = threading.Event()
+    played, events, off_under_lock = [], [], []
+    player_thread = threading.current_thread()
+
+    def synth(text, config):
+        for index in range(3):
+            yield np.full(100, 0.2, np.float32), 1000
+            assert gaps[index].wait(3), "player never reached the empty queue"
+            clock[0] += 0.05 if index < 2 else 0.15
+        # Keep the turn open to observe the debounced off, before final cleanup.
+        with chat._playback:
+            chat._playback.notify_all()
+        assert quiet.wait(3), "indicator did not turn off after sustained idle"
+
+    def play(samples, rate, stop):
+        played.append(clock[0])
+
+    chat = vc.VoiceChat(dict(DEFAULT_CONFIG), play=play,
+                        llm=FakeLLM(["Primeira frase longa."]))
+    original_wait = chat._playback.wait
+
+    def wait(timeout=None):
+        if threading.current_thread() is player_thread and played:
+            gaps[len(played) - 1].set()
+        return original_wait(timeout)
+
+    def on_audio(active):
+        events.append(active)
+        if not active:
+            off_under_lock.append(chat._playback._is_owned())
+            quiet.set()
+
+    monkeypatch.setattr(vc, "synthesize_stream", synth)
+    monkeypatch.setattr(chat._playback, "wait", wait)
+    chat.on_audio = on_audio
+    chat.respond("oi")
+    assert played == pytest.approx([100.0, 100.05, 100.1])
+    assert events == [True, False]
+    assert off_under_lock == [False]
+
+
 @pytest.mark.parametrize("interrupt", [False, True])
 def test_stream_failure_or_stop_does_not_replay(streaming_chat, monkeypatch, interrupt):
     began, closed = threading.Event(), threading.Event()
@@ -2539,7 +2585,10 @@ def test_stream_deadline_cancels_speech_but_preserves_llm_turn(streaming_chat, m
 def test_silent_gap_resets_speech_deadline(server, monkeypatch, streaming, waiting):
     from types import SimpleNamespace
     clock = [100.0]
-    monkeypatch.setattr(vc, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: clock[0]}))
+    began = time.monotonic()
+    # Let the indicator's idle debounce elapse between the simulated jumps.
+    monkeypatch.setattr(vc, "time", SimpleNamespace(
+        **{**vars(time), "monotonic": lambda: clock[0] + time.monotonic() - began}))
     heard, idle = threading.Event(), threading.Event()
     requested, played, logs = [], [], []
     audio = np.full(100, 0.2, np.float32), 1000

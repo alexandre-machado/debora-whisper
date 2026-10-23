@@ -31,6 +31,7 @@ The budget runs while sentences are queued, synthesizing or playing, and resets
 when speech is idle. Silent LLM/tool work, including gaps after the waiting
 announcement, does not consume the next burst’s budget. Expiry interrupts pending
 HTTP reads and playback only; LLM work and reply text continue.
+Once the speech budget expires, the rest of that turn is text only, with no more audio until the next turn.
 
 The client opts in only when `tts_stream` is true (the default) and cached health
 advertises streaming. It also accepts a WAV fallback from a streaming request,
