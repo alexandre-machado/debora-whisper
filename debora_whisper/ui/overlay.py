@@ -122,6 +122,8 @@ class OverlayWindow:
 
         # State
         self._state = "loading"
+        self._hidden = False
+        self._continuous_listening = False
         self._voice_mode = False
         self._mascot_clip = "loop"
         self._mascot_index = 0
@@ -208,9 +210,10 @@ class OverlayWindow:
         # Re-assert topmost periodically so the Windows 11 taskbar doesn't cover it
         def _force_topmost():
             if self._win and self._win.winfo_exists():
-                self._win.attributes("-topmost", True)
-                self._win.lift()
-                self._refresh_scale()
+                if not self._hidden:
+                    self._win.attributes("-topmost", True)
+                    self._win.lift()
+                    self._refresh_scale()
                 self._root.after(500, _force_topmost)
 
         self._canvas = tk.Canvas(
@@ -437,6 +440,8 @@ class OverlayWindow:
         return (families[1] if semibold else families[0], size)
 
     def _redraw(self):
+        if self._hidden:
+            return
         c = self._canvas
         c.delete("all")
         self._photo_refs.clear()
@@ -547,6 +552,8 @@ class OverlayWindow:
 
     def _slide_tick(self):
         self._slide_id = None
+        if self._hidden:
+            return
         left, right, _, _ = self._text_geometry(int(self._cur_w))
         if self._conversation_lines() and right > left:
             self._draw_text(right - left)
@@ -559,8 +566,28 @@ class OverlayWindow:
         self._slide_held = False
 
     def _update_layout(self):
+        was_hidden = self._hidden
+        self._hidden = (self._state == "ready" and not self._voice_mode
+                        and not self._continuous_listening
+                        and not self._conversation_lines())
+        if self._hidden and not was_hidden:
+            self._win.withdraw()
+            self._sync_mascot_animation()
+            self._reset_slides()
+            if self._grip_fade_id is not None:
+                self._root.after_cancel(self._grip_fade_id)
+                self._grip_fade_id = None
+            self._grip_hover = False
+            self._grip_level = 0
         self._position()
         self._redraw()
+        if was_hidden and not self._hidden:
+            # Paint and position before mapping. Keep NOACTIVATE on both
+            # sides of deiconify, which may recreate the Windows wrapper.
+            self._apply_window_flags()
+            self._win.deiconify()
+            self._win.attributes("-topmost", True)
+            self._apply_window_flags()
 
     # --- Drag, resize and click -------------------------------------------
 
@@ -712,9 +739,8 @@ class OverlayWindow:
         return frames
 
     def _sync_mascot_animation(self):
-        """Run the mascot's frame timer except while loading or after an
-        error, where it shows the loop's first frame and costs nothing."""
-        animate = self._state not in self._MASCOT_STILL_STATES
+        """Pause the mascot while hidden, loading, or showing an error."""
+        animate = not self._hidden and self._state not in self._MASCOT_STILL_STATES
         running = self.__dict__.get("_mascot_anim_id")
         if animate and not running:
             self._mascot_anim_id = self._root.after(
@@ -728,6 +754,8 @@ class OverlayWindow:
 
     def _mascot_tick(self):
         self._mascot_anim_id = None
+        if self._hidden:
+            return
         count = len(self._mascot_frames(1, clip=self._mascot_clip))
         talking = bool(self.__dict__.get("_talking"))
         step = 1
@@ -789,7 +817,8 @@ class OverlayWindow:
         self._set_state("loading")
         self._update_layout()
 
-    def show_ready(self):
+    def show_ready(self, *, continuous_listening=False):
+        self._continuous_listening = continuous_listening
         if self._user_text or self._reply_text:
             self._finish_turn()
         self._set_state("ready")
@@ -820,7 +849,8 @@ class OverlayWindow:
             self._cancel_dismiss()
         self._update_layout()
 
-    def show_result(self, text):
+    def show_result(self, text, *, continuous_listening=False):
+        self._continuous_listening = continuous_listening
         if self._voice_turn and not self._turn_finished:
             self._reply_text = text
         else:
@@ -855,7 +885,7 @@ class OverlayWindow:
         """Keep the mode visible even between turns."""
         if self._voice_mode != enabled:
             self._voice_mode = enabled
-            self._redraw()
+            self._update_layout()
 
     def set_show_balloon(self, enabled):
         """The Settings checkbox controls the in-window text area."""
