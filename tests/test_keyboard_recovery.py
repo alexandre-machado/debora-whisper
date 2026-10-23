@@ -1,6 +1,7 @@
 """Keyboard recovery contracts without installing hooks or inspecting real tokens."""
 import ctypes
 import threading
+import queue
 from ctypes import wintypes
 from types import SimpleNamespace
 from unittest.mock import Mock, call
@@ -9,6 +10,79 @@ import pytest
 
 from debora_whisper import dictation_engine as de
 from debora_whisper.platforms import windows
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_recover_stop_rebuild_delivers_hotkey_once(monkeypatch, keyboard, missing):
+    import sys
+
+    events = queue.Queue()
+    callbacks = []
+    threads = []
+
+    def listen(backend, listener):
+        threads.append(threading.current_thread())
+        while events.get() != "quit":
+            for callback in list(callbacks):
+                callback()
+
+    def register(key, callback, **kwargs):
+        callbacks.append(callback)
+        return lambda: callbacks.remove(callback)
+
+    monkeypatch.setattr(windows, "_listen_safely", listen)
+    monkeypatch.setattr(windows, "_post_keyboard_message",
+                        lambda thread, message: events.put("quit"))
+    keyboard._listener.listening_thread.is_alive.side_effect = None
+    keyboard._listener.listening_thread.is_alive.return_value = False
+    keyboard.parse_hotkey = lambda key: (((29,), (57,)),)
+    keyboard.hook = lambda *args, **kwargs: lambda: None
+    keyboard.add_hotkey = register
+    keyboard.unhook_all = callbacks.clear
+    monkeypatch.setitem(sys.modules, "keyboard", keyboard)
+    provider = windows.WindowsPlatform()
+    monkeypatch.setattr(provider, "keyboard_watchdog", lambda *args: None)
+    monkeypatch.setattr(de.platforms, "current", lambda: provider)
+    config = {**de.DEFAULT_CONFIG, "voice_chat_hotkey": "", "beep_on_start": False}
+    first, second = de.DictationApp(config), de.DictationApp(config)
+    delivered = threading.Event()
+    second.toggle_recording = Mock(side_effect=delivered.set)
+    try:
+        assert first._recover_hotkeys()
+        recovered = keyboard._listener.listening_thread
+        first.stop()
+        assert not recovered.is_alive()
+        if missing:
+            del keyboard._listener.listening_thread
+        second._start_hotkeys(keyboard)
+        replacement = keyboard._listener.listening_thread
+        second._start_hotkeys(keyboard)
+        events.put("key")
+        assert delivered.wait(2)
+        second.toggle_recording.assert_called_once_with()
+        assert threads == [recovered, replacement]
+        assert replacement.is_alive()
+    finally:
+        first.stop_monitoring()
+        second.stop()
+
+
+def test_final_shutdown_wakes_legacy_listener_without_replacement(monkeypatch, keyboard):
+    original = threading.excepthook
+    old = keyboard._listener.listening_thread
+
+    def post(thread_id, message, *args):
+        assert threading.excepthook is not original
+        assert thread_id == old.native_id
+        return 1
+
+    windows._user32.PostThreadMessageW.side_effect = post
+    windows.WindowsPlatform().stop_keyboard_listener(keyboard, final=True)
+    assert threading.excepthook is original
+    assert keyboard._listener.listening_thread is old
+    assert windows._user32.PostThreadMessageW.call_args_list == [
+        call(42, 0, 0, 0), call(42, 0x12, 0, 0)]
+    old.join.assert_called_once_with(1.0)
 
 
 @pytest.fixture
@@ -77,6 +151,83 @@ def test_replacement_shutdown_posts_only_quit_without_exception_filter(monkeypat
     stop.set()
     windows.WindowsPlatform().restart_keyboard_listener(keyboard, stop)
     windows._user32.PostThreadMessageW.assert_called_once_with(42, 0x12, 0, 0)
+
+
+@pytest.mark.parametrize("message", [0, 0x12])
+@pytest.mark.parametrize("ready", [True, False])
+def test_post_retries_until_queue_exists_or_timeout(monkeypatch, keyboard, message, ready):
+    elapsed = [0.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+
+    monkeypatch.setattr(windows, "time", SimpleNamespace(
+        monotonic=lambda: elapsed[0], sleep=sleep))
+    post = windows._user32.PostThreadMessageW
+    post.side_effect = [0, 0, 1] if ready else None
+    post.return_value = 0
+    assert windows._post_keyboard_message(keyboard._listener.listening_thread, message) is ready
+    assert 0.02 <= elapsed[0] <= 0.51
+    if not ready:
+        assert elapsed[0] >= 0.5
+    assert sleeps == [0.01] * len(sleeps)
+    assert post.call_args_list == [call(42, message, 0, 0)] * (len(sleeps) + 1)
+
+
+@pytest.mark.parametrize("kind", ["legacy", "unstarted", "dead"])
+def test_shutdown_leaves_unowned_or_inactive_listener_alone(keyboard, kind):
+    thread = keyboard._listener.listening_thread
+    if kind == "unstarted":
+        del keyboard._listener.listening_thread
+    elif kind == "dead":
+        thread._debora_message_loop = True
+        thread.is_alive.side_effect = None
+        thread.is_alive.return_value = False
+    windows.WindowsPlatform().stop_keyboard_listener(keyboard)
+    windows._user32.PostThreadMessageW.assert_not_called()
+    thread.join.assert_not_called()
+
+
+def test_shutdown_exits_owned_loop_and_unhooks(keyboard):
+    entered, quit = threading.Event(), threading.Event()
+
+    def get(*args):
+        entered.set()
+        assert quit.wait(2)
+        return 0
+
+    def post(thread_id, message, *args):
+        assert thread_id == thread.native_id and message == 0x12
+        quit.set()
+        return 1
+
+    windows._user32.GetMessageW.side_effect = get
+    windows._user32.PostThreadMessageW.side_effect = post
+    thread = threading.Thread(target=windows._listen_safely,
+                              args=(keyboard._os_keyboard, keyboard._listener), daemon=True)
+    thread._debora_message_loop = True
+    keyboard._listener.listening_thread = thread
+    thread.start()
+    try:
+        assert entered.wait(2)
+        windows.WindowsPlatform().stop_keyboard_listener(keyboard)
+        assert not thread.is_alive()
+        keyboard._os_keyboard.UnhookWindowsHookEx.assert_called_once_with(123)
+    finally:
+        quit.set()
+        thread.join(2)
+
+
+def test_restart_leaves_backend_modifier_flags_untouched(keyboard):
+    backend = keyboard._os_keyboard
+    backend.shift_is_pressed = backend.altgr_is_pressed = True
+    backend.ignore_next_right_alt = True
+    stop = threading.Event()
+    stop.set()
+    windows.WindowsPlatform().restart_keyboard_listener(keyboard, stop)
+    assert backend.shift_is_pressed and backend.altgr_is_pressed and backend.ignore_next_right_alt
 
 
 @pytest.mark.parametrize("failure", [None, "get", "dispatch", "install"])

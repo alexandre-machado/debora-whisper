@@ -3751,6 +3751,11 @@ class DictationApp:
         if announce:
             log(f"Hotkey {hotkey} registered.")
         self._register_voice_chat_hotkey(keyboard, announce=announce)
+        # Registration starts keyboard's first listener, but its listening flag
+        # stays set after a recovered listener is stopped during Settings Apply.
+        thread = getattr(keyboard._listener, "listening_thread", None)
+        if thread is None or not thread.is_alive():
+            platforms.current().restart_keyboard_listener(keyboard, self._stopping)
 
     def _start_hotkeys(self, keyboard):
         with self._hotkey_lock:
@@ -4002,6 +4007,7 @@ class DictationApp:
             import keyboard
             with self._hotkey_lock:
                 keyboard.unhook_all()
+                platforms.current().stop_keyboard_listener(keyboard)
                 self._hotkey_removers.clear()
         except Exception:
             pass

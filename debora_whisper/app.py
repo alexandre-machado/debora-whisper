@@ -577,6 +577,12 @@ class GUIApp:
                 stop()
             except Exception as exc:
                 log(f"Error stopping {name} during shutdown: {exc}")
+        try:
+            import keyboard
+            from debora_whisper import platforms
+            platforms.current().stop_keyboard_listener(keyboard, final=True)
+        except Exception as exc:
+            log(f"Error stopping keyboard listener during shutdown: {exc}")
 
 
 def _ensure_stdio():

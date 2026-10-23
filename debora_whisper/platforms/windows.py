@@ -115,6 +115,16 @@ def _keyboard_hook_args(backend, callback):
     return captured[0], namespace
 
 
+def _post_keyboard_message(thread, message):
+    # A newly started listener may not have created its message queue yet.
+    deadline = time.monotonic() + 0.5
+    while not _user32.PostThreadMessageW(thread.native_id, message, 0, 0):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
 def _listen_safely(backend, listener):
     if not hasattr(listener, "_debora_hook_args"):
         listener._debora_hook_args, listener._debora_hook_globals = _keyboard_hook_args(
@@ -289,6 +299,22 @@ class WindowsPlatform(Platform):
         self._watchdog = KeyboardHookWatchdog(stopping, recover, log)
         return self._watchdog
 
+    def stop_keyboard_listener(self, keyboard, *, final=False):
+        if final:
+            stopping = threading.Event()
+            stopping.set()
+            self.restart_keyboard_listener(keyboard, stopping)
+            return
+        listener = keyboard._listener
+        with listener.lock:
+            thread = getattr(listener, "listening_thread", None)
+            # keyboard owns the original loop and its atexit cleanup.
+            if (getattr(thread, "_debora_message_loop", False) is True
+                    and thread.is_alive()):
+                _post_keyboard_message(thread, 0x0012)  # WM_QUIT
+                if thread is not threading.current_thread():
+                    thread.join(1.0)
+
     def restart_keyboard_listener(self, keyboard, stopping):
         # Keep the processing thread and unrelated registrations. Only the first
         # listener uses keyboard 0.13.x's NULL LPMSG: wake it with WM_NULL and
@@ -296,8 +322,8 @@ class WindowsPlatform(Platform):
         # replacements own a real MSG and unhook cleanly on WM_QUIT.
         listener = keyboard._listener
         with listener.lock:
-            old = listener.listening_thread
-            if old.is_alive():
+            old = getattr(listener, "listening_thread", None)
+            if old is not None and old.is_alive():
                 legacy = getattr(old, "_debora_message_loop", False) is not True
                 previous_hook = threading.excepthook
 
@@ -309,8 +335,8 @@ class WindowsPlatform(Platform):
                 try:
                     if legacy:
                         threading.excepthook = quiet_old_listener
-                        _user32.PostThreadMessageW(old.native_id, 0, 0, 0)  # WM_NULL
-                    _user32.PostThreadMessageW(old.native_id, 0x0012, 0, 0)  # WM_QUIT
+                        _post_keyboard_message(old, 0)  # WM_NULL
+                    _post_keyboard_message(old, 0x0012)  # WM_QUIT
                     old.join(1.0)
                 finally:
                     if legacy:
@@ -324,8 +350,6 @@ class WindowsPlatform(Platform):
             listener.active_modifiers.clear()
             listener.modifier_states.clear()
             backend = keyboard._os_keyboard
-            backend.shift_is_pressed = backend.altgr_is_pressed = False
-            backend.ignore_next_right_alt = False
             if stopping.is_set():
                 return
             listener.listening_thread = threading.Thread(
