@@ -2538,8 +2538,11 @@ def test_stream_reply_deadline_spans_sentences(streaming_chat, monkeypatch):
     assert chat._tts_cancellation.cancelled
 
 
-def test_stream_deadline_cancels_speech_but_preserves_llm_turn(streaming_chat, monkeypatch):
+@pytest.mark.parametrize("text_only_clips", [False, True])
+def test_stream_deadline_cancels_speech_but_preserves_llm_turn(streaming_chat, monkeypatch, text_only_clips):
     expired = threading.Event()
+    displayed, quiet = threading.Event(), threading.Event()
+    quiet_before_turn_end = []
     turn_stop = threading.Event()
     observed, played, shown = [], [], []
     clock = [100.0]
@@ -2556,6 +2559,13 @@ def test_stream_deadline_cancels_speech_but_preserves_llm_turn(streaming_chat, m
         on_text("Primeira frase longa. ")
         assert expired.wait(3)
         observed.append((stop is turn_stop, stop.is_set(), chat._tts_cancellation.cancelled))
+        if text_only_clips:
+            for index in range(8):
+                displayed.clear()
+                on_text(f"Continuação depois do prazo número {index}. ")
+                assert displayed.wait(3)
+            # Keep the LLM turn open: final cleanup must not mask a stuck indicator.
+            quiet_before_turn_end.append(quiet.wait(1))
         on_text("Resposta depois do prazo.")
 
     def synth(text, config):
@@ -2573,11 +2583,21 @@ def test_stream_deadline_cancels_speech_but_preserves_llm_turn(streaming_chat, m
     monkeypatch.setattr(vc, "synthesize_stream", synth)
     chat = vc.VoiceChat({**DEFAULT_CONFIG, "tts_reply_timeout_seconds": 10},
                         llm=llm, play=play, log=log)
-    reply = chat.respond("oi", stop=turn_stop, on_reply=lambda *args: shown.append(args[0]))
+    chat.on_audio = lambda active: quiet.set() if not active else None
+
+    def on_reply(text, *args):
+        shown.append(text)
+        if expired.is_set():
+            clock[0] += 0.05
+            displayed.set()
+
+    reply = chat.respond("oi", stop=turn_stop, on_reply=on_reply)
     assert (True, False, True) in observed and True in observed
     assert len(played) == 1
     assert "Resposta depois do prazo." in reply
     assert "Resposta depois do prazo." in shown[-1]
+    if text_only_clips:
+        assert quiet_before_turn_end == [True]
 
 
 @pytest.mark.parametrize("streaming", [False, True])

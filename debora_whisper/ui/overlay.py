@@ -565,10 +565,11 @@ class OverlayWindow:
         self._slides.clear()
         self._slide_held = False
 
-    def _update_layout(self):
+    def _update_layout(self, *, force_hidden=False):
         was_hidden = self._hidden
-        self._hidden = (self._state == "ready" and not self._voice_mode
+        self._hidden = force_hidden or (self._state == "ready" and not self._voice_mode
                         and not self._continuous_listening
+                        and not getattr(self, "_dragging", False)
                         and not self._conversation_lines())
         if self._hidden and not was_hidden:
             self._win.withdraw()
@@ -579,6 +580,8 @@ class OverlayWindow:
                 self._grip_fade_id = None
             self._grip_hover = False
             self._grip_level = 0
+        if was_hidden and not self._hidden:
+            self._scale = self._get_scale()
         self._position()
         self._redraw()
         if was_hidden and not self._hidden:
@@ -640,6 +643,7 @@ class OverlayWindow:
                     self._on_width_changed(self._balloon_width)
             elif self._on_pos_changed:
                 self._on_pos_changed(self._pos_x, self._pos_y)
+            self._update_layout()
         elif self._press_region == "text":
             self._dismiss_balloon()
         elif (self._press_region == "mascot" and self._state in self._CLICK_STATES
@@ -906,4 +910,9 @@ class OverlayWindow:
         self._update_layout()
 
     def hide(self):
-        self.show_ready()
+        """Dismiss the text and hide immediately, including in voice mode."""
+        self._cancel_dismiss()
+        self._text_dismissed = True
+        self._reset_slides()
+        self._set_state("ready")
+        self._update_layout(force_hidden=True)

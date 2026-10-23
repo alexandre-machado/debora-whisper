@@ -1852,12 +1852,17 @@ class VoiceChat:
                                      and time.monotonic() - idle_since >= 0.1)
                         clip_available = False
                     else:
-                        idle_since = None
+                        if clip is not None and len(clip[0]) and not speech_stop.is_set():
+                            idle_since = None
+                        elif idle_since is None:
+                            idle_since = max(time.monotonic(), playback_tail)
+                        show_idle = (idle_since is not None
+                                     and time.monotonic() - idle_since >= 0.1)
                         playback_busy = True
                         clip_available = True
+                if show_idle:
+                    self._show_audio(False)
                 if not clip_available:
-                    if show_idle:
-                        self._show_audio(False)
                     continue
                 if clip is None or stop.is_set():
                     break

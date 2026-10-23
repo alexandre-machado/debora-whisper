@@ -4002,6 +4002,7 @@ class DictationApp:
             import keyboard
             with self._hotkey_lock:
                 keyboard.unhook_all()
+                platforms.current().stop_keyboard_listener(keyboard)
                 self._hotkey_removers.clear()
         except Exception:
             pass

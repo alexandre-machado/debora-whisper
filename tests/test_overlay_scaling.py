@@ -59,6 +59,7 @@ def _overlay(scale=1.0, state="ready"):
     overlay._monitor_work_area = Mock(return_value=(0, 0, 1920, 1080))
     overlay._redraw = Mock()
     overlay._apply_window_flags = Mock()
+    overlay._get_scale = Mock(return_value=scale)
     overlay._position()
     return overlay
 
@@ -107,7 +108,7 @@ def test_voice_mode_border_preserves_geometry(monkeypatch, scale, state):
     assert overlay._text_geometry(overlay._cur_w) == text_geometry
 
 
-@pytest.mark.parametrize("finish", ["show_ready", "show_result", "hide"])
+@pytest.mark.parametrize("finish", ["show_ready", "show_result"])
 def test_idle_hides_only_after_the_balloon_timer(finish):
     overlay = _overlay()
     overlay.show_speaking("Finished reply")
@@ -141,6 +142,72 @@ def test_startup_and_empty_result_hide_immediately():
     overlay.show_recording()
     overlay.show_result("")
     assert overlay._win.withdraw.call_count == 2
+
+
+@pytest.mark.parametrize("region", ["mascot", "resize"])
+def test_idle_waits_for_drag_end_before_hiding(region):
+    overlay = _overlay(state="recording")
+    overlay.show_result("Finished turn")
+    overlay._press_region = region
+    overlay._dragging = True
+    overlay._root.after.call_args.args[1]()
+    assert not overlay._hidden
+    overlay._win.withdraw.assert_not_called()
+    overlay._on_drag_end(SimpleNamespace(x=20, y=10))
+    assert overlay._hidden
+    overlay._win.withdraw.assert_called_once_with()
+
+
+def test_unhide_refreshes_dpi_before_positioning():
+    overlay = _overlay()
+    overlay.show_ready()
+    overlay._get_scale.return_value = 2.0
+    positioned = []
+    position = overlay._position
+
+    def record_position():
+        positioned.append(overlay._scale)
+        position()
+
+    overlay._position = record_position
+    overlay.show_recording()
+    assert positioned == [2.0]
+    assert overlay._cur_h == overlay.COMPACT_H * 2.0
+    overlay._win.deiconify.assert_called_once_with()
+
+
+@pytest.mark.parametrize("voice_mode", [False, True])
+@pytest.mark.parametrize("dragging", [False, True])
+def test_hide_dismisses_text_and_forces_hidden_state(voice_mode, dragging):
+    overlay = _overlay()
+    overlay.set_voice_mode(voice_mode)
+    overlay.show_recording("Question", voice_chat=True)
+    overlay.show_speaking("Reply")
+    overlay._dragging = dragging
+    overlay.hide()
+    assert overlay._hidden
+    assert not overlay._conversation_lines()
+    assert overlay._balloon_id is None
+    overlay._win.withdraw.assert_called_once_with()
+
+
+@pytest.mark.parametrize("show, kwargs", [
+    ("show_recording", {}), ("show_recording", {"voice_chat": True}),
+    ("show_ready", {"continuous_listening": True}),
+    ("show_result", {"text": "", "continuous_listening": True}),
+])
+@pytest.mark.parametrize("balloon", [False, True])
+def test_open_microphone_states_always_show_overlay(show, kwargs, balloon):
+    overlay = _overlay()
+    overlay.show_ready()
+    assert overlay._hidden
+    overlay.set_show_balloon(balloon)
+    overlay._win.withdraw.reset_mock()
+    getattr(overlay, show)(**kwargs)
+    overlay._dismiss_balloon()
+    assert not overlay._hidden
+    overlay._win.deiconify.assert_called_once_with()
+    overlay._win.withdraw.assert_not_called()
 
 
 @pytest.mark.parametrize("show, args", [

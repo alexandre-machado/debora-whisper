@@ -79,6 +79,83 @@ def test_replacement_shutdown_posts_only_quit_without_exception_filter(monkeypat
     windows._user32.PostThreadMessageW.assert_called_once_with(42, 0x12, 0, 0)
 
 
+@pytest.mark.parametrize("message", [0, 0x12])
+@pytest.mark.parametrize("ready", [True, False])
+def test_post_retries_until_queue_exists_or_timeout(monkeypatch, keyboard, message, ready):
+    elapsed = [0.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+
+    monkeypatch.setattr(windows, "time", SimpleNamespace(
+        monotonic=lambda: elapsed[0], sleep=sleep))
+    post = windows._user32.PostThreadMessageW
+    post.side_effect = [0, 0, 1] if ready else None
+    post.return_value = 0
+    assert windows._post_keyboard_message(keyboard._listener.listening_thread, message) is ready
+    assert 0.02 <= elapsed[0] <= 0.51
+    if not ready:
+        assert elapsed[0] >= 0.5
+    assert sleeps == [0.01] * len(sleeps)
+    assert post.call_args_list == [call(42, message, 0, 0)] * (len(sleeps) + 1)
+
+
+@pytest.mark.parametrize("kind", ["legacy", "unstarted", "dead"])
+def test_shutdown_leaves_unowned_or_inactive_listener_alone(keyboard, kind):
+    thread = keyboard._listener.listening_thread
+    if kind == "unstarted":
+        del keyboard._listener.listening_thread
+    elif kind == "dead":
+        thread._debora_message_loop = True
+        thread.is_alive.side_effect = None
+        thread.is_alive.return_value = False
+    windows.WindowsPlatform().stop_keyboard_listener(keyboard)
+    windows._user32.PostThreadMessageW.assert_not_called()
+    thread.join.assert_not_called()
+
+
+def test_shutdown_exits_owned_loop_and_unhooks(keyboard):
+    entered, quit = threading.Event(), threading.Event()
+
+    def get(*args):
+        entered.set()
+        assert quit.wait(2)
+        return 0
+
+    def post(thread_id, message, *args):
+        assert thread_id == thread.native_id and message == 0x12
+        quit.set()
+        return 1
+
+    windows._user32.GetMessageW.side_effect = get
+    windows._user32.PostThreadMessageW.side_effect = post
+    thread = threading.Thread(target=windows._listen_safely,
+                              args=(keyboard._os_keyboard, keyboard._listener), daemon=True)
+    thread._debora_message_loop = True
+    keyboard._listener.listening_thread = thread
+    thread.start()
+    try:
+        assert entered.wait(2)
+        windows.WindowsPlatform().stop_keyboard_listener(keyboard)
+        assert not thread.is_alive()
+        keyboard._os_keyboard.UnhookWindowsHookEx.assert_called_once_with(123)
+    finally:
+        quit.set()
+        thread.join(2)
+
+
+def test_restart_leaves_backend_modifier_flags_untouched(keyboard):
+    backend = keyboard._os_keyboard
+    backend.shift_is_pressed = backend.altgr_is_pressed = True
+    backend.ignore_next_right_alt = True
+    stop = threading.Event()
+    stop.set()
+    windows.WindowsPlatform().restart_keyboard_listener(keyboard, stop)
+    assert backend.shift_is_pressed and backend.altgr_is_pressed and backend.ignore_next_right_alt
+
+
 @pytest.mark.parametrize("failure", [None, "get", "dispatch", "install"])
 def test_message_loop_uses_real_buffer_and_unhooks_on_exit(keyboard, monkeypatch, failure):
     api, backend = windows._user32, keyboard._os_keyboard

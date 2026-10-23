@@ -24,6 +24,9 @@ class Platform:
     def restart_keyboard_listener(self, keyboard, stopping):
         """No native listener recovery on this platform."""
 
+    def stop_keyboard_listener(self, keyboard):
+        """No owned native listener to stop on this platform."""
+
     def type_text(self, text: str, auto_enter: bool = False):
         """Keep the portable clipboard/keyboard path; native support is unknown."""
         from debora_whisper.platforms import windows_text

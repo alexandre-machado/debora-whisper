@@ -86,6 +86,7 @@ def test_hook_recovery_replaces_only_owned_registrations_and_stops():
             assert not app._recover_hotkeys()
             assert provider.restart_keyboard_listener.call_count == 1
             keyboard.unhook_all.assert_called_once()
+            provider.stop_keyboard_listener.assert_called_once_with(keyboard)
         finally:
             app.stop_monitoring()
 
@@ -111,6 +112,7 @@ def test_shutdown_orders_unhook_after_inflight_recovery():
             shutdown.start()
             assert app._stopping.wait(2)
             unhook.assert_not_called()
+            provider.stop_keyboard_listener.assert_not_called()
         finally:
             release.set()
             recovery.join(2)
@@ -120,6 +122,7 @@ def test_shutdown_orders_unhook_after_inflight_recovery():
         assert not shutdown.is_alive()
         install.assert_not_called()
         unhook.assert_called_once()
+        provider.stop_keyboard_listener.assert_called_once()
 
 
 class TestTranscriptionThreading:
