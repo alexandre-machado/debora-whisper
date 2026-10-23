@@ -185,6 +185,7 @@ def test_hide_dismisses_text_and_forces_hidden_state(voice_mode, dragging):
     overlay.show_speaking("Reply")
     overlay._dragging = dragging
     overlay.hide()
+    overlay._update_layout()
     assert overlay._hidden
     assert not overlay._conversation_lines()
     assert overlay._balloon_id is None
@@ -205,6 +206,7 @@ def test_open_microphone_states_always_show_overlay(show, kwargs, balloon):
     overlay._win.withdraw.reset_mock()
     getattr(overlay, show)(**kwargs)
     overlay._dismiss_balloon()
+    overlay.hide()
     assert not overlay._hidden
     overlay._win.deiconify.assert_called_once_with()
     overlay._win.withdraw.assert_not_called()

@@ -299,7 +299,12 @@ class WindowsPlatform(Platform):
         self._watchdog = KeyboardHookWatchdog(stopping, recover, log)
         return self._watchdog
 
-    def stop_keyboard_listener(self, keyboard):
+    def stop_keyboard_listener(self, keyboard, *, final=False):
+        if final:
+            stopping = threading.Event()
+            stopping.set()
+            self.restart_keyboard_listener(keyboard, stopping)
+            return
         listener = keyboard._listener
         with listener.lock:
             thread = getattr(listener, "listening_thread", None)
@@ -317,8 +322,8 @@ class WindowsPlatform(Platform):
         # replacements own a real MSG and unhook cleanly on WM_QUIT.
         listener = keyboard._listener
         with listener.lock:
-            old = listener.listening_thread
-            if old.is_alive():
+            old = getattr(listener, "listening_thread", None)
+            if old is not None and old.is_alive():
                 legacy = getattr(old, "_debora_message_loop", False) is not True
                 previous_hook = threading.excepthook
 

@@ -24,7 +24,7 @@ class Platform:
     def restart_keyboard_listener(self, keyboard, stopping):
         """No native listener recovery on this platform."""
 
-    def stop_keyboard_listener(self, keyboard):
+    def stop_keyboard_listener(self, keyboard, *, final=False):
         """No owned native listener to stop on this platform."""
 
     def type_text(self, text: str, auto_enter: bool = False):

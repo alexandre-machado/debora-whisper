@@ -567,7 +567,7 @@ class OverlayWindow:
 
     def _update_layout(self, *, force_hidden=False):
         was_hidden = self._hidden
-        self._hidden = force_hidden or (self._state == "ready" and not self._voice_mode
+        self._hidden = force_hidden or getattr(self, "_explicitly_hidden", False) or (self._state == "ready" and not self._voice_mode
                         and not self._continuous_listening
                         and not getattr(self, "_dragging", False)
                         and not self._conversation_lines())
@@ -809,6 +809,7 @@ class OverlayWindow:
         self._text_dismissed = False
 
     def _set_state(self, state):
+        self._explicitly_hidden = False
         if state in self._MASCOT_STILL_STATES:
             # A replaced or failed engine never reports that the voices
             # stopped; nobody is talking until a new one says so.
@@ -910,9 +911,12 @@ class OverlayWindow:
         self._update_layout()
 
     def hide(self):
-        """Dismiss the text and hide immediately, including in voice mode."""
+        """Hide until the next state notification, unless the microphone is open."""
+        if self._state == "recording" or self._continuous_listening:
+            return
         self._cancel_dismiss()
         self._text_dismissed = True
         self._reset_slides()
         self._set_state("ready")
+        self._explicitly_hidden = True
         self._update_layout(force_hidden=True)

@@ -212,6 +212,14 @@ def _bare_app(engine_stop, tray_stop, root=None):
 
 
 class TestTeardown:
+    def test_final_listener_cleanup_runs_once_even_if_engine_stop_fails(self):
+        app = _bare_app(_Stop(raises=RuntimeError("stop failed")), _Stop())
+        with patch("debora_whisper.platforms.current") as current:
+            app._teardown()
+            app._teardown()
+        current.return_value.stop_keyboard_listener.assert_called_once()
+        assert current.return_value.stop_keyboard_listener.call_args.kwargs == {"final": True}
+
     def test_stops_engine_and_tray(self):
         engine, tray = _Stop(), _Stop()
         _bare_app(engine, tray)._teardown()
