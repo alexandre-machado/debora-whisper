@@ -211,6 +211,26 @@ class TestTranscriptionThreading:
                 assert states == [AppState.PROCESSING, AppState.READY]
 
 
+@pytest.mark.parametrize("listening", [False, True])
+@pytest.mark.parametrize("text", [None, "Finished turn"])
+def test_ready_passes_continuous_listening_to_overlay(listening, text):
+    from debora_whisper.app import GUIApp
+
+    gui = GUIApp.__new__(GUIApp)
+    gui._root = MagicMock()
+    gui._tray = MagicMock()
+    gui._overlay = MagicMock()
+    gui._engine = MagicMock(continuous_active=listening)
+    gui._stop_audio_polling = MagicMock()
+    gui._settings_status = MagicMock()
+    gui._settings_set_apply = MagicMock()
+    gui._update_ui(AppState.READY, {"text": text})
+    if text:
+        gui._overlay.show_result.assert_called_once_with(text, continuous_listening=listening)
+    else:
+        gui._overlay.show_ready.assert_called_once_with(continuous_listening=listening)
+
+
 def test_voice_chat_delivers_both_sides_to_the_single_overlay():
     import numpy as np
     from debora_whisper.app import GUIApp

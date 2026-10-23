@@ -180,15 +180,16 @@ class GUIApp:
         elif state == AppState.READY:
             self._stop_audio_polling()
             text = data.get("text")
+            listening = bool(getattr(self._engine, "continuous_active", False))
             self._tray.update_state(state_name, "Débora Whisper — Ready")
             if text:
-                self._overlay.show_result(text)
+                self._overlay.show_result(text, continuous_listening=listening)
             else:
-                self._overlay.show_ready()
+                self._overlay.show_ready(continuous_listening=listening)
             self._settings_status("Model ready.", "#30D158")
             self._settings_set_apply(True)
             
-            if getattr(self._engine, "continuous_active", False):
+            if listening:
                 # Transition back to recording visually
                 self._root.after(1500, lambda: self._update_ui(AppState.RECORDING, {}) if getattr(self._engine, "is_recording", False) else None)
 

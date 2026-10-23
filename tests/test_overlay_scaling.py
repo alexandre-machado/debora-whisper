@@ -58,6 +58,7 @@ def _overlay(scale=1.0, state="ready"):
         metrics=Mock(return_value=round(26 * overlay._scale))))
     overlay._monitor_work_area = Mock(return_value=(0, 0, 1920, 1080))
     overlay._redraw = Mock()
+    overlay._apply_window_flags = Mock()
     overlay._position()
     return overlay
 
@@ -98,10 +99,113 @@ def test_voice_mode_border_preserves_geometry(monkeypatch, scale, state):
     overlay._redraw.assert_not_called()
     overlay.set_voice_mode(False)
     overlay._redraw.assert_called_once()
-    assert overlay._photo_refs[0].tobytes() == original.tobytes()
+    if state == "ready":
+        assert overlay._hidden
+    else:
+        assert overlay._photo_refs[0].tobytes() == original.tobytes()
     assert (overlay._cur_w, overlay._cur_h, overlay._window_x, overlay._pos_y) == geometry
     assert overlay._text_geometry(overlay._cur_w) == text_geometry
-    overlay._win.geometry.assert_not_called()
+
+
+@pytest.mark.parametrize("finish", ["show_ready", "show_result", "hide"])
+def test_idle_hides_only_after_the_balloon_timer(finish):
+    overlay = _overlay()
+    overlay.show_speaking("Finished reply")
+    args = ("Finished reply",) if finish == "show_result" else ()
+    getattr(overlay, finish)(*args)
+    overlay._win.withdraw.assert_not_called()
+    delay, dismiss = overlay._root.after.call_args.args
+    assert delay == overlay.BALLOON_DURATION
+    dismiss()
+    overlay._win.withdraw.assert_called_once_with()
+    assert overlay._hidden and not overlay._conversation_lines()
+    overlay.show_ready()
+    overlay._win.withdraw.assert_called_once_with()
+
+
+@pytest.mark.parametrize("finish", ["show_ready", "show_result", "hide"])
+def test_idle_hides_immediately_when_balloon_disabled(finish):
+    overlay = _overlay(state="speaking")
+    overlay.set_show_balloon(False)
+    overlay.show_speaking("Finished reply")
+    args = ("Finished reply",) if finish == "show_result" else ()
+    getattr(overlay, finish)(*args)
+    overlay._win.withdraw.assert_called_once_with()
+    assert overlay._hidden
+
+
+def test_startup_and_empty_result_hide_immediately():
+    overlay = _overlay(state="loading")
+    overlay.show_ready()
+    overlay._win.withdraw.assert_called_once_with()
+    overlay.show_recording()
+    overlay.show_result("")
+    assert overlay._win.withdraw.call_count == 2
+
+
+@pytest.mark.parametrize("show, args", [
+    ("show_recording", ()), ("show_processing", ()),
+    ("show_speaking", ("Reply",)), ("show_error", ()),
+    ("show_loading", ()), ("set_voice_mode", (True,)),
+])
+def test_hidden_overlay_reappears_without_focus_or_position_changes(show, args):
+    overlay = _overlay()
+    overlay.show_ready()
+    position = overlay._pos_x, overlay._pos_y
+    calls = Mock()
+    calls.attach_mock(overlay._apply_window_flags, "flags")
+    calls.attach_mock(overlay._win.deiconify, "show")
+    calls.attach_mock(overlay._win.attributes, "attributes")
+    getattr(overlay, show)(*args)
+    assert not overlay._hidden
+    assert [call[0] for call in calls.mock_calls] == ["flags", "show", "attributes", "flags"]
+    overlay._win.attributes.assert_called_with("-topmost", True)
+    overlay._win.focus_set.assert_not_called()
+    overlay._win.focus_force.assert_not_called()
+    assert (overlay._pos_x, overlay._pos_y) == position
+
+
+@pytest.mark.parametrize("voice_mode", [False, True])
+def test_listening_keeps_overlay_visible_between_turns(voice_mode):
+    overlay = _overlay()
+    overlay.set_voice_mode(voice_mode)
+    listening = {"continuous_listening": not voice_mode}
+    overlay.show_ready(**listening)
+    overlay.show_result("Finished turn", **listening)
+    overlay._root.after.call_args.args[1]()
+    overlay._win.withdraw.assert_not_called()
+    assert not overlay._hidden
+    overlay.set_voice_mode(False)
+    if voice_mode:
+        assert overlay._hidden
+    overlay.show_ready()
+    assert overlay._hidden
+
+
+def test_disabling_balloon_hides_an_idle_result():
+    overlay = _overlay()
+    overlay.show_result("Finished turn")
+    overlay.set_show_balloon(False)
+    overlay._win.withdraw.assert_called_once_with()
+
+
+def test_hidden_overlay_stops_animation_and_restarts_on_recording():
+    overlay = _overlay(state="recording")
+    overlay._redraw.side_effect = overlay._sync_mascot_animation
+    overlay._root.after.return_value = "mascot-timer"
+    overlay._sync_mascot_animation()
+    overlay.show_ready()
+    overlay._root.after_cancel.assert_called_once_with("mascot-timer")
+    assert overlay._mascot_anim_id is None
+    overlay._canvas.reset_mock()
+    overlay._root.after.reset_mock()
+    OverlayWindow._redraw(overlay)
+    overlay._mascot_tick()
+    overlay._slide_tick()
+    overlay._canvas.delete.assert_not_called()
+    overlay._root.after.assert_not_called()
+    overlay.show_recording()
+    overlay._root.after.assert_called_once_with(1000 // overlay.MASCOT_FPS, overlay._mascot_tick)
 
 
 def test_monitor_change_rescales_even_without_animation():
@@ -497,6 +601,7 @@ def test_mascot_falls_back_to_the_still_image(monkeypatch, tmp_path):
 ])
 def test_mascot_flaps_in_silence_and_stands_still_only_loading_or_failed(state, animated):
     overlay = OverlayWindow.__new__(OverlayWindow)
+    overlay._hidden = False
     overlay._root = Mock()
     overlay._root.after.return_value = "timer"
     overlay._state = state
@@ -511,6 +616,7 @@ def test_mascot_flaps_in_silence_and_stands_still_only_loading_or_failed(state, 
 
 def test_an_error_stops_the_timer():
     overlay = OverlayWindow.__new__(OverlayWindow)
+    overlay._hidden = False
     overlay._root = Mock()
     overlay._state = "error"
     overlay._mascot_index = 7

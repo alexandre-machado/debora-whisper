@@ -13,7 +13,7 @@ Local voice-to-text dictation for Windows, on Intel NPU or iGPU via OpenVINO, NV
 - **NPU-accelerated** — runs on Intel AI Boost (Meteor Lake / Lunar Lake / Arrow Lake)
 - **6 models** — Whisper tiny/base/small/medium/turbo + Parakeet TDT 0.6B (best accuracy)
 - **15 languages** — English, Russian, Spanish, French, German, Japanese, Chinese, Korean, and more
-- **Dynamic Island overlay** — always-visible floating pill with waveform, timer, and status
+- **Dynamic Island overlay** — floating mascot and conversation text; hides when off after the text balloon dismisses
 - **System tray** — lives in your taskbar, right-click for settings/history
 - **One-click settings** — language-first model picker with download status badges
 - **Claude Code mode** — auto-paste + Enter for hands-free prompt submission
@@ -121,7 +121,7 @@ The Settings dialog shows which models are already downloaded and filters them b
 .\Start-Dictation.ps1
 ```
 
-Launches with a Dynamic Island overlay at the top of your screen and a system tray icon. Click the green dot or press Ctrl+Space to record.
+Launches with a Dynamic Island overlay at the top of your screen and a system tray icon. The overlay hides when ready with listening off, after any conversation text dismisses. Press Ctrl+Space to record; Settings and Quit remain available from the tray.
 
 ### CLI Mode
 
