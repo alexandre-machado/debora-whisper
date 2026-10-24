@@ -50,6 +50,17 @@ def _private_last_recording(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _private_silero_model(tmp_path, monkeypatch):
+    """Never use the operator's cached VAD, even if MODEL_DIR is rebound.
+
+    VAD tests may populate this private path and inject a stub session.
+    """
+    from debora_whisper import dictation_engine as engine
+    model_path = tmp_path / "silero_vad" / "silero_vad.onnx"
+    monkeypatch.setattr(engine, "silero_vad_model_path", lambda: model_path)
+
+
+@pytest.fixture(autouse=True)
 def _reset_allocation_reporter():
     from debora_whisper.hardware_allocation import allocation
     with allocation.lock:

@@ -192,6 +192,12 @@ already listening continuously. A session started by a tap stops by itself
 after `continuous_idle_stop_seconds` (default 120) without speech; `null`
 keeps it on until the next tap.
 
+Push-to-talk recordings (including voice chat) are checked for speech before
+transcription when Silero VAD is loaded or cached locally. Clips without about
+200 ms of speech are dropped and logged. Continuous listening downloads Silero
+on first use; push-to-talk never downloads it and keeps its previous behavior
+if the model is unavailable.
+
 `save_last_recording: true` keeps the audio of the last transcription in
 `~/.debora/last_recording.wav`, to reproduce a bad transcription. Each new
 transcription overwrites it: in continuous dictation and voice chat that is the
