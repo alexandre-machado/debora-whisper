@@ -59,7 +59,7 @@ DEFAULT_CONFIG = {
     # the NPU (README, "Benchmark"). Edit config.json to reorder.
     "device_priority": ["CUDA", "NPU", "GPU", "CPU"],
     "model_size": "turbo",     # see MODEL_REGISTRY; turbo: large-v3-turbo
-    "language": "en",          # Language code or "auto"
+    "language": "en",          # Fallback; load_config uses the OS UI language when unset
     "hotkey": "ctrl+space",    # Global hotkey to toggle recording
     "voice_chat_hotkey": "right alt",  # Tapped alone, switches voice chat; "" disables
     "auto_enter": False,       # Press Enter after pasting (useful for Claude Code)
@@ -313,12 +313,17 @@ def log_folder_moves():
 # Config management
 # ---------------------------------------------------------------------------
 def load_config() -> dict:
+    saved = {}
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE, "r") as f:
             saved = json.load(f)
-        config = {**DEFAULT_CONFIG, **saved}
-    else:
-        config = DEFAULT_CONFIG.copy()
+    config = {**DEFAULT_CONFIG, **saved}
+    if "language" not in saved:
+        language = platforms.default_language(LANGUAGES)
+        # Settings never offers a model without the language; keep to that.
+        if config["model_size"] not in get_models_for_language(language):
+            language = "en"
+        config["language"] = language
     return config
 
 

@@ -102,6 +102,112 @@ def saved_config(tmp_path, monkeypatch):
     return config_file
 
 
+@pytest.mark.parametrize("saved", [None, {}])
+@pytest.mark.parametrize("locale_name,expected", [
+    ("pt-BR", "pt"), ("pt_PT", "pt"), ("es-MX", "es"), ("zh-CN", "zh"),
+    ("ja_JP", "ja"), ("fi_FI", "en"),
+])
+def test_missing_language_uses_system_ui_language(saved_config, monkeypatch, saved,
+                                                locale_name, expected):
+    import ctypes
+    import locale
+    from types import SimpleNamespace
+    from debora_whisper import dictation_engine as de, platforms
+
+    detect = MagicMock(return_value=0x0416)
+    monkeypatch.setattr(platforms, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(
+        kernel32=SimpleNamespace(GetUserDefaultUILanguage=detect)), raising=False)
+    monkeypatch.setitem(locale.windows_locale, 0x0416, locale_name)
+    if saved is not None:
+        saved_config.write_text(json.dumps(saved))
+
+    config = de.load_config()
+
+    assert config["language"] == expected
+    assert config["model_size"] in de.get_models_for_language(expected)
+    detect.assert_called_once_with()
+    assert DEFAULT_CONFIG["language"] == "en"
+    if saved is None:
+        assert not saved_config.exists()
+    else:
+        assert json.loads(saved_config.read_text()) == saved
+    de.save_config(config)
+    assert json.loads(saved_config.read_text())["language"] == expected
+
+
+def test_regional_ui_language_missing_from_locale_table(saved_config, monkeypatch):
+    import ctypes
+    import locale
+    from types import SimpleNamespace
+    from debora_whisper import dictation_engine as de, platforms
+
+    monkeypatch.setattr(platforms, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(kernel32=SimpleNamespace(
+        GetUserDefaultUILanguage=lambda: 0x580A)), raising=False)  # es-419
+    monkeypatch.delitem(locale.windows_locale, 0x580A, raising=False)
+    monkeypatch.setitem(locale.windows_locale, 0x040A, "es_ES")
+
+    assert de.load_config()["language"] == "es"
+
+
+def test_detected_language_unsupported_by_saved_model_uses_english(saved_config,
+                                                                  monkeypatch):
+    from debora_whisper import dictation_engine as de, platforms
+
+    monkeypatch.setattr(platforms, "default_language", lambda languages: "ja")
+    saved_config.write_text(json.dumps({"model_size": "parakeet"}))
+
+    assert "parakeet" not in de.get_models_for_language("ja")
+    assert de.load_config()["language"] == "en"
+
+
+@pytest.mark.parametrize("language", ["en", "auto"])
+def test_explicit_language_skips_detection(saved_config, monkeypatch, language):
+    from debora_whisper import dictation_engine as de, platforms
+
+    detect = MagicMock(side_effect=AssertionError("explicit language must win"))
+    monkeypatch.setattr(platforms, "default_language", detect)
+    saved_config.write_text(json.dumps({"language": language}))
+
+    assert de.load_config()["language"] == language
+    detect.assert_not_called()
+
+
+def test_missing_language_detection_failure_uses_english(saved_config, monkeypatch):
+    import ctypes
+    from types import SimpleNamespace
+    from debora_whisper import dictation_engine as de, platforms
+
+    detect = MagicMock(side_effect=OSError("UI language unavailable"))
+    monkeypatch.setattr(platforms, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(
+        kernel32=SimpleNamespace(GetUserDefaultUILanguage=detect)), raising=False)
+
+    assert de.load_config()["language"] == "en"
+    detect.assert_called_once_with()
+
+
+@pytest.mark.parametrize("locale_name,lc_all,lang,expected", [
+    ("pt_BR", "de_DE", "en_US", "pt"),
+    (None, "es_MX.UTF-8", "en_US", "es"),
+    (None, "", "zh_CN.UTF-8", "zh"),
+    (None, "", "", "en"),
+])
+def test_missing_language_uses_non_windows_locale(saved_config, monkeypatch,
+                                                 locale_name, lc_all, lang, expected):
+    import locale
+    from types import SimpleNamespace
+    from debora_whisper import dictation_engine as de, platforms
+
+    monkeypatch.setattr(platforms, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(locale, "getlocale", lambda: (locale_name, "UTF-8"))
+    monkeypatch.setenv("LC_ALL", lc_all)
+    monkeypatch.setenv("LANG", lang)
+
+    assert de.load_config()["language"] == expected
+
+
 def test_startup_override_survives_unrelated_save(saved_config):
     from debora_whisper.dictation_engine import save_config, start_in_dictation
     config = {**DEFAULT_CONFIG, "continuous_listening": True, "voice_chat": True}
