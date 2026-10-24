@@ -22,7 +22,7 @@ Local voice-to-text dictation for Windows, on Intel NPU or iGPU via OpenVINO, NV
 
 ## Requirements
 
-- **Windows 11**
+- **Windows 11**, or **Linux** (tested on Ubuntu 26.04 with KDE Plasma on Wayland; see [Linux](#linux))
 - **Intel Core Ultra** CPU with NPU (Meteor Lake / Lunar Lake / Arrow Lake), or any Intel CPU with iGPU
 - **Python 3.10+**
 - **16 GB RAM** recommended (NPU/GPU share system memory)
@@ -63,6 +63,62 @@ Update with `uv tool upgrade debora-whisper`. To remove, run
 `debora --remove-shortcut` first, then `uv tool uninstall debora-whisper`
 (models and config stay in `~/.debora/`). Once published to PyPI, the
 same works with `uv tool install debora-whisper` or a one-off `uvx debora-whisper`.
+
+### Linux
+
+Tested on Ubuntu 26.04, KDE Plasma 6 (Wayland), PipeWire and an NVIDIA RTX
+with the `[cuda]` extra. Other desktops work with less: see the table below.
+
+```bash
+sudo apt install wl-clipboard pipx     # the clipboard on Wayland (xclip on X11), and pipx for uv
+sudo usermod -aG input "$USER"         # read the keyboards for the hotkey (see the warning below)
+echo 'KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"' \
+  | sudo tee /etc/udev/rules.d/70-debora-uinput.rules  # type through a virtual keyboard
+sudo udevadm control --reload && sudo udevadm trigger /dev/uinput
+# log out and back in, so the group and the uinput access apply
+pipx install uv && pipx ensurepath  # or uv's own installer, after reading it: https://docs.astral.sh/uv/
+uv tool install "debora-whisper[cuda] @ git+https://github.com/alexandre-machado/debora-whisper"
+debora-cli --setup
+debora --install-shortcut --autostart  # app menu entry + start at login (.desktop files)
+```
+
+The global hotkey reads the keyboards in `/dev/input` and types through a
+virtual keyboard on `/dev/uinput`. While the app runs, it holds the keyboards
+exclusively and mirrors every key except its own hotkey, which never reaches
+the app in focus.
+
+> **Security:** the app itself needs no root, but these permissions are broad.
+> Membership in the `input` group lets **every program you run** read every
+> key you type, passwords and the lock screen included, with no prompt; on
+> Wayland that is otherwise reserved to the compositor. The group can also
+> write to `/dev/input/event*`, so those programs can inject input too, and
+> it applies in every session of that user (SSH or a second seat included),
+> not only the one at the local seat. Write access to
+> `/dev/uinput` lets a program type and click as you. The rule above grants it
+> through `uaccess` only to the user at the local seat, while logged in, which
+> is narrower than giving the `input` group write access; do not do the
+> latter. Some packages (Steam, for instance) already install the same
+> `uaccess` rule. To undo: `sudo gpasswd -d "$USER" input` and remove
+> `/etc/udev/rules.d/70-debora-uinput.rules`.
+
+Text is pasted: Ctrl+V, or Ctrl+Shift+V in terminals. On KDE Plasma the app
+asks KWin which window has focus and picks the key per window; elsewhere it
+uses Ctrl+Shift+V, which most terminals and many other apps accept. Override
+per window class with `paste_hotkeys` in the config:
+
+```json
+"paste_hotkeys": {"org.kde.konsole": "ctrl+shift+v", "emacs": "ctrl+y", "unknown": "ctrl+v"}
+```
+
+| | KDE Plasma (Wayland/X11) | Other desktops |
+|---|---|---|
+| Hotkey (suppressed) and typing | yes | yes |
+| Paste key per window | yes (KWin) | `unknown` key from `paste_hotkeys` |
+| Tray icon with menu | yes (StatusNotifierItem) | GNOME needs the AppIndicator extension; otherwise an icon without menu |
+| Inline drafts | overlay only (the text before the caret is not readable yet) | same |
+
+`language` defaults to `"en"`, which makes Whisper translate other languages
+into English: set your language (`"pt"`, ...) or `"auto"`.
 
 ### From a source checkout
 

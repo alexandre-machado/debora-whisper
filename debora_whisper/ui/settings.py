@@ -79,9 +79,20 @@ def _make_wide_dropdown(om, values, on_select):
         h = min(len(values) * 30 + 10, 500)
         win.geometry(f"{w}x{h}+{x}+{y}")
 
-        win.grab_set()
+        _grab(win)
         win.bind("<Button-1>", _on_click)
         win.bind("<Escape>", lambda e: _close())
+
+    def _grab(win, tries=25):
+        # On X11 the popup maps after this returns, and a grab on an unmapped
+        # window fails: retry until it shows (Windows maps it at once).
+        if _state["win"] is not win:
+            return
+        try:
+            win.grab_set()
+        except tk.TclError:
+            if tries > 1:
+                win.after(20, _grab, win, tries - 1)
 
     def _select(value):
         om.set(value)
@@ -454,11 +465,10 @@ class SettingsWindow:
         return names
 
     def _open_voices_folder(self):
-        import os
-        from debora_whisper import paths
+        from debora_whisper import paths, platforms
         try:
             paths.VOICES_DIR.mkdir(parents=True, exist_ok=True)
-            os.startfile(paths.VOICES_DIR)
+            platforms.current().open_folder(paths.VOICES_DIR)
         except OSError as e:
             self.update_status(f"Cannot open {paths.VOICES_DIR}: {e}", "#FF453A")
 

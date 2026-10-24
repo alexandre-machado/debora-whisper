@@ -27,6 +27,27 @@ class Platform:
     def stop_keyboard_listener(self, keyboard, *, final=False):
         """No owned native listener to stop on this platform."""
 
+    def apply_config(self, config):
+        """Settings for this provider, from the app's config."""
+        pass
+
+    def keyboard(self):
+        """The keyboard-package API for hotkeys and keys (the package itself)."""
+        import keyboard
+        return keyboard
+
+    def close(self):
+        """Release what the provider holds, at shutdown."""
+        pass
+
+    def tray_icon_class(self):
+        """A pystray.Icon replacement for this desktop, or None for pystray's."""
+        return None
+
+    def handle_termination(self):
+        """Make the OS's "please quit" a Ctrl+C, so shutdown code runs."""
+        pass
+
     def type_text(self, text: str, auto_enter: bool = False):
         """Keep the portable clipboard/keyboard path; native support is unknown."""
         from debora_whisper.platforms import windows_text
@@ -94,9 +115,27 @@ class Platform:
         path = Path(found).resolve()
         return None if path.parent == Path.cwd().resolve() else str(path)
 
+    # Where pip's nvidia-* wheels keep the libraries add_library_dir loads.
+    library_dir_names = ("bin",)
+
     def add_library_dir(self, path):
         """Extra library directories are only needed on Windows today."""
         pass
+
+    def claim_single_instance(self, name: str) -> bool:
+        """False when another process already holds `name`; unknown: True."""
+        return True
+
+    def boot_time(self):
+        """When the system last started (seconds since the epoch), or None."""
+        return None
+
+    def open_folder(self, path):
+        """Show `path` in the file manager; OSError when that is unknown."""
+        import os
+        if not hasattr(os, "startfile"):
+            raise OSError("no file manager known on this system")
+        os.startfile(path)
 
     def kill_tree(self, process):
         """Kill a running process, without waiting for it."""

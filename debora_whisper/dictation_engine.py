@@ -757,12 +757,8 @@ def record_device_failure(device: str, exc: BaseException) -> dict:
 
 
 def _boot_time() -> float | None:
-    """When Windows last started (seconds since the epoch), or None."""
-    if sys.platform != "win32":
-        return None
-    import ctypes
-    ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_uint64
-    return time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000
+    """When the system last started (seconds since the epoch), or None."""
+    return platforms.current().boot_time()
 
 
 def remember_npu_loss(detail: str):
@@ -868,18 +864,18 @@ class FasterWhisperCUDA:
     def _load_pipeline(self):
         ensure_devices_usable()
         
-        # On Windows, CTranslate2 needs to find the CUDA runtime DLLs (cublas, cudnn).
+        # CTranslate2 needs to find the CUDA runtime libraries (cublas, cudnn).
         # If installed via pip (nvidia-cublas-cu12, nvidia-cudnn-cu12), we must explicitly
-        # add them to the DLL search path.
+        # add them to the search path: DLLs in bin/ on Windows, .so files in lib/ on Linux.
         try:
             import site
             for site_pkg in site.getsitepackages():
                 nvidia_base = Path(site_pkg) / "nvidia"
                 if nvidia_base.exists():
                     for lib_dir in nvidia_base.iterdir():
-                        bin_path = lib_dir / "bin"
-                        if bin_path.exists():
-                            platforms.current().add_library_dir(bin_path)
+                        for sub in platforms.current().library_dir_names:
+                            if (lib_dir / sub).exists():
+                                platforms.current().add_library_dir(lib_dir / sub)
         except Exception as e:
             log(f"Warning: Failed to inject NVIDIA DLL paths: {e}")
 
@@ -2591,6 +2587,7 @@ class DictationApp:
     def __init__(self, config: dict):
         self.config = config
         allocation.configure(config, log)
+        platforms.current().apply_config(config)
         if not config.get("save_last_recording"):
             discard_last_recording()
         self.recorder = AudioRecorder(
@@ -3667,7 +3664,7 @@ class DictationApp:
     def _watch_key(self, press_time, starter=None):
         """Wait for the hotkey release, then settle what a starting press
         meant: held = push-to-talk (stop and transcribe), tap = tap_action."""
-        import keyboard
+        keyboard = platforms.current().keyboard()
         while self._hotkey_released_at is None and keyboard.is_pressed(self.config["hotkey"]):
             if self._stopping.wait(0.05):
                 self._hotkey_held = False
@@ -3771,7 +3768,7 @@ class DictationApp:
         Use this from GUI mode instead of ``run()`` — does NOT call
         ``keyboard.wait()``, so the caller's main loop stays in control.
         """
-        import keyboard
+        keyboard = platforms.current().keyboard()
 
         self._start_hotkeys(keyboard)
 
@@ -3828,7 +3825,7 @@ class DictationApp:
                 self._hook_watchdog.start()
 
     def _recover_hotkeys(self):
-        import keyboard
+        keyboard = platforms.current().keyboard()
         with self._hotkey_lock:
             if self._stopping.is_set():
                 return False
@@ -4064,7 +4061,7 @@ class DictationApp:
         with self._output_lock:
             self._stopping.set()
         try:
-            import keyboard
+            keyboard = platforms.current().keyboard()
             with self._hotkey_lock:
                 keyboard.unhook_all()
                 platforms.current().stop_keyboard_listener(keyboard)
@@ -4089,11 +4086,12 @@ class DictationApp:
         except Exception:
             pass
 
+        platforms.current().close()
         log("Engine stopped.")
 
     def run(self):
         """Run the main application loop with global hotkey (CLI mode)."""
-        import keyboard
+        keyboard = platforms.current().keyboard()
 
         hotkey = self.config["hotkey"]
 
@@ -4269,6 +4267,7 @@ def main():
         apply_device_priority(config)
     avoid_lost_npu(config)
 
+    platforms.current().handle_termination()
     app = DictationApp(config)
     app.warm_voice_chat = warm_voice_chat
     app.run()

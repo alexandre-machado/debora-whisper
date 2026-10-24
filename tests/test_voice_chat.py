@@ -1889,6 +1889,7 @@ def test_switching_off_stops_the_reply_and_forgets_the_conversation():
 
 
 @pytest.mark.parametrize("readable", [True, False], ids=["verified", "backspace"])
+@pytest.mark.usefixtures("windows_text_provider")
 def test_sentence_typed_as_dictation_goes_to_the_llm_after_the_switch(typed, monkeypatch, readable):
     app = _app(voice_chat=False, continuous_listening=True, inline_drafts=True)
     monkeypatch.setattr(de.platforms.current(), "text_before_caret",
