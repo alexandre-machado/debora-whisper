@@ -208,12 +208,15 @@ def test_engine_installs_and_reinstalls_hotkeys_on_evdev(module_listener, monkey
 # -- keyboards are never left grabbed or blocked ------------------------------
 
 class Device:
-    def __init__(self, held=()):
-        self.name, self.held = "AT keyboard", list(held)
+    def __init__(self, held=(), queued=()):
+        self.name, self.held, self.queued = "AT keyboard", list(held), list(queued)
         self.ungrab, self.grab, self.close = Mock(), Mock(), Mock()
 
     def active_keys(self):
         return self.held
+
+    def read_one(self):
+        return self.queued.pop(0) if self.queued else None
 
 
 def test_a_held_key_defers_the_grab_without_blocking(listener, monkeypatch):
@@ -288,6 +291,27 @@ def test_suspend_gives_keyboards_back_and_resume_grabs_them(listener, monkeypatc
     assert listener._devices["/dev/input/event9"] == (device, None)
     listener.resume()
     regrab.assert_called_once_with()
+
+
+def test_resume_drops_keys_typed_while_stopped(listener, monkeypatch):
+    monkeypatch.setattr(listener, "_regrab", Mock())
+    device = Device(held=[e.KEY_LEFTSHIFT],
+                    queued=[key(e.KEY_LEFTCTRL, 1), key(e.KEY_SPACE, 1)])
+    listener._devices["/dev/input/event9"] = (device, None)
+    listener._pressed = {e.KEY_LEFTCTRL}  # its release went to the shell
+    listener._suppressed = {e.KEY_SPACE}
+    listener.resume()
+    assert device.queued == []
+    assert listener._pressed == {e.KEY_LEFTSHIFT}
+    assert listener._suppressed == set()
+
+
+def test_close_waits_for_the_callback_worker(monkeypatch):
+    listener = lk._Listener()
+    worker = Mock()
+    listener._worker = worker
+    listener.close()
+    worker.join.assert_called_once_with(1)
 
 
 def test_resume_without_suppressed_hotkeys_grabs_nothing(listener, monkeypatch):

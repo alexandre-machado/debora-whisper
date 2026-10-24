@@ -72,22 +72,27 @@ def default_sink_headphones():
     return None
 
 
+_STOP_SIGNALS = ("SIGTSTP", "SIGTTIN", "SIGTTOU")
+
+
 def _stop_without_keyboards(signum, frame):
-    """SIGTSTP: give the keyboards back, then stop as the default action would."""
+    """SIGTSTP/SIGTTIN/SIGTTOU: give the keyboards back, then stop as the
+    default action would."""
     import signal
     try:
         from debora_whisper.platforms import linux_keyboard
         linux_keyboard.suspend()
     except Exception:
         pass  # stopping must not depend on the keyboard module
-    signal.signal(signal.SIGTSTP, signal.SIG_DFL)
-    os.kill(os.getpid(), signal.SIGTSTP)
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
 
 
 def _grab_keyboards_again(signum, frame):
-    """SIGCONT: rearm the SIGTSTP handler and grab the keyboards again."""
+    """SIGCONT: rearm the stop handlers and grab the keyboards again."""
     import signal
-    signal.signal(signal.SIGTSTP, _stop_without_keyboards)
+    for name in _STOP_SIGNALS:
+        signal.signal(getattr(signal, name), _stop_without_keyboards)
     try:
         from debora_whisper.platforms import linux_keyboard
         linux_keyboard.resume()
@@ -169,7 +174,8 @@ class LinuxPlatform(Platform):
             signal.signal(getattr(signal, name), signal.default_int_handler)
         # A stopped process (Ctrl+Z on debora-cli) would keep the keyboards
         # grabbed with nothing forwarding them. SIGSTOP can't be caught.
-        signal.signal(signal.SIGTSTP, _stop_without_keyboards)
+        for name in _STOP_SIGNALS:
+            signal.signal(getattr(signal, name), _stop_without_keyboards)
         signal.signal(signal.SIGCONT, _grab_keyboards_again)
 
     def close(self):

@@ -92,10 +92,12 @@ def test_level_zero_is_kept_from_crashing_without_an_npu(monkeypatch, accel, pre
     assert os.environ.get("ZE_ENABLE_ALT_DRIVERS") == expected
 
 
-def test_ctrl_z_releases_keyboards_and_sigcont_grabs_them_again(monkeypatch):
+@pytest.mark.parametrize("name", ["SIGTSTP", "SIGTTIN", "SIGTTOU"])
+def test_a_stop_releases_keyboards_and_sigcont_grabs_them_again(monkeypatch, name):
     import signal
     from unittest.mock import Mock
     from debora_whisper.platforms import linux_keyboard
+    stop = getattr(signal, name)
     handlers, sent = {}, []
     monkeypatch.setattr(signal, "signal", lambda sig, handler: handlers.__setitem__(sig, handler))
     monkeypatch.setattr(linux_platform.os, "kill", lambda pid, sig: sent.append(sig))
@@ -104,11 +106,11 @@ def test_ctrl_z_releases_keyboards_and_sigcont_grabs_them_again(monkeypatch):
     monkeypatch.setattr(linux_keyboard, "resume", resume)
 
     LinuxPlatform().handle_termination()
-    handlers[signal.SIGTSTP](signal.SIGTSTP, None)
+    handlers[stop](stop, None)
     suspend.assert_called_once_with()
-    assert handlers[signal.SIGTSTP] is signal.SIG_DFL
-    assert sent == [signal.SIGTSTP]
+    assert handlers[stop] is signal.SIG_DFL
+    assert sent == [stop]
 
     handlers[signal.SIGCONT](signal.SIGCONT, None)
     resume.assert_called_once_with()
-    assert handlers[signal.SIGTSTP] is linux_platform._stop_without_keyboards
+    assert handlers[stop] is linux_platform._stop_without_keyboards

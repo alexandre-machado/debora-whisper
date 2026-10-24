@@ -322,8 +322,21 @@ class _Listener:
                 self._ungrab(path)
 
     def resume(self):
-        """Grab the keyboards again after SIGCONT."""
+        """Grab the keyboards again after SIGCONT.
+
+        Keys typed while stopped went to the shell; replaying them would
+        fire a hotkey late. Drop them and take the held keys from the
+        devices themselves, in case their buffers overflowed."""
         with self._lock:
+            self._pressed.clear()
+            self._suppressed.clear()
+            for device, _mirror in self._devices.values():
+                try:
+                    while device.read_one() is not None:
+                        pass
+                    self._pressed.update(device.active_keys())
+                except OSError:
+                    pass  # unplugged: the reader drops it
             if self._grab:
                 self._regrab()
 
@@ -375,6 +388,10 @@ class _Listener:
             self._grab = False
             self._thread = None
         self._calls.put(None)
+        # A restart right after this must not reuse a worker about to exit.
+        worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(1)
 
     # -- event loop ----------------------------------------------------
 
