@@ -189,6 +189,7 @@ class _Listener:
         self._thread = None
         self._worker = None
         self._grab = False
+        self._suspended = False  # between SIGTSTP and resume()
         self.error = None
 
     # -- registration --------------------------------------------------
@@ -318,6 +319,7 @@ class _Listener:
         """Give every keyboard back before the process stops (Ctrl+Z, SIGTSTP):
         a stopped reader forwards nothing, VT switching and SysRq included."""
         with self._lock:
+            self._suspended = True
             for path in list(self._devices):
                 self._ungrab(path)
 
@@ -337,6 +339,7 @@ class _Listener:
                     self._pressed.update(device.active_keys())
                 except OSError:
                     pass  # unplugged: the reader drops it
+            self._suspended = False
             if self._grab:
                 self._regrab()
 
@@ -426,6 +429,10 @@ class _Listener:
                         continue
                     except OSError:  # unplugged
                         self._drop(path)
+                        continue
+                    if self._suspended:
+                        # SIGCONT woke this thread before resume() ran: the
+                        # keys were typed in the shell, not for the app.
                         continue
                     for event in events:
                         forward = self._handle(event)

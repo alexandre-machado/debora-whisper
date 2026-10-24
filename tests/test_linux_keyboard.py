@@ -306,6 +306,18 @@ def test_resume_drops_keys_typed_while_stopped(listener, monkeypatch):
     assert listener._suppressed == set()
 
 
+def test_reader_woken_before_resume_ignores_keys_typed_while_stopped(listener, monkeypatch):
+    fired = []
+    listener.add_hotkey("ctrl+space", lambda: fired.append(True), suppress=True)
+    listener.suspend()
+    run_reader(listener, monkeypatch, Device(), None,
+               [key(e.KEY_LEFTCTRL, 1), key(e.KEY_SPACE, 1)])
+    assert listener._calls.empty() and not fired
+    assert listener._pressed == set()
+    listener.resume()
+    assert not listener._suspended
+
+
 def test_close_waits_for_the_callback_worker(monkeypatch):
     listener = lk._Listener()
     worker = Mock()
