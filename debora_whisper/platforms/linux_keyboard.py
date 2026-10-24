@@ -251,9 +251,12 @@ class _Listener:
                     "'input' group (sudo usermod -aG input $USER) and log in again.")
             self._thread = threading.Thread(target=self._run, name="evdev-keyboard", daemon=True)
             self._thread.start()
-            self._worker = threading.Thread(target=self._dispatch, name="evdev-callbacks",
-                                            daemon=True)
-            self._worker.start()
+            # A reader that crashed leaves its worker running: a second one on
+            # the same queue would run callbacks out of order.
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(target=self._dispatch, name="evdev-callbacks",
+                                                daemon=True)
+                self._worker.start()
 
     def _scan(self):
         """Open keyboards plugged in since the last scan."""
@@ -310,6 +313,19 @@ class _Listener:
     def _regrab(self):
         for path in list(self._devices):
             self._grab_device(path)
+
+    def suspend(self):
+        """Give every keyboard back before the process stops (Ctrl+Z, SIGTSTP):
+        a stopped reader forwards nothing, VT switching and SysRq included."""
+        with self._lock:
+            for path in list(self._devices):
+                self._ungrab(path)
+
+    def resume(self):
+        """Grab the keyboards again after SIGCONT."""
+        with self._lock:
+            if self._grab:
+                self._regrab()
 
     def _ungrab(self, path, reason=None):
         """Give the device back to the desktop and keep reading it."""
@@ -586,6 +602,14 @@ def release(hotkey):
 
 
 press_and_release = send
+
+
+def suspend():
+    _listener.suspend()
+
+
+def resume():
+    _listener.resume()
 
 
 def last_error():

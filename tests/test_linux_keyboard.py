@@ -274,3 +274,48 @@ def test_a_crashing_reader_releases_every_keyboard(listener, monkeypatch):
 def test_an_event_bug_still_forwards_the_key(listener, monkeypatch):
     monkeypatch.setattr(listener, "_track", Mock(side_effect=RuntimeError("bug")))
     assert listener._handle(key(e.KEY_A, 1)) is True
+
+
+def test_suspend_gives_keyboards_back_and_resume_grabs_them(listener, monkeypatch):
+    device, mirror = Device(), Mock()
+    regrab = Mock()
+    monkeypatch.setattr(listener, "_regrab", regrab)
+    listener._devices["/dev/input/event9"] = (device, mirror)
+    listener._grab = True
+    listener.suspend()
+    device.ungrab.assert_called_once_with()
+    mirror.close.assert_called_once_with()
+    assert listener._devices["/dev/input/event9"] == (device, None)
+    listener.resume()
+    regrab.assert_called_once_with()
+
+
+def test_resume_without_suppressed_hotkeys_grabs_nothing(listener, monkeypatch):
+    regrab = Mock()
+    monkeypatch.setattr(listener, "_regrab", regrab)
+    listener.resume()
+    regrab.assert_not_called()
+
+
+def test_restarted_reader_reuses_the_live_callback_worker(monkeypatch):
+    listener = lk._Listener()
+    monkeypatch.setattr(listener, "_scan", lambda: listener._devices.setdefault(
+        "/dev/input/event9", (Device(), None)))
+    started = []
+
+    class Thread:
+        def __init__(self, target, name, daemon):
+            self.name, self.alive = name, False
+
+        def start(self):
+            self.alive = True
+            started.append(self.name)
+
+        def is_alive(self):
+            return self.alive
+
+    monkeypatch.setattr(lk.threading, "Thread", Thread)
+    listener._ensure_running()
+    listener._thread.alive = False  # the reader crashed; its worker lives on
+    listener._ensure_running()
+    assert started == ["evdev-keyboard", "evdev-callbacks", "evdev-keyboard"]

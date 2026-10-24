@@ -72,6 +72,29 @@ def default_sink_headphones():
     return None
 
 
+def _stop_without_keyboards(signum, frame):
+    """SIGTSTP: give the keyboards back, then stop as the default action would."""
+    import signal
+    try:
+        from debora_whisper.platforms import linux_keyboard
+        linux_keyboard.suspend()
+    except Exception:
+        pass  # stopping must not depend on the keyboard module
+    signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGTSTP)
+
+
+def _grab_keyboards_again(signum, frame):
+    """SIGCONT: rearm the SIGTSTP handler and grab the keyboards again."""
+    import signal
+    signal.signal(signal.SIGTSTP, _stop_without_keyboards)
+    try:
+        from debora_whisper.platforms import linux_keyboard
+        linux_keyboard.resume()
+    except Exception:
+        pass
+
+
 class LinuxPlatform(Platform):
     name = "linux"
 
@@ -144,6 +167,10 @@ class LinuxPlatform(Platform):
         import signal
         for name in ("SIGTERM", "SIGHUP"):
             signal.signal(getattr(signal, name), signal.default_int_handler)
+        # A stopped process (Ctrl+Z on debora-cli) would keep the keyboards
+        # grabbed with nothing forwarding them. SIGSTOP can't be caught.
+        signal.signal(signal.SIGTSTP, _stop_without_keyboards)
+        signal.signal(signal.SIGCONT, _grab_keyboards_again)
 
     def close(self):
         if self._focus is not None:

@@ -90,7 +90,10 @@ the app in focus.
 > **Security:** the app itself needs no root, but these permissions are broad.
 > Membership in the `input` group lets **every program you run** read every
 > key you type, passwords and the lock screen included, with no prompt; on
-> Wayland that is otherwise reserved to the compositor. Write access to
+> Wayland that is otherwise reserved to the compositor. The group can also
+> write to `/dev/input/event*`, so those programs can inject input too, and
+> it applies in every session of that user (SSH or a second seat included),
+> not only the one at the local seat. Write access to
 > `/dev/uinput` lets a program type and click as you. The rule above grants it
 > through `uaccess` only to the user at the local seat, while logged in, which
 > is narrower than giving the `input` group write access; do not do the

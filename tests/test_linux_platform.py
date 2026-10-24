@@ -90,3 +90,25 @@ def test_level_zero_is_kept_from_crashing_without_an_npu(monkeypatch, accel, pre
         monkeypatch.setenv("ZE_ENABLE_ALT_DRIVERS", preset)
     linux_platform.avoid_level_zero_crash()
     assert os.environ.get("ZE_ENABLE_ALT_DRIVERS") == expected
+
+
+def test_ctrl_z_releases_keyboards_and_sigcont_grabs_them_again(monkeypatch):
+    import signal
+    from unittest.mock import Mock
+    from debora_whisper.platforms import linux_keyboard
+    handlers, sent = {}, []
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: handlers.__setitem__(sig, handler))
+    monkeypatch.setattr(linux_platform.os, "kill", lambda pid, sig: sent.append(sig))
+    suspend, resume = Mock(), Mock()
+    monkeypatch.setattr(linux_keyboard, "suspend", suspend)
+    monkeypatch.setattr(linux_keyboard, "resume", resume)
+
+    LinuxPlatform().handle_termination()
+    handlers[signal.SIGTSTP](signal.SIGTSTP, None)
+    suspend.assert_called_once_with()
+    assert handlers[signal.SIGTSTP] is signal.SIG_DFL
+    assert sent == [signal.SIGTSTP]
+
+    handlers[signal.SIGCONT](signal.SIGCONT, None)
+    resume.assert_called_once_with()
+    assert handlers[signal.SIGTSTP] is linux_platform._stop_without_keyboards
