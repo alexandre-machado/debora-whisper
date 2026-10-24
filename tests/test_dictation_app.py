@@ -210,7 +210,7 @@ class TestTranscriptionThreading:
                 assert not app.history
                 assert states == [AppState.PROCESSING]
             else:
-                paste.assert_called_once_with('completed speech', auto_enter=False)
+                paste.assert_called_once_with('completed speech ', auto_enter=False)
                 assert states == [AppState.PROCESSING, AppState.READY]
 
 
