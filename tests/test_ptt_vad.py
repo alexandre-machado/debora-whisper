@@ -59,7 +59,7 @@ def test_short_speech_is_typed_without_changing_live_vad_state(app):
 
     app._finish_recording()
 
-    engine.type_text.assert_called_once_with("E aí", auto_enter=False)
+    engine.type_text.assert_called_once_with("E aí ", auto_enter=False)
     assert np.all(vad.state == 7)
     assert np.all(vad.context == 0.25)
 
@@ -80,7 +80,7 @@ def test_missing_vad_keeps_existing_behavior_without_download(
 
     app._finish_recording()
 
-    engine.type_text.assert_called_once_with("E aí", auto_enter=False)
+    engine.type_text.assert_called_once_with("E aí ", auto_enter=False)
     constructor.assert_not_called()
 
 
@@ -145,7 +145,7 @@ def test_vad_failure_keeps_existing_behavior(app, monkeypatch, failure):
 
     app._finish_recording()
 
-    engine.type_text.assert_called_once_with("E aí", auto_enter=False)
+    engine.type_text.assert_called_once_with("E aí ", auto_enter=False)
     assert not app._transcribing
 
 
