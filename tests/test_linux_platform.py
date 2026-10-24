@@ -100,17 +100,23 @@ def test_a_stop_releases_keyboards_and_sigcont_grabs_them_again(monkeypatch, nam
     stop = getattr(signal, name)
     handlers, sent = {}, []
     monkeypatch.setattr(signal, "signal", lambda sig, handler: handlers.__setitem__(sig, handler))
-    monkeypatch.setattr(linux_platform.os, "kill", lambda pid, sig: sent.append(sig))
     suspend, resume = Mock(), Mock()
     monkeypatch.setattr(linux_keyboard, "suspend", suspend)
     monkeypatch.setattr(linux_keyboard, "resume", resume)
 
+    def kill(pid, sig):
+        assert handlers[sig] is signal.SIG_DFL  # stops as the default would
+        sent.append(sig)
+    monkeypatch.setattr(linux_platform.os, "kill", kill)
+
     LinuxPlatform().handle_termination()
     handlers[stop](stop, None)
     suspend.assert_called_once_with()
-    assert handlers[stop] is signal.SIG_DFL
     assert sent == [stop]
-
-    handlers[signal.SIGCONT](signal.SIGCONT, None)
+    # Back from the stop (or the kernel discarded it): rearmed and grabbing.
     resume.assert_called_once_with()
+    assert handlers[stop] is linux_platform._stop_without_keyboards
+
+    handlers[signal.SIGCONT](signal.SIGCONT, None)  # idempotent
+    assert resume.call_count == 2
     assert handlers[stop] is linux_platform._stop_without_keyboards

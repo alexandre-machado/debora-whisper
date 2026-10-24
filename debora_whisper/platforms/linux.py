@@ -86,6 +86,9 @@ def _stop_without_keyboards(signum, frame):
         pass  # stopping must not depend on the keyboard module
     signal.signal(signum, signal.SIG_DFL)
     os.kill(os.getpid(), signum)
+    # Running again: continued, or the kernel discarded the stop (orphaned
+    # process group) and no SIGCONT will come. Either way, take them back.
+    _grab_keyboards_again(signal.SIGCONT, frame)
 
 
 def _grab_keyboards_again(signum, frame):

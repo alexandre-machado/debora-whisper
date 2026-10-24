@@ -318,6 +318,16 @@ def test_reader_woken_before_resume_ignores_keys_typed_while_stopped(listener, m
     assert not listener._suspended
 
 
+def test_keyboard_plugged_in_while_suspended_is_not_grabbed(listener, monkeypatch):
+    monkeypatch.setattr(lk.evdev.UInput, "from_device", Mock(return_value=Mock()))
+    device = Device()
+    listener._devices["/dev/input/event9"] = (device, None)
+    listener.suspend()
+    listener._grab_device("/dev/input/event9")
+    device.grab.assert_not_called()
+    assert listener._devices["/dev/input/event9"] == (device, None)
+
+
 def test_close_waits_for_the_callback_worker(monkeypatch):
     listener = lk._Listener()
     worker = Mock()

@@ -288,8 +288,8 @@ class _Listener:
         (it never sees their release), so a device with keys down is left
         pending; the reader retries it without blocking the other keyboards."""
         device, mirror = self._devices[path]
-        if mirror is not None:
-            return
+        if mirror is not None or self._suspended:
+            return  # while suspended nothing would forward it; resume() grabs it
         try:
             held = device.active_keys()
         except OSError:
