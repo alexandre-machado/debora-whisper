@@ -1,6 +1,9 @@
 """Native Windows hotkey contracts without real hooks, windows or key input."""
 import ctypes
+import importlib
+import json
 import queue
+import sys
 import threading
 from unittest.mock import Mock, call, patch
 
@@ -18,6 +21,8 @@ from debora_whisper.platforms.windows import WindowsPlatform
     ("windows+7", wh.MOD_WIN, ord("7")),
     ("control+page down", wh.MOD_CONTROL, 0x22),
     ("f24", 0, 0x87),
+    ("f12", 0, 0x7b),
+    ("ctrl+f12", wh.MOD_CONTROL, 0x7b),
     ("shift+escape", wh.MOD_SHIFT, 0x1b),
     ("ctrl+;", wh.MOD_CONTROL, 0xba),
     ("ctrl+.", wh.MOD_CONTROL, 0xbe),
@@ -27,6 +32,9 @@ from debora_whisper.platforms.windows import WindowsPlatform
     ("alt+num 0", wh.MOD_ALT, 0x60),
     ("ctrl+menu", wh.MOD_CONTROL, 0x5d),
     ("ctrl+apps", wh.MOD_CONTROL, 0x5d),
+    ("scroll lock", 0, 0x91),
+    ("pause", 0, 0x13),
+    ("ctrl+break", wh.MOD_CONTROL, 0x03),
 ])
 def test_hotkey_maps_to_modifiers_and_vk(native_api, hotkey, modifiers, vk):
     assert wh.parse_hotkey(hotkey) == (modifiers | wh.MOD_NOREPEAT, vk)
@@ -38,7 +46,7 @@ def test_hotkey_maps_to_modifiers_and_vk(native_api, hotkey, modifiers, vk):
     ("", "one chord"), (None, "one chord"),
     ("ctrl+", "unsupported key"), ("ctrl+not-a-key", "unsupported key"),
     ("ctrl+f25", "unsupported key"), ("right ctrl+space", "left/right"),
-    ("ctrl+f12", "reserved"), ("right alt", "left/right"),
+    ("right alt", "left/right"),
     ("ctrl+left control", "non-modifier"),
 ])
 def test_unmappable_hotkeys_fail_clearly(native_api, hotkey, reason):
@@ -96,6 +104,84 @@ def service(hotkey="ctrl+space", voice_key="right alt", **callbacks):
 
 def key(vk, scan, flags=0):
     return wh.RAWKEYBOARD(MakeCode=scan, VKey=vk, Flags=flags)
+
+
+@pytest.mark.parametrize("dedicated", [True, False])
+def test_abnt2_slash_never_registers_ctrl_q(native_api, dedicated):
+    api, messages = native_api
+    api.VkKeyScanW.side_effect = lambda char: 0x600 | ord("Q")
+    api.MapVirtualKeyW.side_effect = lambda code, mode: {
+        (0x10, wh.MAPVK_VSC_TO_VK_EX): ord("Q"),
+        (0x73, wh.MAPVK_VSC_TO_VK_EX): 0xc1,
+        (ord("Q"), wh.MAPVK_VK_TO_CHAR): ord("Q"),
+        (0xc1, wh.MAPVK_VK_TO_CHAR): ord("/"),
+    }.get((code, mode), 0)
+    scans = (0x10, 0x73) if dedicated else (0x10,)
+    log = Mock()
+    with patch("keyboard.key_to_scan_codes", return_value=scans):
+        hotkeys = service(hotkey="ctrl+/", voice_key="", log=log)
+    messages.put((0, 0))
+    hotkeys._run()
+    if dedicated:
+        api.RegisterHotKey.assert_called_once_with(
+            None, wh.HOTKEY_ID, wh.MOD_CONTROL | wh.MOD_NOREPEAT, 0xc1)
+    else:
+        api.RegisterHotKey.assert_not_called()
+        assert "key '/' requires extra modifiers" in log.call_args.args[0]
+
+
+def test_abnt2_question_mark_rejects_all_modified_routes(native_api):
+    api, _ = native_api
+    api.VkKeyScanW.side_effect = lambda char: 0x600 | ord("W")
+    api.MapVirtualKeyW.side_effect = lambda code, mode: {
+        (0x11, wh.MAPVK_VSC_TO_VK_EX): ord("W"),
+        (0x73, wh.MAPVK_VSC_TO_VK_EX): 0xc1,
+        (ord("W"), wh.MAPVK_VK_TO_CHAR): ord("W"),
+        (0xc1, wh.MAPVK_VK_TO_CHAR): ord("/"),
+    }.get((code, mode), 0)
+    with patch("keyboard.key_to_scan_codes", return_value=(0x11, 0x73)), \
+            pytest.raises(ValueError, match=r"key '\?' requires extra modifiers"):
+        wh.parse_hotkey("ctrl+?")
+    api.RegisterHotKey.assert_not_called()
+
+
+@pytest.mark.parametrize("character", ["\U0001f600", "\U00010400", "\ud800"])
+def test_non_bmp_or_surrogate_key_is_a_value_error(native_api, character):
+    api, _ = native_api
+    with pytest.raises(ValueError, match="unsupported key.*BMP"):
+        wh.parse_hotkey("ctrl+" + character)
+    log = Mock()
+    hotkeys = service(hotkey="ctrl+" + character, voice_key=character, log=log)
+    assert hotkeys._vk is None and hotkeys._solo is None
+    assert log.call_count == 2
+    api.VkKeyScanW.assert_not_called()
+
+
+@pytest.mark.parametrize("name,vk", [("scroll lock", 0x91), ("pause", 0x13),
+                                   ("num lock", 0x90), ("print screen", 0x2c)])
+def test_special_keys_do_not_use_ambiguous_scan_mapping(native_api, name, vk):
+    api, _ = native_api
+    api.MapVirtualKeyW.side_effect = None
+    api.MapVirtualKeyW.return_value = 0x03
+    with patch("keyboard.key_to_scan_codes", return_value=(0x46,)) as lookup:
+        assert wh.key_to_vk(name) == vk
+    lookup.assert_not_called()
+    api.MapVirtualKeyW.assert_not_called()
+
+
+def test_f12_registration_failure_is_logged_without_stopping(native_api):
+    api, messages = native_api
+    api.RegisterHotKey.return_value = False
+    messages.put((0, 0))
+    log = Mock()
+    hotkeys = service(hotkey="f12", log=log)
+    log.assert_not_called()
+    hotkeys._run()
+    api.RegisterHotKey.assert_called_once_with(None, wh.HOTKEY_ID, wh.MOD_NOREPEAT, 0x7b)
+    assert any("RegisterHotKey failed" in entry.args[0] and "F12" in entry.args[0]
+               for entry in log.call_args_list)
+    assert any("Voice chat hotkey" in entry.args[0] for entry in log.call_args_list)
+    assert not hotkeys._registered and hotkeys._ready.is_set()
 
 
 def test_owner_thread_registers_dispatches_and_unregisters(native_api):
@@ -195,6 +281,54 @@ def test_poll_release_settles_hold_without_keyboard_listener(native_api):
             app._watch_key(100.0, Mock())
         finish.assert_called_once_with()
         old_poll.assert_not_called()
+    finally:
+        app.stop_monitoring()
+
+
+@pytest.mark.parametrize("released_vk,scan", [(0x20, 57), (0x11, 29)])
+def test_device_less_release_is_settled_by_polling(native_api, released_vk, scan):
+    api, _ = native_api
+    app = de.DictationApp({**de.DEFAULT_CONFIG, "beep_on_start": False})
+    app.stop_monitoring()
+    app._stopping.clear()
+    hotkeys = service(on_release=app._release_hotkey)
+    app._native_hotkeys = hotkeys
+    hotkeys._registered = True
+    app._hotkey_held = True
+    held = {0x20, 0xa2}
+    api.GetAsyncKeyState.side_effect = lambda vk: 0x8000 if vk in held else 0
+    event = key(released_vk, scan, wh.RI_KEY_BREAK)
+    header = wh.RAWINPUTHEADER(dwType=1, hDevice=0,
+                               dwSize=ctypes.sizeof(wh.RAWINPUTHEADER) + ctypes.sizeof(event))
+    data = bytes(header) + bytes(event)
+
+    def read(handle, command, buffer, size, header_size):
+        size._obj.value = len(data)
+        if buffer is None:
+            return 0
+        ctypes.memmove(buffer, data, len(data))
+        return len(data)
+
+    def release(timeout):
+        assert timeout == 0.05
+        held.remove(0xa2 if released_vk == 0x11 else released_vk)
+        hotkeys._window_proc(123, wh.WM_INPUT, 1, 77)
+        assert app._hotkey_released_at is None  # Raw Input was discarded.
+        return False
+
+    api.GetRawInputData.side_effect = read
+    starter = Mock()
+    try:
+        with patch.object(app._stopping, "wait", side_effect=release) as wait, \
+                patch.object(de.time, "time", return_value=101.0), \
+                patch.object(app, "_finish_recording") as finish, \
+                patch("keyboard.is_pressed") as old_poll:
+            app._watch_key(100.0, starter)
+        wait.assert_called_once_with(0.05)
+        starter.join.assert_called_once_with()
+        finish.assert_called_once_with()
+        old_poll.assert_not_called()
+        assert not app._hotkey_held
     finally:
         app.stop_monitoring()
 
@@ -491,13 +625,89 @@ def test_stop_finishes_teardown_before_logging_hotkey_timeout(native_api):
         app.stop_monitoring()
 
 
-def test_settings_shows_unmappable_hotkey_before_saving(native_api, monkeypatch):
+@pytest.fixture(params=["debora_whisper.app", "debora_whisper.dictation_engine"])
+def entrypoint(request, native_api, monkeypatch, tmp_path):
+    module = importlib.import_module(request.param)
+    provider = WindowsPlatform()
+    monkeypatch.setattr(provider, "handle_termination", Mock())
+    monkeypatch.setattr(de.platforms, "current", lambda: provider)
+    monkeypatch.setattr(de, "CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr(sys, "argv", ["debora", "--device", "CPU"])
+    for name in ("log_folder_moves", "rotate_logs", "log_hardware_inventory", "avoid_lost_npu"):
+        monkeypatch.setattr(module, name, Mock(return_value=False))
+    factory = Mock()
+    if request.param.endswith(".app"):
+        monkeypatch.setattr(module, "_claim_single_instance", lambda: True)
+        monkeypatch.setattr(module, "GUIApp", factory)
+    else:
+        monkeypatch.setattr(module, "DictationApp", factory)
+    return module, factory
+
+
+@pytest.mark.parametrize("hotkey", ["right ctrl", "ctrl+a, b", "ctrl+not-a-key", "f12",
+                                   "ctrl+\U0001f600"])
+def test_saved_unregistrable_hotkey_does_not_block_startup(entrypoint, hotkey):
+    module, factory = entrypoint
+    de.CONFIG_FILE.write_text(json.dumps({**de.DEFAULT_CONFIG, "hotkey": hotkey}), encoding="utf-8")
+    module.main()
+    assert factory.call_args.args[0]["hotkey"] == hotkey
+    factory.return_value.run.assert_called_once_with()
+
+
+@pytest.mark.parametrize("hotkey", ["right ctrl", "ctrl+a, b", "", "ctrl+\U0001f600"])
+def test_explicit_cli_hotkey_is_validated(entrypoint, hotkey, monkeypatch, capsys):
+    module, factory = entrypoint
+    monkeypatch.setattr(sys, "argv", ["debora", "--hotkey", hotkey])
+    with pytest.raises(SystemExit) as exc:
+        module.main()
+    assert exc.value.code == 2
+    assert "Invalid hotkey" in capsys.readouterr().err
+    factory.assert_not_called()
+
+
+def test_cli_f12_is_left_to_registration(entrypoint, monkeypatch):
+    module, factory = entrypoint
+    monkeypatch.setattr(sys, "argv", ["debora", "--device", "CPU", "--hotkey", "f12"])
+    module.main()
+    assert factory.call_args.args[0]["hotkey"] == "f12"
+    factory.return_value.run.assert_called_once_with()
+
+
+@pytest.mark.parametrize("hotkey", ["right ctrl", "ctrl+a, b", "ctrl+not-a-key"])
+def test_unmappable_hotkey_logs_to_app_log_and_background_start_continues(
+        native_api, monkeypatch, tmp_path, hotkey):
+    api, _ = native_api
+    provider, keyboard = WindowsPlatform(), Mock()
+    monkeypatch.setattr(provider, "keyboard", lambda: keyboard)
+    monkeypatch.setattr(de.platforms, "current", lambda: provider)
+    monkeypatch.setattr(de, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(de, "LOG_FILE", tmp_path / "app.log")
+    config = {**de.DEFAULT_CONFIG, "hotkey": hotkey, "voice_chat": False, "beep_on_start": False}
+    de.validate_config(config)
+    app = de.DictationApp(config)
+    try:
+        with patch.object(app, "_start_loader") as loader, \
+                patch.object(app, "_start_segment_consumer") as consumer:
+            app.start_background()
+        loader.assert_called_once_with()
+        consumer.assert_called_once_with()
+        assert app._native_hotkeys._thread.is_alive()
+        assert app._native_hotkeys._vk is None
+        assert f"Hotkey {hotkey!r} disabled:" in de.LOG_FILE.read_text(encoding="utf-8")
+        api.RegisterHotKey.assert_not_called()
+        keyboard.hook.assert_not_called()
+    finally:
+        app.stop()
+
+
+@pytest.mark.parametrize("hotkey", ["ctrl+not-a-key", "ctrl+\U0001f600"])
+def test_settings_shows_unmappable_hotkey_before_saving(native_api, monkeypatch, hotkey):
     from debora_whisper.ui.settings import SettingsWindow
     monkeypatch.setattr(de.platforms, "current", lambda: WindowsPlatform())
     window = SettingsWindow.__new__(SettingsWindow)
     original = dict(de.DEFAULT_CONFIG)
     window._config = original
-    window._get_new_config = Mock(return_value={**original, "hotkey": "ctrl+not-a-key"})
+    window._get_new_config = Mock(return_value={**original, "hotkey": hotkey})
     window._on_apply = Mock()
     window.update_status = Mock()
     window._apply()

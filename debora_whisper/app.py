@@ -17,7 +17,7 @@ from debora_whisper.dictation_engine import (
     load_config, save_config, start_in_dictation, validate_config, log, create_model,
     is_model_downloaded, device_failure, set_voice_chat_config,
     apply_device_priority, avoid_lost_npu, detect_devices, rotate_logs, log_folder_moves,
-    select_device, log_hardware_inventory,
+    select_device, log_hardware_inventory, validate_hotkey,
 )
 from debora_whisper.npu_probe import probe_npu
 from debora_whisper.ui.tray import TrayManager
@@ -427,6 +427,7 @@ class GUIApp:
     def _on_settings_apply(self, new_config: dict):
         try:
             validate_config(new_config)
+            validate_hotkey(new_config)
         except ValueError as e:
             self._settings_status(str(e), "#FF453A")
             return
@@ -669,8 +670,12 @@ def main():
         config["language"] = args.language
     if args.auto_enter:
         config["auto_enter"] = True
-    if args.hotkey:
+    if args.hotkey is not None:
         config["hotkey"] = args.hotkey
+        try:
+            validate_hotkey(config)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.continuous:
         config["continuous_listening"] = True
     if args.voice_chat:

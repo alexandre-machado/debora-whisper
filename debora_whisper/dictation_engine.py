@@ -358,14 +358,18 @@ def set_voice_chat_config(config: dict, enabled: bool):
     config["voice_chat"] = bool(enabled)
 
 
-def validate_config(config: dict):
-    """Validate config values. Raises ValueError on invalid values."""
+def validate_hotkey(config: dict):
+    """Validate an explicit Settings/CLI choice; saved hotkeys may be disabled at startup."""
     if platforms.current().name == "windows":
         from debora_whisper.platforms.windows_hotkeys import parse_hotkey
         try:
             parse_hotkey(config.get("hotkey", DEFAULT_CONFIG["hotkey"]))
         except ValueError as exc:
             raise ValueError(f"Invalid hotkey: {exc}") from exc
+
+
+def validate_config(config: dict):
+    """Validate config values. Raises ValueError on invalid values."""
     for key in ("inline_drafts", "inline_drafts_require_verification"):
         if not isinstance(config.get(key, False), bool):
             raise ValueError(f"{key} must be a bool")
@@ -4251,8 +4255,12 @@ def main():
         config["language"] = args.language
     if args.auto_enter:
         config["auto_enter"] = True
-    if args.hotkey:
+    if args.hotkey is not None:
         config["hotkey"] = args.hotkey
+        try:
+            validate_hotkey(config)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.continuous:
         config["continuous_listening"] = True
     if args.voice_chat:

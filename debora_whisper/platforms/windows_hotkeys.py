@@ -12,14 +12,15 @@ MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 1, 2, 4, 8, 0x4000
 WM_INPUT, WM_HOTKEY, WM_QUIT = 0x00ff, 0x0312, 0x0012
 RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT = 0x100, 1, 0x10000003
 RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1 = 1, 2, 4
-MAPVK_VSC_TO_VK_EX = 3
+MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK_EX = 2, 3
 HOTKEY_ID = 1
 
 _MODIFIERS = {"alt": MOD_ALT, "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
               "shift": MOD_SHIFT, "win": MOD_WIN, "windows": MOD_WIN}
 _KEYS = {"delete": 0x2e, "insert": 0x2d, "home": 0x24, "end": 0x23, "page up": 0x21,
          "page down": 0x22, "up": 0x26, "down": 0x28, "left": 0x25,
-         "right": 0x27, "num lock": 0x90, "pause": 0x13, "print screen": 0x2c,
+         "right": 0x27, "num lock": 0x90, "scroll lock": 0x91,
+         "pause": 0x13, "break": 0x03, "print screen": 0x2c,
          "menu": 0x5d, "apps": 0x5d,
          **{f"num {n}": 0x60 + n for n in range(10)},
          "multiply": 0x6a, "add": 0x6b, "separator": 0x6c,
@@ -33,6 +34,8 @@ _MODIFIER_KEYS = {MOD_ALT: (0xa4, 0xa5), MOD_CONTROL: (0xa2, 0xa3),
 
 def key_to_vk(key):
     key = key.strip().lower()
+    if any(ord(char) > 0xffff or 0xd800 <= ord(char) <= 0xdfff for char in key):
+        raise ValueError(f"unsupported key {key!r}: Windows hotkeys require BMP characters")
     if key in _KEYS:
         return _KEYS[key]
     if len(key) == 1 and key in "abcdefghijklmnopqrstuvwxyz0123456789":
@@ -40,19 +43,24 @@ def key_to_vk(key):
     if key.startswith("f") and key[1:].isdigit() and 1 <= int(key[1:]) <= 24:
         return 0x70 + int(key[1:]) - 1
     if _user32 is not None and key:
-        # VkKeyScan uses the active layout, including OEM punctuation keys.
-        # Its high byte describes typing modifiers, not hotkey modifiers.
-        if len(key) == 1:
-            mapped = _user32.VkKeyScanW(key)
-            if mapped != -1 and 0 < (mapped & 0xff) < 0xff:
-                return mapped & 0xff
         import keyboard
         # Name table initialization installs no hook. Extended/numpad names
         # above need explicit VKs because this API discards the E0 flag.
         for scan in keyboard.key_to_scan_codes(key, error_if_missing=False):
             vk = -scan if scan < 0 else _user32.MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX)
             if 0 < vk < 0xff:
-                return vk
+                # A character can have several routes: on ABNT2, '/' is both
+                # AltGr+Q and a dedicated key. Accept only an unshifted match.
+                if (len(key) != 1 or
+                        (_user32.MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) & 0xffff) == ord(key)):
+                    return vk
+        if len(key) == 1:
+            mapped = _user32.VkKeyScanW(key)
+            if mapped != -1 and 0 < mapped < 0xff:
+                return mapped
+            if mapped != -1 and mapped & 0xff00:
+                raise ValueError(f"key {key!r} requires extra modifiers on this keyboard layout; "
+                                 "use a key available without modifiers")
     raise ValueError(f"unsupported key {key!r}")
 
 
@@ -73,8 +81,6 @@ def parse_hotkey(hotkey):
         raise ValueError("expected exactly one non-modifier key")
     if keys[0] in (0x10, 0x11, 0x12, *_SIDE_KEYS.values()):
         raise ValueError("expected a non-modifier key; left/right modifiers cannot be the main key")
-    if keys[0] == 0x7b:
-        raise ValueError("F12 is reserved by Windows for the debugger")
     return modifiers | MOD_NOREPEAT, keys[0]
 
 
@@ -204,7 +210,8 @@ class WindowsHotkeys:
             raise RuntimeError("Windows hotkey thread did not stop")
 
     def is_pressed(self):
-        # Also catches releases lost across lock/unlock or device removal.
+        # Also catches releases lost across lock/unlock, device removal, or
+        # hDevice == 0 input, via DictationApp._watch_key's 50 ms polling.
         return (self._registered and bool(_user32.GetAsyncKeyState(self._vk) & 0x8000)
                 and all(any(_user32.GetAsyncKeyState(vk) & 0x8000 for vk in keys)
                         for flag, keys in _MODIFIER_KEYS.items() if self._modifiers & flag))
@@ -258,8 +265,8 @@ class WindowsHotkeys:
             # adjacent LCtrl make (1D), then RAlt make (E0 38), from the same
             # device with the SAME GetMessageTime. A previously held Ctrl or
             # one with a different timestamp remains a real chord modifier.
-            # Identical physical events within one Windows clock tick are
-            # indistinguishable here; do not use processing-time thresholds.
+            # Physical Ctrl then Right Alt within one ~15.6 ms timer tick
+            # can look like AltGr; do not use processing-time thresholds.
             if (vk == 0xa5 and key.MakeCode == 0x38 and extended and not released
                     and stamp is not None and stamp == message_time and source == device):
                 self._fake_ctrl = True
@@ -300,7 +307,9 @@ class WindowsHotkeys:
         if received < header_size + ctypes.sizeof(RAWKEYBOARD):
             return
         header = RAWINPUTHEADER.from_buffer(buffer)
-        if header.dwType == 1 and header.hDevice:  # Ignore our injected input.
+        # Filtering hDevice == 0 also drops Remote Desktop/on-screen keyboard
+        # input. Main-hotkey releases still use GetAsyncKeyState polling.
+        if header.dwType == 1 and header.hDevice:
             return RAWKEYBOARD.from_buffer_copy(buffer, header_size), header.hDevice
 
     def _window_proc(self, hwnd, message, wparam, lparam):
@@ -342,9 +351,11 @@ class WindowsHotkeys:
                     self._log(f"Hotkey {self.hotkey} registered.")
                 else:
                     error = ctypes.get_last_error()
+                    reason = ("Windows reserves F12 for debuggers." if self._vk == 0x7b else
+                              "another application may own it.")
                     self._log(f"Hotkey {self.hotkey!r} disabled: RegisterHotKey failed "
                               f"({error}: {ctypes.FormatError(error).strip()}); "
-                              "another application may own it.")
+                              f"{reason}")
             if self._solo is not None:
                 self._log(f"Voice chat hotkey {self._voice_key} registered (tap it alone).")
             self._ready.set()
