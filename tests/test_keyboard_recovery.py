@@ -40,11 +40,53 @@ def test_hotkey_maps_to_modifiers_and_vk(native_api, hotkey, modifiers, vk):
     assert wh.parse_hotkey(hotkey) == (modifiers | wh.MOD_NOREPEAT, vk)
 
 
+@pytest.mark.parametrize("name,vk", [
+    *[(f"num {n}", 0x60 + n) for n in range(10)],
+    ("num multiply", 0x6a), ("num *", 0x6a), ("multiply", 0x6a),
+    ("num plus", 0x6b), ("num add", 0x6b), ("num +", 0x6b), ("add", 0x6b),
+    ("num separator", 0x6c), ("separator", 0x6c),
+    ("num minus", 0x6d), ("num sub", 0x6d), ("num subtract", 0x6d),
+    ("num -", 0x6d), ("subtract", 0x6d),
+    ("num decimal", 0x6e), ("num del", 0x6e), ("num .", 0x6e), ("decimal", 0x6e),
+    ("num divide", 0x6f), ("num /", 0x6f), ("divide", 0x6f),
+])
+@pytest.mark.parametrize("padded_upper", [False, True])
+def test_explicit_numpad_names_preserve_vk(monkeypatch, name, vk, padded_upper):
+    # Do not use native_api: it replaces keyboard's name lookup. Exercise the
+    # real parser/resolver, mocking only Win32 and forbidding layout lookup.
+    api = Mock()
+    api.VkKeyScanW.side_effect = AssertionError("explicit numpad name used layout lookup")
+    api.MapVirtualKeyW.side_effect = AssertionError("explicit numpad name used scan lookup")
+    monkeypatch.setattr(wh, "_user32", api)
+    if padded_upper:
+        name = f" {name.upper()} "
+    assert wh.key_to_vk(name) == vk
+    assert wh.parse_hotkey("ctrl+" + name) == (wh.MOD_CONTROL | wh.MOD_NOREPEAT, vk)
+    assert wh.parse_hotkey(name + "+ctrl") == (wh.MOD_CONTROL | wh.MOD_NOREPEAT, vk)
+    assert wh.parse_hotkey(name) == (wh.MOD_NOREPEAT, vk)
+    api.VkKeyScanW.assert_not_called()
+    api.MapVirtualKeyW.assert_not_called()
+
+
+@pytest.mark.parametrize("name", ["num enter", " NUM ENTER "])
+def test_numpad_enter_is_rejected_as_indistinguishable(monkeypatch, name):
+    api = Mock()
+    monkeypatch.setattr(wh, "_user32", api)
+    reason = "RegisterHotKey cannot distinguish num enter from enter"
+    with pytest.raises(ValueError, match=reason):
+        wh.key_to_vk(name)
+    with pytest.raises(ValueError, match=reason):
+        wh.parse_hotkey("ctrl+" + name)
+    api.VkKeyScanW.assert_not_called()
+    api.MapVirtualKeyW.assert_not_called()
+
+
 @pytest.mark.parametrize("hotkey,reason", [
     ("ctrl", "non-modifier"), ("ctrl+shift", "non-modifier"),
     ("ctrl+a+b", "non-modifier"), ("ctrl+a, b", "sequences"),
     ("", "one chord"), (None, "one chord"),
     ("ctrl+", "unsupported key"), ("ctrl+not-a-key", "unsupported key"),
+    ("ctrl+num ++", "unsupported key"), ("ctrl+num +a", "unsupported key"),
     ("ctrl+f25", "unsupported key"), ("right ctrl+space", "left/right"),
     ("right alt", "left/right"),
     ("ctrl+left control", "non-modifier"),

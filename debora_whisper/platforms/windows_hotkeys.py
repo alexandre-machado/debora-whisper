@@ -1,6 +1,7 @@
 """Windows hotkeys and passive key events, without a low-level keyboard hook."""
 import ctypes
 import os
+import re
 import threading
 import time
 from ctypes import wintypes
@@ -23,6 +24,12 @@ _KEYS = {"delete": 0x2e, "insert": 0x2d, "home": 0x24, "end": 0x23, "page up": 0
          "pause": 0x13, "break": 0x03, "print screen": 0x2c,
          "menu": 0x5d, "apps": 0x5d,
          **{f"num {n}": 0x60 + n for n in range(10)},
+         "num multiply": 0x6a, "num *": 0x6a,
+         "num plus": 0x6b, "num add": 0x6b, "num +": 0x6b,
+         "num separator": 0x6c,
+         "num minus": 0x6d, "num sub": 0x6d, "num subtract": 0x6d, "num -": 0x6d,
+         "num decimal": 0x6e, "num del": 0x6e, "num .": 0x6e,
+         "num divide": 0x6f, "num /": 0x6f,
          "multiply": 0x6a, "add": 0x6b, "separator": 0x6c,
          "subtract": 0x6d, "decimal": 0x6e, "divide": 0x6f}
 _SIDE_KEYS = {"left ctrl": 0xa2, "right ctrl": 0xa3, "left shift": 0xa0,
@@ -34,8 +41,13 @@ _MODIFIER_KEYS = {MOD_ALT: (0xa4, 0xa5), MOD_CONTROL: (0xa2, 0xa3),
 
 def key_to_vk(key):
     key = key.strip().lower()
+    if key == "num enter":
+        raise ValueError("RegisterHotKey cannot distinguish num enter from enter; "
+                         "use enter to accept either key")
     if any(ord(char) > 0xffff or 0xd800 <= ord(char) <= 0xdfff for char in key):
         raise ValueError(f"unsupported key {key!r}: Windows hotkeys require BMP characters")
+    # Preserve explicit numpad names before keyboard normalizes aliases to
+    # bare symbols/digits or loses extended-key metadata (notably divide).
     if key in _KEYS:
         return _KEYS[key]
     if len(key) == 1 and key in "abcdefghijklmnopqrstuvwxyz0123456789":
@@ -73,7 +85,8 @@ def parse_hotkey(hotkey):
     if not isinstance(hotkey, str) or not hotkey.strip() or "," in hotkey:
         raise ValueError("expected one chord, such as ctrl+space; sequences are unsupported")
     modifiers, keys = 0, []
-    for key in hotkey.lower().split("+"):
+    # The literal plus in the Windows key name 'num +' is not a delimiter.
+    for key in re.split(r"(?<!\bnum )\+", hotkey.lower()):
         key = key.strip()
         if key in _MODIFIERS:
             modifiers |= _MODIFIERS[key]
