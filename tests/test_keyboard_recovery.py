@@ -1,433 +1,328 @@
-"""Keyboard recovery contracts without installing hooks or inspecting real tokens."""
+"""Native Windows hotkey contracts without real hooks, windows or key input."""
 import ctypes
-import threading
 import queue
-from ctypes import wintypes
-from types import SimpleNamespace
-from unittest.mock import Mock, call
+import threading
+from unittest.mock import Mock, call, patch
 
 import pytest
 
 from debora_whisper import dictation_engine as de
-from debora_whisper.platforms import windows
+from debora_whisper.platforms import windows_hotkeys as wh
+from debora_whisper.platforms.windows import WindowsPlatform
 
 
-@pytest.mark.parametrize("missing", [False, True])
-def test_recover_stop_rebuild_delivers_hotkey_once(monkeypatch, keyboard, missing):
-    import sys
-
-    events = queue.Queue()
-    callbacks = []
-    threads = []
-
-    def listen(backend, listener):
-        threads.append(threading.current_thread())
-        while events.get() != "quit":
-            for callback in list(callbacks):
-                callback()
-
-    def register(key, callback, **kwargs):
-        callbacks.append(callback)
-        return lambda: callbacks.remove(callback)
-
-    monkeypatch.setattr(windows, "_listen_safely", listen)
-    monkeypatch.setattr(windows, "_post_keyboard_message",
-                        lambda thread, message: events.put("quit"))
-    keyboard._listener.listening_thread.is_alive.side_effect = None
-    keyboard._listener.listening_thread.is_alive.return_value = False
-    keyboard.parse_hotkey = lambda key: (((29,), (57,)),)
-    keyboard.hook = lambda *args, **kwargs: lambda: None
-    keyboard.add_hotkey = register
-    keyboard.unhook_all = callbacks.clear
-    monkeypatch.setitem(sys.modules, "keyboard", keyboard)
-    provider = windows.WindowsPlatform()
-    monkeypatch.setattr(provider, "keyboard_watchdog", lambda *args: None)
-    monkeypatch.setattr(de.platforms, "current", lambda: provider)
-    config = {**de.DEFAULT_CONFIG, "voice_chat_hotkey": "", "beep_on_start": False}
-    first, second = de.DictationApp(config), de.DictationApp(config)
-    delivered = threading.Event()
-    second.toggle_recording = Mock(side_effect=delivered.set)
-    try:
-        assert first._recover_hotkeys()
-        recovered = keyboard._listener.listening_thread
-        first.stop()
-        assert not recovered.is_alive()
-        if missing:
-            del keyboard._listener.listening_thread
-        second._start_hotkeys(keyboard)
-        replacement = keyboard._listener.listening_thread
-        second._start_hotkeys(keyboard)
-        events.put("key")
-        assert delivered.wait(2)
-        second.toggle_recording.assert_called_once_with()
-        assert threads == [recovered, replacement]
-        assert replacement.is_alive()
-    finally:
-        first.stop_monitoring()
-        second.stop()
+@pytest.mark.parametrize("hotkey,modifiers,vk", [
+    ("ctrl+space", wh.MOD_CONTROL, 0x20),
+    (" CTRL + Shift + D ", wh.MOD_CONTROL | wh.MOD_SHIFT, ord("D")),
+    ("alt+f9", wh.MOD_ALT, 0x78),
+    ("windows+7", wh.MOD_WIN, ord("7")),
+    ("control+page down", wh.MOD_CONTROL, 0x22),
+    ("f24", 0, 0x87),
+    ("shift+escape", wh.MOD_SHIFT, 0x1b),
+])
+def test_hotkey_maps_to_modifiers_and_vk(hotkey, modifiers, vk):
+    assert wh.parse_hotkey(hotkey) == (modifiers | wh.MOD_NOREPEAT, vk)
 
 
-def test_final_shutdown_wakes_legacy_listener_without_replacement(monkeypatch, keyboard):
-    original = threading.excepthook
-    old = keyboard._listener.listening_thread
-
-    def post(thread_id, message, *args):
-        assert threading.excepthook is not original
-        assert thread_id == old.native_id
-        return 1
-
-    windows._user32.PostThreadMessageW.side_effect = post
-    windows.WindowsPlatform().stop_keyboard_listener(keyboard, final=True)
-    assert threading.excepthook is original
-    assert keyboard._listener.listening_thread is old
-    assert windows._user32.PostThreadMessageW.call_args_list == [
-        call(42, 0, 0, 0), call(42, 0x12, 0, 0)]
-    old.join.assert_called_once_with(1.0)
+@pytest.mark.parametrize("hotkey,reason", [
+    ("ctrl", "non-modifier"), ("ctrl+shift", "non-modifier"),
+    ("ctrl+a+b", "non-modifier"), ("ctrl+a, b", "sequences"),
+    ("", "one chord"), (None, "one chord"),
+    ("ctrl+", "unsupported key"), ("ctrl+not-a-key", "unsupported key"),
+    ("ctrl+f25", "unsupported key"), ("right ctrl+space", "left/right"),
+    ("ctrl+f12", "reserved"), ("ctrl+/", "unsupported key"),
+])
+def test_unmappable_hotkeys_fail_clearly(hotkey, reason):
+    with pytest.raises(ValueError, match=reason):
+        wh.parse_hotkey(hotkey)
 
 
 @pytest.fixture
-def keyboard(monkeypatch):
-    old = Mock(native_id=42)
-    old.is_alive.side_effect = [True, False]
-    listener = SimpleNamespace(lock=threading.Lock(), listening_thread=old,
-                               active_modifiers=set(), modifier_states={},
-                               direct_callback=Mock())
-    backend = SimpleNamespace(SetWindowsHookEx=Mock(return_value=123),
-                              UnhookWindowsHookEx=Mock())
+def native_api(monkeypatch):
+    messages = queue.Queue()
     api = Mock()
-    api.GetMessageW.return_value = 0
-    monkeypatch.setattr(windows, "_user32", api)
-    monkeypatch.setattr(windows, "_keyboard_hook_args",
-                        Mock(return_value=((13, object(), None, 0), {})))
-    monkeypatch.setattr(windows, "_self_elevated", lambda: True)
-    return SimpleNamespace(_listener=listener, _os_keyboard=backend,
-                           _pressed_events_lock=threading.Lock(),
-                           _pressed_events={}, _logically_pressed_keys={})
+    api.RegisterClassW.return_value = 1
+    api.CreateWindowExW.return_value = 123
+    api.RegisterRawInputDevices.return_value = True
+    api.RegisterHotKey.return_value = True
+    api.DefWindowProcW.return_value = 0
+    api.GetAsyncKeyState.return_value = 0
 
-
-@pytest.mark.parametrize("failure", [None, "post", "join", "hung"])
-def test_legacy_exception_filter_is_thread_scoped_and_restored(monkeypatch, keyboard, failure):
-    old = keyboard._listener.listening_thread
-    original = Mock()
-    monkeypatch.setattr(threading, "excepthook", original)
-    unrelated = SimpleNamespace(thread=object(), exc_type=OSError)
-    unexpected = SimpleNamespace(thread=old, exc_type=ValueError)
-
-    def post(*args):
-        threading.excepthook(SimpleNamespace(thread=old, exc_type=OSError))
-        threading.excepthook(unrelated)
-        threading.excepthook(unexpected)
-        if failure == "post":
-            raise OSError("post failed")
-        return True
-
-    windows._user32.PostThreadMessageW.side_effect = post
-    if failure == "join":
-        old.join.side_effect = RuntimeError("join failed")
-    if failure == "hung":
-        old.is_alive.side_effect = [True, True]
-    stop = threading.Event()
-    stop.set()
-    if failure:
-        with pytest.raises((OSError, RuntimeError)):
-            windows.WindowsPlatform().restart_keyboard_listener(keyboard, stop)
-    else:
-        windows.WindowsPlatform().restart_keyboard_listener(keyboard, stop)
-    assert threading.excepthook is original
-    assert original.call_args_list == [call(unrelated), call(unexpected)] * (1 if failure == "post" else 2)
-
-
-def test_replacement_shutdown_posts_only_quit_without_exception_filter(monkeypatch, keyboard):
-    old = keyboard._listener.listening_thread
-    old._debora_message_loop = True
-    original = threading.excepthook
-
-    def post(*args):
-        assert threading.excepthook is original
-        return True
-
-    windows._user32.PostThreadMessageW.side_effect = post
-    stop = threading.Event()
-    stop.set()
-    windows.WindowsPlatform().restart_keyboard_listener(keyboard, stop)
-    windows._user32.PostThreadMessageW.assert_called_once_with(42, 0x12, 0, 0)
-
-
-@pytest.mark.parametrize("message", [0, 0x12])
-@pytest.mark.parametrize("ready", [True, False])
-def test_post_retries_until_queue_exists_or_timeout(monkeypatch, keyboard, message, ready):
-    elapsed = [0.0]
-    sleeps = []
-
-    def sleep(seconds):
-        sleeps.append(seconds)
-        elapsed[0] += seconds
-
-    monkeypatch.setattr(windows, "time", SimpleNamespace(
-        monotonic=lambda: elapsed[0], sleep=sleep))
-    post = windows._user32.PostThreadMessageW
-    post.side_effect = [0, 0, 1] if ready else None
-    post.return_value = 0
-    assert windows._post_keyboard_message(keyboard._listener.listening_thread, message) is ready
-    assert 0.02 <= elapsed[0] <= 0.51
-    if not ready:
-        assert elapsed[0] >= 0.5
-    assert sleeps == [0.01] * len(sleeps)
-    assert post.call_args_list == [call(42, message, 0, 0)] * (len(sleeps) + 1)
-
-
-@pytest.mark.parametrize("kind", ["legacy", "unstarted", "dead"])
-def test_shutdown_leaves_unowned_or_inactive_listener_alone(keyboard, kind):
-    thread = keyboard._listener.listening_thread
-    if kind == "unstarted":
-        del keyboard._listener.listening_thread
-    elif kind == "dead":
-        thread._debora_message_loop = True
-        thread.is_alive.side_effect = None
-        thread.is_alive.return_value = False
-    windows.WindowsPlatform().stop_keyboard_listener(keyboard)
-    windows._user32.PostThreadMessageW.assert_not_called()
-    thread.join.assert_not_called()
-
-
-def test_shutdown_exits_owned_loop_and_unhooks(keyboard):
-    entered, quit = threading.Event(), threading.Event()
-
-    def get(*args):
-        entered.set()
-        assert quit.wait(2)
-        return 0
-
-    def post(thread_id, message, *args):
-        assert thread_id == thread.native_id and message == 0x12
-        quit.set()
+    def get_message(pointer, *args):
+        message, identifier = messages.get(timeout=2)
+        if message in (0, -1):
+            return message
+        pointer._obj.message = message
+        pointer._obj.wParam = identifier
         return 1
 
-    windows._user32.GetMessageW.side_effect = get
-    windows._user32.PostThreadMessageW.side_effect = post
-    thread = threading.Thread(target=windows._listen_safely,
-                              args=(keyboard._os_keyboard, keyboard._listener), daemon=True)
-    thread._debora_message_loop = True
-    keyboard._listener.listening_thread = thread
-    thread.start()
-    try:
-        assert entered.wait(2)
-        windows.WindowsPlatform().stop_keyboard_listener(keyboard)
-        assert not thread.is_alive()
-        keyboard._os_keyboard.UnhookWindowsHookEx.assert_called_once_with(123)
-    finally:
-        quit.set()
-        thread.join(2)
-
-
-def test_restart_leaves_backend_modifier_flags_untouched(keyboard):
-    backend = keyboard._os_keyboard
-    backend.shift_is_pressed = backend.altgr_is_pressed = True
-    backend.ignore_next_right_alt = True
-    stop = threading.Event()
-    stop.set()
-    windows.WindowsPlatform().restart_keyboard_listener(keyboard, stop)
-    assert backend.shift_is_pressed and backend.altgr_is_pressed and backend.ignore_next_right_alt
-
-
-@pytest.mark.parametrize("failure", [None, "get", "dispatch", "install"])
-def test_message_loop_uses_real_buffer_and_unhooks_on_exit(keyboard, monkeypatch, failure):
-    api, backend = windows._user32, keyboard._os_keyboard
-    seen = []
-
-    def get(message, window, minimum, maximum):
-        assert isinstance(message._obj, wintypes.MSG)
-        seen.append(message._obj)
-        message._obj.message = 0x12 if len(seen) == 2 else 0x100
-        return -1 if failure == "get" else (1 if len(seen) == 1 else 0)
-
-    api.GetMessageW.side_effect = get
-    monkeypatch.setattr(ctypes, "WinError", lambda code: OSError("win32 failed"), raising=False)
-    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
-    if failure == "dispatch":
-        api.DispatchMessageW.side_effect = OSError("dispatch failed")
-    if failure == "install":
-        backend.SetWindowsHookEx.return_value = 0
-    if failure:
-        with pytest.raises(OSError):
-            windows._listen_safely(backend, keyboard._listener)
-    else:
-        windows._listen_safely(backend, keyboard._listener)
-        assert seen[0] is seen[1]
-        api.TranslateMessage.assert_called_once()
-        api.DispatchMessageW.assert_called_once()
-    if failure == "install":
-        backend.UnhookWindowsHookEx.assert_not_called()
-        api.GetMessageW.assert_not_called()
-    else:
-        backend.UnhookWindowsHookEx.assert_called_once_with(123)
-
-
-def test_listener_reuses_callback_and_resets_decoder_modifiers(keyboard):
-    listener, backend = keyboard._listener, keyboard._os_keyboard
-    windows._listen_safely(backend, listener)
-    first_callback = backend.SetWindowsHookEx.call_args.args[1]
-    listener._debora_hook_globals.update(shift_is_pressed=True, altgr_is_pressed=True,
-                                         ignore_next_right_alt=True)
-    windows._listen_safely(backend, listener)
-    assert backend.SetWindowsHookEx.call_args.args[1] is first_callback
-    windows._keyboard_hook_args.assert_called_once_with(backend, listener.direct_callback)
-    assert not any(listener._debora_hook_globals.values())
-    assert backend.UnhookWindowsHookEx.call_count == 2
-
-
-def test_builder_captures_callback_without_native_install_or_atexit_registration():
-    # Model the package's nested decoder and CFUNCTYPE creation, without a hook.
-    namespace = dict(SetWindowsHookEx=Mock(), atexit=Mock(),
-                     LowLevelKeyboardProc=ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int),
-                     UnhookWindowsHookEx=Mock(), shift_is_pressed=False)
-    exec("""
-def prepare_intercept(callback):
-    def handler(value):
-        global shift_is_pressed
-        shift_is_pressed = True
-        return callback(value)
-    native_callback = LowLevelKeyboardProc(handler)
-    SetWindowsHookEx(13, native_callback, None, 0)
-    atexit.register(UnhookWindowsHookEx, native_callback)
-""", namespace)
-    backend = SimpleNamespace(prepare_intercept=namespace["prepare_intercept"])
-    args, decoder_globals = windows._keyboard_hook_args(backend, lambda value: value + 1)
-    assert args[0] == 13
-    assert args[1](4) == 5
-    assert decoder_globals["shift_is_pressed"] is True
-    assert namespace["shift_is_pressed"] is False
-    namespace["SetWindowsHookEx"].assert_not_called()
-    namespace["atexit"].register.assert_not_called()
-
-
-def test_successful_recovery_emits_exactly_one_log_line(keyboard, monkeypatch):
-    log = Mock()
-    monkeypatch.setattr(de, "log", log)
-    provider, now = windows.WindowsPlatform(), [0.0]
-
-    def start(**kwargs):
-        return Mock(start=lambda: kwargs["target"](*kwargs["args"]))
-
-    monkeypatch.setattr(threading, "Thread", start)
-    stop = threading.Event()
-
-    def recover():
-        provider.restart_keyboard_listener(keyboard, stop)
+    def post_message(thread_id, message, *args):
+        messages.put((0 if message == wh.WM_QUIT else message, 0))
         return True
 
-    keyboard._listener.listening_thread.join.side_effect = lambda timeout: threading.excepthook(
-        SimpleNamespace(thread=keyboard._listener.listening_thread, exc_type=OSError))
-    watchdog = windows.KeyboardHookWatchdog(stop, recover, log, clock=lambda: now[0],
-                                           probe=lambda: (0.0, True))
-    for now[0] in (4.0, 5.0):
-        watchdog.poll()
-    log.assert_called_once_with("Keyboard hook lost; hotkeys re-registered.")
+    api.GetMessageW.side_effect = get_message
+    api.PostThreadMessageW.side_effect = post_message
+    monkeypatch.setattr(wh, "_user32", api)
+    monkeypatch.setattr(wh, "_kernel32", Mock(GetModuleHandleW=Mock(return_value=42)))
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 1409, raising=False)
+    monkeypatch.setattr(ctypes, "FormatError", lambda error: "Hot key already registered", raising=False)
+    monkeypatch.setattr(ctypes, "WinError", lambda error: OSError(error, "native failure"), raising=False)
+    return api, messages
 
 
-@pytest.mark.parametrize("self_elevated,foreground,skipped", [
-    (False, True, True), (True, True, False), (None, True, False), (False, False, False),
-])
-def test_watchdog_skips_only_known_elevated_foreground(monkeypatch, self_elevated, foreground, skipped):
-    monkeypatch.setattr(windows, "_self_elevated", lambda: self_elevated)
-    query = Mock(return_value=foreground)
-    monkeypatch.setattr(windows, "_foreground_elevated", query)
-    now, recover = [0.0], Mock(return_value=True)
-    watchdog = windows.KeyboardHookWatchdog(threading.Event(), recover, Mock(),
-                                           clock=lambda: now[0], probe=lambda: (0.0, True))
-    watchdog._suspect = (3.0, 0.0)
-    now[0] = 4.0
-    watchdog.poll()
-    assert recover.call_count == (0 if skipped else 1)
-    assert watchdog._suspect is None
-    if self_elevated is not False:
-        query.assert_not_called()
-    if skipped:
-        query.return_value = False
-        now[0] = 5.0
-        watchdog.poll()
-        recover.assert_not_called()  # Must start a fresh confirmation interval.
-        now[0] = 6.0
-        watchdog.poll()
-        recover.assert_called_once()
+def service(hotkey="ctrl+space", voice_key="right alt", **callbacks):
+    return wh.WindowsHotkeys(hotkey, callbacks.get("on_press", Mock()),
+                             callbacks.get("on_release", Mock()), voice_key,
+                             callbacks.get("on_voice", Mock()), callbacks.get("log", Mock()))
 
 
-@pytest.mark.parametrize("failure", [None, "process", "token", "info", "exception"])
-@pytest.mark.parametrize("elevated", [False, True])
-def test_token_elevation_closes_all_acquired_handles(monkeypatch, failure, elevated):
-    kernel, advapi = Mock(), Mock()
-    # Pointer-sized handle values catch accidental truncation in signatures.
-    process_handle, token_handle = 0x123456789, 0x234567890
-    kernel.OpenProcess.return_value = 0 if failure == "process" else process_handle
-
-    def open_token(process, access, token):
-        token._obj.value = token_handle
-        return failure != "token"
-
-    def info(token, kind, value, size, returned):
-        assert token.value == token_handle
-        assert kind == 20
-        assert size == ctypes.sizeof(wintypes.DWORD)
-        if failure == "exception":
-            raise OSError("token failed")
-        value._obj.value = elevated
-        returned._obj.value = size
-        return failure != "info"
-
-    advapi.OpenProcessToken.side_effect = open_token
-    advapi.GetTokenInformation.side_effect = info
-    monkeypatch.setattr(windows, "_kernel32", kernel)
-    monkeypatch.setattr(windows, "_advapi32", advapi)
-    assert windows._process_elevated(321) is (None if failure else elevated)
-    kernel.OpenProcess.assert_called_once_with(0x1000, False, 321)
-    closed = [args.args[0].value if isinstance(args.args[0], wintypes.HANDLE)
-              else args.args[0] for args in kernel.CloseHandle.call_args_list]
-    assert closed == ([] if failure == "process" else [process_handle] if failure == "token"
-                      else [token_handle, process_handle])
+def key(vk, scan, flags=0):
+    return wh.RAWKEYBOARD(MakeCode=scan, VKey=vk, Flags=flags)
 
 
-def test_self_elevation_is_cached(monkeypatch):
-    query = Mock(return_value=False)
-    monkeypatch.setattr(windows, "_process_elevated", query)
-    windows._self_elevated.cache_clear()
+def test_owner_thread_registers_dispatches_and_unregisters(native_api):
+    api, messages = native_api
+    delivered = threading.Event()
+    pressed = Mock(side_effect=delivered.set)
+    owner_threads = []
+    api.RegisterHotKey.side_effect = lambda *args: owner_threads.append(threading.get_ident()) or True
+    api.UnregisterHotKey.side_effect = lambda *args: owner_threads.append(threading.get_ident()) or True
+    hotkeys = service(on_press=pressed)
     try:
-        assert windows._self_elevated() is False
-        assert windows._self_elevated() is False
-        query.assert_called_once()
+        hotkeys.start()
+        api.RegisterHotKey.assert_called_once_with(None, wh.HOTKEY_ID,
+                                                   wh.MOD_CONTROL | wh.MOD_NOREPEAT, 0x20)
+        messages.put((wh.WM_HOTKEY, wh.HOTKEY_ID))
+        assert delivered.wait(2)
+        pressed.assert_called_once_with()
     finally:
-        windows._self_elevated.cache_clear()
+        hotkeys.stop()
+    assert owner_threads == [hotkeys._thread.ident, hotkeys._thread.ident]
+    assert owner_threads[0] != threading.get_ident()
+    assert not hotkeys._thread.is_alive()
+    api.UnregisterHotKey.assert_called_once_with(None, wh.HOTKEY_ID)
+    api.DestroyWindow.assert_called_once_with(123)
+    api.UnregisterClassW.assert_called_once()
+    assert api.RegisterRawInputDevices.call_count == 2
+    registration, removal = [entry.args[0]._obj for entry in api.RegisterRawInputDevices.call_args_list]
+    assert (registration.usUsagePage, registration.usUsage, registration.dwFlags,
+            registration.hwndTarget) == (1, 6, wh.RIDEV_INPUTSINK, 123)
+    assert removal.dwFlags == wh.RIDEV_REMOVE and removal.hwndTarget is None
+    hotkeys.stop()  # idempotent, no second unregister
+    api.UnregisterHotKey.assert_called_once()
 
 
-@pytest.mark.parametrize("failure", [None, "window", "pid", "zero_pid", "token", "exception"])
-def test_foreground_query_falls_back_on_failure(monkeypatch, failure):
-    api = Mock()
-    api.GetForegroundWindow.return_value = 0 if failure == "window" else 123
+def test_wm_hotkey_enqueues_toggle_once(native_api):
+    app = de.DictationApp({**de.DEFAULT_CONFIG, "beep_on_start": False})
+    app.stop_monitoring()  # Inspect the action queue without a racing consumer.
+    app._stopping.clear()
+    hotkeys = service(on_press=app.toggle_recording)
+    hotkeys._registered = True
+    try:
+        hotkeys._dispatch_hotkey(999)
+        assert app._hotkey_actions.empty()
+        hotkeys._dispatch_hotkey(wh.HOTKEY_ID)
+        hotkeys._dispatch_hotkey(wh.HOTKEY_ID)  # engine also guards a held press
+        callback, args = app._hotkey_actions.get_nowait()
+        assert callback == app._handle_hotkey_press and len(args) == 2
+        assert app._hotkey_actions.empty()
+        hotkeys._stopping.set()
+        app._hotkey_held = False
+        hotkeys._dispatch_hotkey(wh.HOTKEY_ID)
+        assert app._hotkey_actions.empty()
+    finally:
+        app.stop_monitoring()
 
-    def pid(window, result):
-        assert window == 123
-        if failure == "exception":
-            raise OSError("window disappeared")
-        result._obj.value = 0 if failure == "zero_pid" else 321
-        return 0 if failure == "pid" else 456
 
-    api.GetWindowThreadProcessId.side_effect = pid
-    query = Mock(return_value=None if failure == "token" else True)
-    monkeypatch.setattr(windows, "_user32", api)
-    monkeypatch.setattr(windows, "_process_elevated", query)
-    assert windows._foreground_elevated() is (failure is None)
-    if failure in (None, "token"):
-        query.assert_called_once_with(321)
-    else:
-        query.assert_not_called()
+@pytest.mark.parametrize("vk,scan,flags", [(0x20, 57, 0), (0x11, 29, 0), (0x11, 29, wh.RI_KEY_E0)])
+def test_raw_release_ends_push_to_talk(native_api, vk, scan, flags):
+    app = de.DictationApp({**de.DEFAULT_CONFIG, "beep_on_start": False})
+    hotkeys = service(on_release=app._release_hotkey)
+    app._native_hotkeys = hotkeys
+    app._hotkey_held = True
+    starter = Mock()
+    try:
+        with patch.object(de.time, "time", return_value=101.0):
+            hotkeys._handle_key(key(vk, scan, flags | wh.RI_KEY_BREAK))
+        assert app._hotkey_released_at == 101.0
+        with patch.object(app, "_finish_recording") as finish, \
+                patch.object(app, "_begin_continuous") as begin:
+            app._watch_key(100.0, starter)
+        starter.join.assert_called_once()
+        finish.assert_called_once_with()
+        begin.assert_not_called()
+        assert not app._hotkey_held
+    finally:
+        app.stop_monitoring()
 
 
-@pytest.mark.skipif(windows._kernel32 is None, reason="Windows API declarations")
-def test_native_api_signatures_preserve_handle_and_message_widths():
-    assert windows._kernel32.OpenProcess.restype is wintypes.HANDLE
-    assert windows._kernel32.CloseHandle.argtypes == [wintypes.HANDLE]
-    assert windows._advapi32.OpenProcessToken.argtypes == [
-        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-    assert windows._advapi32.GetTokenInformation.argtypes == [
-        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD)]
-    assert windows._user32.GetMessageW.argtypes[0] == ctypes.POINTER(wintypes.MSG)
+@pytest.mark.parametrize("held", [{0x20, 0xa2}, {0x20, 0xa3}, {0x20}, {0xa2}, set()])
+def test_release_poll_uses_physical_modifier_sides(native_api, held):
+    api, _ = native_api
+    api.GetAsyncKeyState.side_effect = lambda vk: 0x8000 if vk in held else 0
+    hotkeys = service()
+    hotkeys._registered = True
+    assert hotkeys.is_pressed() == (0x20 in held and bool(held & {0xa2, 0xa3}))
+
+
+def test_poll_release_settles_hold_without_keyboard_listener(native_api):
+    app = de.DictationApp({**de.DEFAULT_CONFIG, "beep_on_start": False})
+    app._native_hotkeys = service()
+    app._native_hotkeys._registered = True
+    app._hotkey_held = True
+    try:
+        with patch.object(de.time, "time", return_value=101.0), \
+                patch.object(app, "_finish_recording") as finish, \
+                patch("keyboard.is_pressed") as old_poll:
+            app._watch_key(100.0, Mock())
+        finish.assert_called_once_with()
+        old_poll.assert_not_called()
+    finally:
+        app.stop_monitoring()
+
+
+def test_unrelated_raw_release_does_not_end_a_hold(native_api):
+    released = Mock()
+    hotkeys = service(on_release=released)
+    hotkeys._handle_key(key(ord("A"), 30, wh.RI_KEY_BREAK))
+    hotkeys._handle_key(key(0x20, 57))
+    released.assert_not_called()
+
+
+def test_raw_tap_keeps_tap_action_after_delayed_audio_start(native_api):
+    app = de.DictationApp({**de.DEFAULT_CONFIG, "beep_on_start": False})
+    app._hotkey_held = True
+    app._native_hotkeys = service(on_release=app._release_hotkey)
+    try:
+        with patch.object(de.time, "time", return_value=100.1):
+            app._native_hotkeys._handle_key(key(0x20, 57, wh.RI_KEY_BREAK))
+        with patch.object(de.time, "time", return_value=105.0), \
+                patch.object(app, "_finish_recording") as finish, \
+                patch.object(app, "_begin_continuous") as begin:
+            app._watch_key(100.0, Mock())
+        begin.assert_called_once_with(100.0)
+        finish.assert_not_called()
+    finally:
+        app.stop_monitoring()
+
+
+@pytest.mark.parametrize("voice_key", ["right alt", "alt gr"])
+@pytest.mark.parametrize("chord", ["solo", "q", "ctrl"])
+def test_raw_events_feed_solo_tap_without_suppressing_altgr(native_api, voice_key, chord):
+    tapped = Mock()
+    hotkeys = service(voice_key=voice_key, on_voice=tapped)
+    if chord == "ctrl":
+        hotkeys._handle_key(key(0x11, 29))
+    hotkeys._handle_key(key(0x12, 56, wh.RI_KEY_E0))
+    hotkeys._handle_key(key(0x12, 56, wh.RI_KEY_E0))  # repeat
+    if chord == "q":
+        hotkeys._handle_key(key(ord("Q"), 16))
+        hotkeys._handle_key(key(ord("Q"), 16, wh.RI_KEY_BREAK))
+    hotkeys._handle_key(key(0x12, 56, wh.RI_KEY_E0 | wh.RI_KEY_BREAK))
+    assert tapped.call_count == (1 if chord == "solo" else 0)
+
+
+def test_wm_input_decodes_extended_key_and_calls_default_proc(native_api):
+    api, _ = native_api
+    tapped = Mock()
+    hotkeys = service(on_voice=tapped)
+    data = b""
+
+    def read(handle, command, buffer, size, header_size):
+        assert handle == 77 and command == wh.RID_INPUT
+        assert header_size == ctypes.sizeof(wh.RAWINPUTHEADER)
+        size._obj.value = len(data)
+        if buffer is None:
+            return 0
+        ctypes.memmove(buffer, data, len(data))
+        return len(data)
+
+    api.GetRawInputData.side_effect = read
+    for flags in (wh.RI_KEY_E0, wh.RI_KEY_E0 | wh.RI_KEY_BREAK):
+        event = key(0x12, 56, flags)
+        header = wh.RAWINPUTHEADER(dwType=1, dwSize=ctypes.sizeof(wh.RAWINPUTHEADER) + ctypes.sizeof(event))
+        data = bytes(header) + bytes(event)
+        hotkeys._window_proc(123, wh.WM_INPUT, 1, 77)
+    tapped.assert_called_once_with()
+    assert api.DefWindowProcW.call_args_list == [call(123, wh.WM_INPUT, 1, 77)] * 2
+
+
+def test_raw_read_failure_is_logged_once_without_event_data(native_api):
+    api, _ = native_api
+    log = Mock()
+    hotkeys = service(log=log)
+    api.GetRawInputData.side_effect = RuntimeError("private event data")
+    for _ in range(2):
+        hotkeys._window_proc(123, wh.WM_INPUT, 1, 77)
+    log.assert_called_once_with("Windows Raw Input read failed; release polling remains active.")
+    assert api.DefWindowProcW.call_count == 2
+
+
+def test_invalid_voice_key_leaves_main_hotkey_available(native_api):
+    api, messages = native_api
+    messages.put((0, 0))
+    log = Mock()
+    hotkeys = service(voice_key="not-a-key", log=log)
+    hotkeys._run()
+    assert hotkeys._solo is None
+    api.RegisterHotKey.assert_called_once()
+    assert any("Voice chat hotkey 'not-a-key' disabled" in entry.args[0]
+               for entry in log.call_args_list)
+
+
+@pytest.mark.parametrize("failure", ["parse", "conflict", "raw", "window", "class", "get"])
+def test_failures_log_and_release_owned_resources(native_api, failure):
+    api, messages = native_api
+    log = Mock()
+    if failure == "conflict":
+        api.RegisterHotKey.return_value = False
+    elif failure == "raw":
+        api.RegisterRawInputDevices.return_value = False
+    elif failure == "window":
+        api.CreateWindowExW.return_value = None
+    elif failure == "class":
+        api.RegisterClassW.return_value = 0
+    messages.put((-1 if failure == "get" else 0, 0))
+    configured = "ctrl" if failure == "parse" else "ctrl+space"
+    hotkeys = service(hotkey=configured, voice_key="", log=log)
+    hotkeys._run()
+    lines = "\n".join(c.args[0] for c in log.call_args_list)
+    assert configured in lines
+    assert "disabled" in lines or "stopped" in lines
+    if failure == "conflict":
+        assert "1409" in lines and "another application" in lines
+    assert not hotkeys._registered and hotkeys._ready.is_set()
+    assert api.UnregisterHotKey.call_count == (1 if failure == "get" else 0)
+    assert api.DestroyWindow.call_count == (0 if failure in ("class", "window") else 1)
+    assert api.UnregisterClassW.call_count == (0 if failure == "class" else 1)
+
+
+def test_settings_rebuild_unregisters_before_registering_new_hotkey(native_api, monkeypatch):
+    api, _ = native_api
+    provider, keyboard = WindowsPlatform(), Mock()
+    monkeypatch.setattr(provider, "keyboard", lambda: keyboard)
+    monkeypatch.setattr(de.platforms, "current", lambda: provider)
+    config = {**de.DEFAULT_CONFIG, "beep_on_start": False, "voice_chat_hotkey": ""}
+    first = de.DictationApp(dict(config))
+    second = de.DictationApp({**config, "hotkey": "ctrl+shift+d"})
+    try:
+        first._start_hotkeys(keyboard)
+        assert first.stop_if_idle() is None
+        second._start_hotkeys(keyboard)
+        second._start_hotkeys(keyboard)
+        relevant = [entry for entry in api.mock_calls if entry[0] in ("RegisterHotKey", "UnregisterHotKey")]
+        assert relevant == [
+            call.RegisterHotKey(None, wh.HOTKEY_ID, wh.MOD_CONTROL | wh.MOD_NOREPEAT, 0x20),
+            call.UnregisterHotKey(None, wh.HOTKEY_ID),
+            call.RegisterHotKey(None, wh.HOTKEY_ID,
+                                wh.MOD_CONTROL | wh.MOD_SHIFT | wh.MOD_NOREPEAT, ord("D")),
+        ]
+        keyboard.add_hotkey.assert_not_called()
+        keyboard.hook.assert_not_called()
+        keyboard.is_pressed.assert_not_called()
+        keyboard.unhook_all.assert_not_called()
+    finally:
+        first.stop()
+        second.stop()
+    assert not first._native_hotkeys._thread.is_alive()
+    assert not second._native_hotkeys._thread.is_alive()

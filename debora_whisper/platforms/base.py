@@ -17,15 +17,9 @@ class Platform:
     name = "generic"
     no_window = 0
 
-    def keyboard_watchdog(self, stopping, recover, log):
-        """Native hook health is unknown on this platform."""
+    def native_hotkeys(self, hotkey, on_press, on_release, voice_key, on_voice, log):
+        """An owned native hotkey service, or None for the keyboard backend."""
         return None
-
-    def restart_keyboard_listener(self, keyboard, stopping):
-        """No native listener recovery on this platform."""
-
-    def stop_keyboard_listener(self, keyboard, *, final=False):
-        """No owned native listener to stop on this platform."""
 
     def apply_config(self, config):
         """Settings for this provider, from the app's config."""

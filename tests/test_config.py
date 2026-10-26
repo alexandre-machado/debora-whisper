@@ -78,7 +78,10 @@ def test_warm_voice_chat_loads_it_while_dictating():
     from debora_whisper.dictation_engine import DEFAULT_CONFIG, DictationApp
     app = DictationApp({**DEFAULT_CONFIG, "beep_on_start": False, "voice_chat": False})
     app.warm_voice_chat = True
-    with patch.dict("sys.modules", {"keyboard": MagicMock()}),             patch.object(app, "_start_loader"),             patch.object(app, "_start_segment_consumer"),             patch.object(app, "_warm_up_voice_chat") as warm:
+    with patch.dict("sys.modules", {"keyboard": MagicMock()}), \
+            patch.object(app, "_start_hotkeys"), patch.object(app, "_start_loader"), \
+            patch.object(app, "_start_segment_consumer"), \
+            patch.object(app, "_warm_up_voice_chat") as warm:
         app.start_background()
     warm.assert_called_once()
 

@@ -5,13 +5,7 @@ headphones from speakers needs no extra package.
 """
 import os
 import subprocess
-import ctypes
-import threading
-import time
-from ctypes import wintypes
-from functools import lru_cache
 from pathlib import Path
-from types import FunctionType, SimpleNamespace
 
 from debora_whisper.platforms.base import CaretReadStatus, Platform
 from debora_whisper.platforms import windows_text, windows_uia
@@ -25,224 +19,6 @@ _ACTIVE = 1
 _HEADPHONES, _HEADSET = 3, 5
 # MME, sounddevice's default host API, cuts device names at 31 characters.
 _MME_NAME_CHARS = 31
-_user32 = ctypes.WinDLL("user32", use_last_error=True) if os.name == "nt" else None
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) if os.name == "nt" else None
-_advapi32 = ctypes.WinDLL("advapi32", use_last_error=True) if os.name == "nt" else None
-if _user32 is not None:
-    _user32.PostThreadMessageW.argtypes = [ctypes.c_ulong, ctypes.c_uint,
-                                         ctypes.c_size_t, ctypes.c_ssize_t]
-    _user32.PostThreadMessageW.restype = ctypes.c_int
-    _user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
-                                   wintypes.UINT, wintypes.UINT]
-    _user32.GetMessageW.restype = wintypes.BOOL
-    _user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
-    _user32.TranslateMessage.restype = wintypes.BOOL
-    _user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
-    _user32.DispatchMessageW.restype = ctypes.c_ssize_t
-    _user32.GetForegroundWindow.argtypes = []
-    _user32.GetForegroundWindow.restype = wintypes.HWND
-    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    _kernel32.OpenProcess.restype = wintypes.HANDLE
-    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    _kernel32.CloseHandle.restype = wintypes.BOOL
-    _advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
-                                         ctypes.POINTER(wintypes.HANDLE)]
-    _advapi32.OpenProcessToken.restype = wintypes.BOOL
-    _advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
-                                            wintypes.LPVOID, wintypes.DWORD,
-                                            ctypes.POINTER(wintypes.DWORD)]
-    _advapi32.GetTokenInformation.restype = wintypes.BOOL
-
-
-def _process_elevated(pid):
-    """Return None on failure, so inaccessible tokens don't suppress recovery."""
-    if _kernel32 is None:
-        return None
-    try:
-        process = _kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
-        if not process:
-            return None
-        try:
-            token = wintypes.HANDLE()
-            if not _advapi32.OpenProcessToken(process, 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
-                return None
-            try:
-                elevated, size = wintypes.DWORD(), wintypes.DWORD()
-                if not _advapi32.GetTokenInformation(
-                        token, 20, ctypes.byref(elevated), ctypes.sizeof(elevated),
-                        ctypes.byref(size)):  # TokenElevation
-                    return None
-                return bool(elevated.value)
-            finally:
-                _kernel32.CloseHandle(token)
-        finally:
-            _kernel32.CloseHandle(process)
-    except OSError:
-        return None
-
-
-@lru_cache(maxsize=1)
-def _self_elevated():
-    return _process_elevated(os.getpid())
-
-
-def _foreground_elevated():
-    if _user32 is None:
-        return False
-    try:
-        window = _user32.GetForegroundWindow()
-        pid = wintypes.DWORD()
-        if not window or not _user32.GetWindowThreadProcessId(window, ctypes.byref(pid)) or not pid.value:
-            return False
-        return _process_elevated(pid.value) is True
-    except OSError:
-        return False
-
-
-def _keyboard_hook_args(backend, callback):
-    # keyboard 0.13.x builds its decoder closure inside prepare_intercept and
-    # retains each native callback via atexit. Run that builder with private
-    # globals to capture the install arguments without installing or registering
-    # cleanup. No package globals are patched; the listener retains ONE callback
-    # for every recovery, and our loop owns the hook handle and its cleanup.
-    captured = []
-    namespace = dict(backend.prepare_intercept.__globals__)
-    namespace.update(SetWindowsHookEx=lambda *args: captured.append(args),
-                     atexit=SimpleNamespace(register=lambda *args: None))
-    FunctionType(backend.prepare_intercept.__code__, namespace)(callback)
-    return captured[0], namespace
-
-
-def _post_keyboard_message(thread, message):
-    # A newly started listener may not have created its message queue yet.
-    deadline = time.monotonic() + 0.5
-    while not _user32.PostThreadMessageW(thread.native_id, message, 0, 0):
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.01)
-    return True
-
-
-def _listen_safely(backend, listener):
-    if not hasattr(listener, "_debora_hook_args"):
-        listener._debora_hook_args, listener._debora_hook_globals = _keyboard_hook_args(
-            backend, listener.direct_callback)
-    # The decoder closure uses these private globals for its modifier state.
-    listener._debora_hook_globals.update(shift_is_pressed=False, altgr_is_pressed=False,
-                                         ignore_next_right_alt=False)
-    hook = backend.SetWindowsHookEx(*listener._debora_hook_args)
-    if not hook:
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        message = wintypes.MSG()
-        while True:
-            result = _user32.GetMessageW(ctypes.byref(message), None, 0, 0)
-            if result == 0:  # WM_QUIT
-                return
-            if result == -1:
-                raise ctypes.WinError(ctypes.get_last_error())
-            _user32.TranslateMessage(ctypes.byref(message))
-            _user32.DispatchMessageW(ctypes.byref(message))
-    finally:
-        backend.UnhookWindowsHookEx(hook)
-
-
-class KeyboardHookWatchdog:
-    """Confirm missing hook events against independent Windows input state.
-
-    Mouse input alone never triggers recovery. Give a detected key one second
-    to reach the hook, then replace the native listener as well as our bindings:
-    keyboard.add_hotkey alone cannot revive a WH_KEYBOARD_LL removed by Windows.
-    The same check covers input after sleep/unlock without a hidden window.
-    """
-    STALE_SECONDS = 3.0
-    RETRY_SECONDS = 30.0
-
-    def __init__(self, stopping, recover, log, *, clock=time.monotonic, probe=None):
-        self._stopping, self._recover, self._log = stopping, recover, log
-        self._clock = clock
-        self._probe = probe or self._input_state
-        self._last_event = clock()
-        self._last_attempt = float("-inf")
-        self._suspect = None
-        self._keys_down = set()
-        self._thread = None
-        self._elevated = _self_elevated()
-
-    def observe(self, event):
-        self._last_event = self._clock()
-
-    def _input_state(self):
-        from ctypes import wintypes
-
-        class LASTINPUTINFO(ctypes.Structure):
-            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
-
-        user32 = ctypes.windll.user32
-        info = LASTINPUTINFO()
-        info.cbSize = ctypes.sizeof(info)
-        if not user32.GetLastInputInfo(ctypes.byref(info)):
-            return float("inf"), False
-        # Both counters are DWORD milliseconds, including across the 49-day wrap.
-        age = ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xffffffff) / 1000
-        # Derive only pressed/not-pressed; raw key states are never logged or
-        # stored beyond this poll (held keys are compared with the next poll).
-        states = {key: user32.GetAsyncKeyState(key) for key in range(8, 255)}
-        down = {key for key, state in states.items() if state & 0x8000}
-        # The low bit can miss a quick tap (another process may consume it).
-        # Newly held keys provide an independent fallback; mouse buttons excluded.
-        pressed = bool(down - self._keys_down) or any(state & 1 for state in states.values())
-        self._keys_down = down
-        return age, pressed
-
-    def poll(self):
-        now = self._clock()
-        if self._stopping.is_set():
-            return
-        age, key_pressed = self._probe()
-        if now - self._last_event < self.STALE_SECONDS:
-            self._suspect = None
-            return
-        if self._elevated is False and _foreground_elevated():
-            self._suspect = None
-            return
-        if now - self._last_attempt < self.RETRY_SECONDS:
-            return
-        if self._suspect is None:
-            if key_pressed and age < 1.0:
-                self._suspect = (now, self._last_event)
-            return
-        since, last_event = self._suspect
-        if self._last_event != last_event:
-            self._suspect = None
-            return
-        if now - since < 1.0:
-            return
-        self._last_attempt = now
-        self._suspect = None
-        if self._recover():
-            self._last_event = now
-            self._log("Keyboard hook lost; hotkeys re-registered.")
-
-    def _run(self):
-        while not self._stopping.wait(0.5):
-            try:
-                self.poll()
-            except Exception as exc:
-                now = self._clock()
-                if now - getattr(self, "_last_error", float("-inf")) >= self.RETRY_SECONDS:
-                    self._last_error = now
-                    self._log(f"Keyboard hook recovery failed: {exc}")
-
-    def start(self):
-        self._thread = threading.Thread(target=self._run, name="keyboard-watchdog", daemon=True)
-        self._thread.start()
-
-    def join(self, timeout):
-        if self._thread is not None and self._thread is not threading.current_thread():
-            self._thread.join(timeout)
 
 
 def render_endpoints():
@@ -295,91 +71,21 @@ def is_headphones(name, endpoints):
 class WindowsPlatform(Platform):
     name = "windows"
 
-    def keyboard_watchdog(self, stopping, recover, log):
-        self._watchdog = KeyboardHookWatchdog(stopping, recover, log)
-        return self._watchdog
-
-    def stop_keyboard_listener(self, keyboard, *, final=False):
-        if final:
-            stopping = threading.Event()
-            stopping.set()
-            self.restart_keyboard_listener(keyboard, stopping)
-            return
-        listener = keyboard._listener
-        with listener.lock:
-            thread = getattr(listener, "listening_thread", None)
-            # keyboard owns the original loop and its atexit cleanup.
-            if (getattr(thread, "_debora_message_loop", False) is True
-                    and thread.is_alive()):
-                _post_keyboard_message(thread, 0x0012)  # WM_QUIT
-                if thread is not threading.current_thread():
-                    thread.join(1.0)
-
-    def restart_keyboard_listener(self, keyboard, stopping):
-        # Keep the processing thread and unrelated registrations. Only the first
-        # listener uses keyboard 0.13.x's NULL LPMSG: wake it with WM_NULL and
-        # quietly consume its expected ctypes OSError during shutdown. All our
-        # replacements own a real MSG and unhook cleanly on WM_QUIT.
-        listener = keyboard._listener
-        with listener.lock:
-            old = getattr(listener, "listening_thread", None)
-            if old is not None and old.is_alive():
-                legacy = getattr(old, "_debora_message_loop", False) is not True
-                previous_hook = threading.excepthook
-
-                def quiet_old_listener(args):
-                    if args.thread is old and issubclass(args.exc_type, OSError):
-                        return
-                    previous_hook(args)
-
-                try:
-                    if legacy:
-                        threading.excepthook = quiet_old_listener
-                        _post_keyboard_message(old, 0)  # WM_NULL
-                    _post_keyboard_message(old, 0x0012)  # WM_QUIT
-                    old.join(1.0)
-                finally:
-                    if legacy:
-                        threading.excepthook = previous_hook
-                if old.is_alive():
-                    raise RuntimeError("keyboard listener did not stop")
-            # Lost up events otherwise leave Ctrl/Alt or a suppressed hotkey stuck.
-            with keyboard._pressed_events_lock:
-                keyboard._pressed_events.clear()
-                keyboard._logically_pressed_keys.clear()
-            listener.active_modifiers.clear()
-            listener.modifier_states.clear()
-            backend = keyboard._os_keyboard
-            if stopping.is_set():
-                return
-            listener.listening_thread = threading.Thread(
-                target=_listen_safely, args=(backend, listener),
-                name="keyboard-listener", daemon=True)
-            listener.listening_thread._debora_message_loop = True
-            listener.listening_thread.start()
+    def native_hotkeys(self, hotkey, on_press, on_release, voice_key, on_voice, log):
+        from debora_whisper.platforms.windows_hotkeys import WindowsHotkeys
+        return WindowsHotkeys(hotkey, on_press, on_release, voice_key, on_voice, log)
 
     def type_text(self, text: str, auto_enter: bool = False):
-        return self._observe_typing(windows_text.type_text, text, auto_enter)
-
-    def _observe_typing(self, type_text, *args):
-        watchdog = getattr(self, "_watchdog", None)
-        # Replayed keys and VK_PACKET bypass the passive keyboard observer.
-        if watchdog is not None:
-            watchdog.observe(None)
-        try:
-            return type_text(*args)
-        finally:
-            if watchdog is not None:
-                watchdog.observe(None)
+        return windows_text.type_text(text, auto_enter)
 
     def _type_text_ctypes(self, text: str):
-        return self._observe_typing(windows_text._type_text_ctypes, text)
+        return windows_text._type_text_ctypes(text)
 
     def type_draft(self, text: str):
-        return self._observe_typing(windows_text.type_draft, text)
+        return windows_text.type_draft(text)
 
     def delete_text(self, count: int):
-        return self._observe_typing(windows_text.delete_text, count)
+        return windows_text.delete_text(count)
 
     def _delete_text_ctypes(self, count: int):
         return windows_text._delete_text_ctypes(count)
