@@ -2,6 +2,7 @@
 import ctypes
 import os
 import threading
+import time
 from ctypes import wintypes
 from types import SimpleNamespace
 
@@ -11,16 +12,18 @@ MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 1, 2, 4, 8, 0x4000
 WM_INPUT, WM_HOTKEY, WM_QUIT = 0x00ff, 0x0312, 0x0012
 RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT = 0x100, 1, 0x10000003
 RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1 = 1, 2, 4
+MAPVK_VSC_TO_VK_EX = 3
 HOTKEY_ID = 1
 
 _MODIFIERS = {"alt": MOD_ALT, "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
               "shift": MOD_SHIFT, "win": MOD_WIN, "windows": MOD_WIN}
-_KEYS = {"space": 0x20, "tab": 0x09, "enter": 0x0d, "return": 0x0d,
-         "esc": 0x1b, "escape": 0x1b, "backspace": 0x08, "delete": 0x2e,
-         "insert": 0x2d, "home": 0x24, "end": 0x23, "page up": 0x21,
+_KEYS = {"delete": 0x2e, "insert": 0x2d, "home": 0x24, "end": 0x23, "page up": 0x21,
          "page down": 0x22, "up": 0x26, "down": 0x28, "left": 0x25,
-         "right": 0x27, "caps lock": 0x14, "num lock": 0x90,
-         "scroll lock": 0x91, "pause": 0x13, "print screen": 0x2c}
+         "right": 0x27, "num lock": 0x90, "pause": 0x13, "print screen": 0x2c,
+         "menu": 0x5d, "apps": 0x5d,
+         **{f"num {n}": 0x60 + n for n in range(10)},
+         "multiply": 0x6a, "add": 0x6b, "separator": 0x6c,
+         "subtract": 0x6d, "decimal": 0x6e, "divide": 0x6f}
 _SIDE_KEYS = {"left ctrl": 0xa2, "right ctrl": 0xa3, "left shift": 0xa0,
               "right shift": 0xa1, "left alt": 0xa4, "right alt": 0xa5,
               "alt gr": 0xa5, "left windows": 0x5b, "right windows": 0x5c}
@@ -36,6 +39,20 @@ def key_to_vk(key):
         return ord(key.upper())
     if key.startswith("f") and key[1:].isdigit() and 1 <= int(key[1:]) <= 24:
         return 0x70 + int(key[1:]) - 1
+    if _user32 is not None and key:
+        # VkKeyScan uses the active layout, including OEM punctuation keys.
+        # Its high byte describes typing modifiers, not hotkey modifiers.
+        if len(key) == 1:
+            mapped = _user32.VkKeyScanW(key)
+            if mapped != -1 and 0 < (mapped & 0xff) < 0xff:
+                return mapped & 0xff
+        import keyboard
+        # Name table initialization installs no hook. Extended/numpad names
+        # above need explicit VKs because this API discards the E0 flag.
+        for scan in keyboard.key_to_scan_codes(key, error_if_missing=False):
+            vk = -scan if scan < 0 else _user32.MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX)
+            if 0 < vk < 0xff:
+                return vk
     raise ValueError(f"unsupported key {key!r}")
 
 
@@ -54,6 +71,8 @@ def parse_hotkey(hotkey):
             keys.append(key_to_vk(key))
     if len(keys) != 1:
         raise ValueError("expected exactly one non-modifier key")
+    if keys[0] in (0x10, 0x11, 0x12, *_SIDE_KEYS.values()):
+        raise ValueError("expected a non-modifier key; left/right modifiers cannot be the main key")
     if keys[0] == 0x7b:
         raise ValueError("F12 is reserved by Windows for the debugger")
     return modifiers | MOD_NOREPEAT, keys[0]
@@ -112,11 +131,16 @@ if _user32 is not None:
         ("PostThreadMessageW", [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM,
                                 wintypes.LPARAM], wintypes.BOOL),
         ("GetAsyncKeyState", [ctypes.c_int], ctypes.c_short),
+        ("MapVirtualKeyW", [wintypes.UINT, wintypes.UINT], wintypes.UINT),
+        ("VkKeyScanW", [wintypes.WCHAR], ctypes.c_short),
+        ("GetMessageTime", [], wintypes.LONG),
     ):
         function = getattr(_user32, name)
         function.argtypes, function.restype = args, result
     _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     _kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    _kernel32.GetTickCount.argtypes = []
+    _kernel32.GetTickCount.restype = wintypes.DWORD
 
 
 class WindowsHotkeys:
@@ -136,6 +160,11 @@ class WindowsHotkeys:
         self._ready = threading.Event()
         self._stopping = threading.Event()
         self._thread = None
+        self._press = threading.local()
+        self._errors_at = {}
+        self._pending_ctrl = None
+        self._fake_ctrl = False
+        self._left_ctrl_down = False
         try:
             self._modifiers, self._vk = parse_hotkey(hotkey)
         except ValueError as exc:
@@ -148,7 +177,8 @@ class WindowsHotkeys:
                 else:
                     self._voice_vks = (_SIDE_KEYS[voice_key] if voice_key in _SIDE_KEYS
                                        else key_to_vk(voice_key),)
-                self._solo = SoloKeyTap(voice_key, on_voice)
+                self._solo = SoloKeyTap(
+                    voice_key, lambda: self._call_callback("voice", on_voice))
                 self._voice_key = voice_key
             except ValueError as exc:
                 log(f"Voice chat hotkey {voice_key!r} disabled: {exc}.")
@@ -181,9 +211,34 @@ class WindowsHotkeys:
 
     def _dispatch_hotkey(self, identifier):
         if identifier == HOTKEY_ID and self._registered and not self._stopping.is_set():
-            self._on_press()
+            # WM_INPUT release can be dispatched before this older WM_HOTKEY.
+            # Compare its original queue time with the engine's release time.
+            age = (_kernel32.GetTickCount() - _user32.GetMessageTime()) & 0xffffffff
+            self._press.time = time.time() - age / 1000
+            try:
+                self._call_callback("hotkey", self._on_press)
+            finally:
+                self._press.time = None
 
-    def _handle_key(self, key):
+    @property
+    def press_time(self):
+        # Tray/overlay clicks on other threads must not reuse a native press.
+        return getattr(self._press, "time", None)
+
+    def _report_error(self, kind, message):
+        now = time.monotonic()
+        if now - self._errors_at.get(kind, float("-inf")) >= 5:
+            self._errors_at[kind] = now
+            self._log(message)
+
+    def _call_callback(self, kind, callback):
+        try:
+            callback()
+        except Exception:
+            # Callback failures must neither stop the pump nor expose input.
+            self._report_error(kind, f"Windows {kind} callback failed; hotkeys remain active.")
+
+    def _handle_key(self, key, message_time=None, device=None):
         if self._stopping.is_set() or key.VKey == 0xff or key.MakeCode == 0xff:
             return
         vk = key.VKey
@@ -195,13 +250,42 @@ class WindowsHotkeys:
         elif vk == 0x12:
             vk = 0xa5 if extended else 0xa4
         released = bool(key.Flags & RI_KEY_BREAK)
+        event = (vk, key.MakeCode, key.Flags & (RI_KEY_E0 | RI_KEY_E1), released)
+        if self._pending_ctrl is not None:
+            pending, stamp, source = self._pending_ctrl
+            self._pending_ctrl = None
+            # Raw Input has no LLKHF_INJECTED bit. Recognize AltGr by an
+            # adjacent LCtrl make (1D), then RAlt make (E0 38), from the same
+            # device with the SAME GetMessageTime. A previously held Ctrl or
+            # one with a different timestamp remains a real chord modifier.
+            # Identical physical events within one Windows clock tick are
+            # indistinguishable here; do not use processing-time thresholds.
+            if (vk == 0xa5 and key.MakeCode == 0x38 and extended and not released
+                    and stamp is not None and stamp == message_time and source == device):
+                self._fake_ctrl = True
+            else:
+                self._emit_key(*pending)
+        if (0xa5 in self._voice_vks and vk == 0xa2
+                and key.MakeCode in (0x1d, 0x21d) and not extended):
+            if released and self._fake_ctrl and not self._left_ctrl_down:
+                # The matching synthetic break may precede or follow RAlt up.
+                self._fake_ctrl = False
+                return
+            if not released and not self._left_ctrl_down:
+                self._pending_ctrl = (event, message_time, device)
+                return
+        self._emit_key(*event)
+
+    def _emit_key(self, vk, scan, flags, released):
+        if vk == 0xa2:
+            self._left_ctrl_down = not released
         if released and (vk == self._vk or any(
                 vk in keys for flag, keys in _MODIFIER_KEYS.items() if self._modifiers & flag)):
-            self._on_release()
+            self._call_callback("release", self._on_release)
         if self._solo is not None:
             self._solo.handle(SimpleNamespace(
                 name=self._voice_key if vk in self._voice_vks else "",
-                scan_code=(vk, key.MakeCode, key.Flags & (RI_KEY_E0 | RI_KEY_E1)),
+                scan_code=(vk, scan, flags),
                 event_type="up" if released else "down"))
 
     def _read_input(self, handle):
@@ -216,18 +300,19 @@ class WindowsHotkeys:
         if received < header_size + ctypes.sizeof(RAWKEYBOARD):
             return
         header = RAWINPUTHEADER.from_buffer(buffer)
-        if header.dwType == 1:  # RIM_TYPEKEYBOARD
-            self._handle_key(RAWKEYBOARD.from_buffer(buffer, header_size))
+        if header.dwType == 1 and header.hDevice:  # Ignore our injected input.
+            return RAWKEYBOARD.from_buffer_copy(buffer, header_size), header.hDevice
 
     def _window_proc(self, hwnd, message, wparam, lparam):
         if message == WM_INPUT:
             try:
-                self._read_input(lparam)
+                event = self._read_input(lparam)
             except Exception:
                 # Never include raw event data in logs, even on decoder errors.
-                if not getattr(self, "_input_error", False):
-                    self._input_error = True
-                    self._log("Windows Raw Input read failed; release polling remains active.")
+                self._report_error("decode", "Windows Raw Input read failed; release polling remains active.")
+            else:
+                if event is not None:
+                    self._handle_key(event[0], _user32.GetMessageTime(), event[1])
         return _user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
     def _run(self):

@@ -360,6 +360,12 @@ def set_voice_chat_config(config: dict, enabled: bool):
 
 def validate_config(config: dict):
     """Validate config values. Raises ValueError on invalid values."""
+    if platforms.current().name == "windows":
+        from debora_whisper.platforms.windows_hotkeys import parse_hotkey
+        try:
+            parse_hotkey(config.get("hotkey", DEFAULT_CONFIG["hotkey"]))
+        except ValueError as exc:
+            raise ValueError(f"Invalid hotkey: {exc}") from exc
     for key in ("inline_drafts", "inline_drafts_require_verification"):
         if not isinstance(config.get(key, False), bool):
             raise ValueError(f"{key} must be a bool")
@@ -2611,6 +2617,7 @@ class DictationApp:
         self._hotkeys_started = False
         self._hotkey_held = False
         self._hotkey_released_at = None
+        self._hotkey_last_release = None
         self._hotkey_codes = frozenset()
         self._hotkey_actions = queue.SimpleQueue()
         # Orders the final "still running?" check plus paste/history against
@@ -3551,8 +3558,14 @@ class DictationApp:
         if self._stopping.is_set() or self._hotkey_held:
             return
         self._hotkey_held = True
-        self._hotkey_released_at = None
-        self._hotkey_actions.put((self._handle_hotkey_press, (time.time(), time.perf_counter())))
+        press_time = (self._native_hotkeys.press_time if self._native_hotkeys is not None
+                      else None)
+        if press_time is None:
+            press_time = time.time()
+        released_at = self._hotkey_last_release
+        self._hotkey_released_at = (released_at if released_at is not None
+                                    and released_at >= press_time else None)
+        self._hotkey_actions.put((self._handle_hotkey_press, (press_time, time.perf_counter())))
 
     def _consume_hotkeys(self):
         while not self._stopping.is_set():
@@ -3790,8 +3803,9 @@ class DictationApp:
         self._start_segment_consumer()
 
     def _release_hotkey(self):
+        self._hotkey_last_release = time.time()
         if self._hotkey_held and self._hotkey_released_at is None:
-            self._hotkey_released_at = time.time()
+            self._hotkey_released_at = self._hotkey_last_release
 
     def _observe_keyboard(self, event):
         if event.event_type == "up" and event.scan_code in self._hotkey_codes:
@@ -4047,6 +4061,7 @@ class DictationApp:
         # after this line no transcription can be typed or added to history.
         with self._output_lock:
             self._stopping.set()
+        hotkey_error = None
         try:
             with self._hotkey_lock:
                 if self._native_hotkeys is not None:
@@ -4056,8 +4071,7 @@ class DictationApp:
                     platforms.current().keyboard().unhook_all()
                 self._hotkey_removers.clear()
         except Exception as exc:
-            log(f"Error stopping hotkeys: {exc}")
-            raise
+            hotkey_error = exc
         self.stop_monitoring()
         self._interrupt_voice_reply()
         with self._audio_lifecycle_lock:
@@ -4077,6 +4091,8 @@ class DictationApp:
             pass
 
         platforms.current().close()
+        if hotkey_error is not None:
+            log(f"Error stopping hotkeys: {hotkey_error}")
         log("Engine stopped.")
 
     def run(self):
