@@ -68,10 +68,18 @@ def native_api(monkeypatch):
     api.VkKeyScanW.side_effect = lambda key: {
         ";": 0xba, ".": 0xbe, "`": 0xc0, "-": 0xbd, "/": 0xbf,
     }.get(key, -1)
-    scans = {"space": (57,), "escape": (1,), "left control": (29,)}
+    scans = {"space": (57,), "escape": (1,), "left control": (29,),
+             "-": (74, 12), ";": (39,), ".": (83, 52), "`": (41,), "/": (53,)}
     monkeypatch.setattr("keyboard.key_to_scan_codes",
                         lambda name, error_if_missing=True: scans.get(name, ()))
-    api.MapVirtualKeyW.side_effect = lambda scan, mode: {57: 0x20, 1: 0x1b, 29: 0xa2}.get(scan, 0)
+    scan_vks = {57: 0x20, 1: 0x1b, 29: 0xa2, 74: 0x6d, 12: 0xbd,
+                39: 0xba, 83: 0x6e, 52: 0xbe, 41: 0xc0, 53: 0xbf}
+    vk_chars = {0x6d: ord("-"), 0xbd: ord("-"), 0xba: ord(";"),
+                0x6e: ord("."), 0xbe: ord("."), 0xc0: ord("`"), 0xbf: ord("/")}
+    api.MapVirtualKeyW.side_effect = lambda code, mode: {
+        wh.MAPVK_VSC_TO_VK_EX: scan_vks,
+        wh.MAPVK_VK_TO_CHAR: vk_chars,
+    }.get(mode, {}).get(code, 0)
 
     def get_message(pointer, *args):
         message, identifier = messages.get(timeout=2)
@@ -106,6 +114,34 @@ def key(vk, scan, flags=0):
     return wh.RAWKEYBOARD(MakeCode=scan, VKey=vk, Flags=flags)
 
 
+@pytest.mark.parametrize("character,vk", [("-", 0xbd), (";", 0xba), (".", 0xbe)])
+def test_punctuation_prefers_unmodified_vk_over_scan_codes(native_api, character, vk):
+    api, _ = native_api
+    assert wh.parse_hotkey("ctrl+" + character) == (wh.MOD_CONTROL | wh.MOD_NOREPEAT, vk)
+    api.VkKeyScanW.assert_called_once_with(character)
+    api.MapVirtualKeyW.assert_not_called()
+
+
+@pytest.mark.parametrize("character,vk", [("-", 0xbd), (";", 0xba), (".", 0xbe)])
+@pytest.mark.parametrize("shift_state", [None, 0x100, 0x600])
+def test_punctuation_fallback_skips_numpad(native_api, character, vk, shift_state):
+    api, _ = native_api
+    api.VkKeyScanW.side_effect = None
+    api.VkKeyScanW.return_value = -1 if shift_state is None else shift_state | vk
+    assert wh.parse_hotkey("ctrl+" + character) == (wh.MOD_CONTROL | wh.MOD_NOREPEAT, vk)
+
+
+@pytest.mark.parametrize("scan", [74, -0x6d])
+def test_punctuation_with_only_numpad_route_is_rejected(native_api, scan):
+    api, _ = native_api
+    api.VkKeyScanW.side_effect = None
+    api.VkKeyScanW.return_value = -1
+    with patch("keyboard.key_to_scan_codes", return_value=(scan,)), \
+            pytest.raises(ValueError, match="unsupported key"):
+        wh.parse_hotkey("ctrl+-")
+    assert wh.parse_hotkey("ctrl+subtract") == (wh.MOD_CONTROL | wh.MOD_NOREPEAT, 0x6d)
+
+
 @pytest.mark.parametrize("dedicated", [True, False])
 def test_abnt2_slash_never_registers_ctrl_q(native_api, dedicated):
     api, messages = native_api
@@ -120,6 +156,7 @@ def test_abnt2_slash_never_registers_ctrl_q(native_api, dedicated):
     log = Mock()
     with patch("keyboard.key_to_scan_codes", return_value=scans):
         hotkeys = service(hotkey="ctrl+/", voice_key="", log=log)
+    api.VkKeyScanW.assert_called_once_with("/")
     messages.put((0, 0))
     hotkeys._run()
     if dedicated:

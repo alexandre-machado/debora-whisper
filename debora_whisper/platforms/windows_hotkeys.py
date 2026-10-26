@@ -43,24 +43,28 @@ def key_to_vk(key):
     if key.startswith("f") and key[1:].isdigit() and 1 <= int(key[1:]) <= 24:
         return 0x70 + int(key[1:]) - 1
     if _user32 is not None and key:
+        mapped = _user32.VkKeyScanW(key) if len(key) == 1 else -1
+        if mapped != -1 and not (mapped & 0xff00) and 0 < mapped < 0xff:
+            return mapped
         import keyboard
-        # Name table initialization installs no hook. Extended/numpad names
-        # above need explicit VKs because this API discards the E0 flag.
+        # Name table initialization installs no hook. keyboard's scan-code
+        # lookup omits extended-key metadata; explicit numpad/extended names
+        # are resolved by _KEYS above. Skip numpad candidates for other names.
         for scan in keyboard.key_to_scan_codes(key, error_if_missing=False):
+            if scan in (0x37, 0x7e) or 0x47 <= scan <= 0x53:
+                continue
             vk = -scan if scan < 0 else _user32.MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX)
+            if 0x60 <= vk <= 0x6f or vk == 0xc2:
+                continue
             if 0 < vk < 0xff:
                 # A character can have several routes: on ABNT2, '/' is both
                 # AltGr+Q and a dedicated key. Accept only an unshifted match.
                 if (len(key) != 1 or
                         (_user32.MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) & 0xffff) == ord(key)):
                     return vk
-        if len(key) == 1:
-            mapped = _user32.VkKeyScanW(key)
-            if mapped != -1 and 0 < mapped < 0xff:
-                return mapped
-            if mapped != -1 and mapped & 0xff00:
-                raise ValueError(f"key {key!r} requires extra modifiers on this keyboard layout; "
-                                 "use a key available without modifiers")
+        if mapped != -1 and mapped & 0xff00:
+            raise ValueError(f"key {key!r} requires extra modifiers on this keyboard layout; "
+                             "use a key available without modifiers")
     raise ValueError(f"unsupported key {key!r}")
 
 
