@@ -588,9 +588,10 @@ class SettingsWindow:
     def _apply(self):
         """Apply settings without closing the window."""
         new_config = self._get_new_config()
-        from debora_whisper.dictation_engine import validate_config
+        from debora_whisper.dictation_engine import validate_config, validate_hotkey
         try:
             validate_config(new_config)
+            validate_hotkey(new_config)
             if (new_config.get("tts_backend") in _CLONE_ONLY_ENGINES
                     and new_config.get("tts_voice") is None
                     and not new_config.get("tts_server_command")):

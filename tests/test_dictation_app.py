@@ -1,5 +1,4 @@
 """Tests for DictationApp transcription threading."""
-import importlib
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -49,90 +48,69 @@ def test_tap_duration_excludes_delayed_audio_start():
     assert not app._hotkey_held
 
 
-def test_hook_recovery_replaces_only_owned_registrations_and_stops():
-    from debora_whisper.platforms.windows import KeyboardHookWatchdog
+def test_native_hotkeys_start_once_and_stop_before_workers():
     app = DictationApp({**DEFAULT_CONFIG, "beep_on_start": False})
-    keyboard = MagicMock()
-    keyboard.parse_hotkey.return_value = (((29,), (57,)),)
-    active = {"unrelated": object()}
-    removers = []
+    provider, keyboard = MagicMock(), MagicMock()
+    native = provider.native_hotkeys.return_value
+    stop_monitoring = app.stop_monitoring
 
-    def register(callback):
-        token = object()
-        active[token] = callback
-        remove = MagicMock(side_effect=lambda: active.pop(token))
-        removers.append(remove)
-        return remove
+    def stop():
+        native.stop.assert_called_once_with()
+        stop_monitoring()
 
-    keyboard.hook.side_effect = lambda callback, **kw: register(callback)
-    keyboard.add_hotkey.side_effect = lambda key, callback, **kw: register(callback)
-    provider = MagicMock()
-    provider.keyboard.return_value = keyboard
-    watchdog = KeyboardHookWatchdog(app._stopping, app._recover_hotkeys, MagicMock(),
-                                    probe=lambda: (10, False))
-    provider.keyboard_watchdog.return_value = watchdog
-    with patch("debora_whisper.dictation_engine.platforms.current", return_value=provider), \
-            patch.dict("sys.modules", keyboard=keyboard):
-        app._start_hotkeys(keyboard)
+    with patch("debora_whisper.dictation_engine.platforms.current", return_value=provider):
         try:
-            assert len(active) == 4
-            assert app._recover_hotkeys()
-            assert len(active) == 4
-            assert "unrelated" in active
-            for remove in removers[:3]:
-                remove.assert_called_once()
-            keyboard.unhook_all.assert_not_called()
-            app.stop()
-            assert not watchdog._thread.is_alive()
+            app._start_hotkeys(keyboard)
+            app._start_hotkeys(keyboard)
+            native.start.assert_called_once_with()
+            keyboard.add_hotkey.assert_not_called()
+            keyboard.hook.assert_not_called()
+            with patch.object(app, "stop_monitoring", side_effect=stop):
+                app.stop()
+            app._start_hotkeys(keyboard)
+            assert provider.native_hotkeys.call_count == 1
             assert not app._hotkey_worker.is_alive()
-            assert not app._recover_hotkeys()
-            assert provider.restart_keyboard_listener.call_count == 1
-            keyboard.unhook_all.assert_called_once()
-            provider.stop_keyboard_listener.assert_called_once_with(keyboard)
         finally:
-            app.stop_monitoring()
+            stop_monitoring()
 
 
-def test_shutdown_orders_unhook_after_inflight_recovery():
+def test_shutdown_waits_for_inflight_native_registration():
     app = DictationApp({**DEFAULT_CONFIG, "beep_on_start": False})
     entered, release = threading.Event(), threading.Event()
     provider = MagicMock()
-    provider.keyboard.side_effect = lambda: importlib.import_module("keyboard")
+    native = provider.native_hotkeys.return_value
 
-    def restart(*args):
+    def start():
         entered.set()
         assert release.wait(2)
 
-    provider.restart_keyboard_listener.side_effect = restart
-    with patch("debora_whisper.dictation_engine.platforms.current", return_value=provider), \
-            patch("keyboard.unhook_all") as unhook, \
-            patch.object(app, "_install_hotkeys") as install:
-        recovery = threading.Thread(target=app._recover_hotkeys)
+    native.start.side_effect = start
+    with patch("debora_whisper.dictation_engine.platforms.current", return_value=provider):
+        registration = threading.Thread(target=app._start_hotkeys, args=(MagicMock(),))
         shutdown = threading.Thread(target=app.stop)
-        recovery.start()
+        registration.start()
         try:
             assert entered.wait(2)
             shutdown.start()
             assert app._stopping.wait(2)
-            unhook.assert_not_called()
-            provider.stop_keyboard_listener.assert_not_called()
+            native.stop.assert_not_called()
         finally:
             release.set()
-            recovery.join(2)
+            registration.join(2)
             if shutdown.ident is not None:
                 shutdown.join(2)
-        assert not recovery.is_alive()
+            app.stop_monitoring()
+        assert not registration.is_alive()
         assert not shutdown.is_alive()
-        install.assert_not_called()
-        unhook.assert_called_once()
-        provider.stop_keyboard_listener.assert_called_once()
+        native.stop.assert_called_once_with()
 
 
 class TestTranscriptionThreading:
     """Verify transcription runs in background thread, not hotkey thread."""
 
-    def test_stop_unhooks_keyboard_before_joining_monitor(self):
+    def test_stop_removes_backend_hotkeys_before_joining_monitor(self):
         app = DictationApp({**DEFAULT_CONFIG, "beep_on_start": False})
+        app._hotkey_removers.append(MagicMock())
         stop_monitoring = app.stop_monitoring
         with patch("keyboard.unhook_all") as unhook:
             def stop():

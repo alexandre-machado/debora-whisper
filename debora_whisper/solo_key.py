@@ -15,7 +15,7 @@ class SoloKeyTap:
 
     The key is never suppressed, so AltGr+Q still types "/" and Ctrl+Alt
     shortcuts keep working; only a tap of the key alone counts. Feed it
-    every event from ``keyboard.hook``. ``on_tap`` must only enqueue work;
+    every event from the platform key source. ``on_tap`` must only enqueue work;
     audio, UI, locks and thread startup belong in the consumer.
     """
 
