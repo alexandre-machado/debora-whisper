@@ -541,6 +541,22 @@ def test_altgr_pair_requires_same_device_and_timestamp(native_api, scan):
         tapped.assert_not_called()
 
 
+@pytest.mark.parametrize("chord", ["solo", "q"])
+def test_altgr_synthetic_ctrl_with_altgr_scan_code_is_ignored(native_api, chord):
+    # Raw Input as recorded on an ABNT2 keyboard: VK_CONTROL with E0 38.
+    tapped, released = Mock(), Mock()
+    hotkeys = service(on_voice=tapped, on_release=released)
+    hotkeys._handle_key(key(0x11, 0x38, wh.RI_KEY_E0), 100, 1)
+    hotkeys._handle_key(key(0x12, 0x38, wh.RI_KEY_E0), 100, 1)
+    if chord == "q":
+        hotkeys._handle_key(key(ord("Q"), 16), 120, 1)
+        hotkeys._handle_key(key(ord("Q"), 16, wh.RI_KEY_BREAK), 130, 1)
+    hotkeys._handle_key(key(0x11, 0x38, wh.RI_KEY_E0 | wh.RI_KEY_BREAK), 150, 1)
+    hotkeys._handle_key(key(0x12, 0x38, wh.RI_KEY_E0 | wh.RI_KEY_BREAK), 150, 1)
+    assert tapped.call_count == (1 if chord == "solo" else 0)
+    released.assert_not_called()
+
+
 def test_intervening_key_prevents_altgr_pair_detection(native_api):
     tapped = Mock()
     hotkeys = service(on_voice=tapped)
