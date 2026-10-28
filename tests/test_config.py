@@ -8,6 +8,16 @@ from debora_whisper.dictation_engine import validate_config, DEFAULT_CONFIG
 
 
 class TestConfigValidation:
+    @pytest.mark.parametrize("value", [None, "false", 0, 1])
+    def test_invalid_update_check_flag(self, value):
+        with pytest.raises(ValueError, match="update_check"):
+            validate_config({**DEFAULT_CONFIG, "update_check": value})
+
+    def test_update_check_defaults_on_and_accepts_opt_out(self):
+        assert DEFAULT_CONFIG["update_check"] is True
+        validate_config({**DEFAULT_CONFIG, "update_check": False})
+        validate_config({key: value for key, value in DEFAULT_CONFIG.items() if key != "update_check"})
+
     @pytest.mark.parametrize("key", ["inline_drafts", "inline_drafts_require_verification"])
     @pytest.mark.parametrize("value", [None, "true", 0, 1])
     def test_invalid_inline_drafts_flag(self, key, value):

@@ -53,6 +53,7 @@ HARDWARE_INVENTORY = CONFIG_DIR / "hardware-inventory.json"
 LAST_RECORDING = CONFIG_DIR / "last_recording.wav"
 
 DEFAULT_CONFIG = {
+    "update_check": True,
     "device": "NPU",           # Active device; chosen from device_priority at startup
     # Startup picks the first present device; a lost device falls back to the
     # next healthy one. RTX first: turbo transcribes 5-7x faster there than on
@@ -370,7 +371,7 @@ def validate_hotkey(config: dict):
 
 def validate_config(config: dict):
     """Validate config values. Raises ValueError on invalid values."""
-    for key in ("inline_drafts", "inline_drafts_require_verification"):
+    for key in ("inline_drafts", "inline_drafts_require_verification", "update_check"):
         if not isinstance(config.get(key, False), bool):
             raise ValueError(f"{key} must be a bool")
     width = config.get("balloon_width")

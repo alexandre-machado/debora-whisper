@@ -57,6 +57,39 @@ def _under_test():
 GUIApp = _under_test()
 
 
+def test_update_result_reaches_tray_and_open_settings_once():
+    from debora_whisper.version import BuildInfo, UPDATE_AVAILABLE, display_version
+
+    app = GUIApp.__new__(GUIApp)
+    app._version_checker = MagicMock()
+    result = (BuildInfo("0.1.0", commit="a6d8864", date="2026-10-26"), UPDATE_AVAILABLE)
+    app._version_checker.result = result
+    app._shown_version = None
+    app._tray = MagicMock()
+    app._settings_win = MagicMock()
+    app._settings_win.is_open = True
+    app._refresh_version()
+    app._refresh_version()
+    text = display_version(*result)
+    app._tray.update_version.assert_called_once_with(text, True)
+    app._settings_win.update_version.assert_called_once_with(text)
+
+
+def test_new_settings_window_receives_current_version():
+    from debora_whisper.version import BuildInfo, UNKNOWN, display_version
+
+    app = GUIApp.__new__(GUIApp)
+    app._version_checker = MagicMock(result=(BuildInfo("0.1.0"), UNKNOWN))
+    app._config = {}
+    app._root = MagicMock()
+    window = MagicMock()
+    with patch.dict(GUIApp._show_settings.__globals__, {
+        "SettingsWindow": window, "DictationApp": MagicMock(),
+    }):
+        app._show_settings()
+    assert window.call_args.kwargs["version_text"] == display_version(*app._version_checker.result)
+
+
 @pytest.mark.parametrize('key,value', [
     ('beep_on_start', True),
     ('beep_on_start', False),
@@ -212,6 +245,13 @@ def _bare_app(engine_stop, tray_stop, root=None):
 
 
 class TestTeardown:
+    def test_stops_update_worker(self):
+        app = _bare_app(_Stop(), _Stop())
+        app._version_checker = MagicMock()
+        app._teardown()
+        app._teardown()
+        app._version_checker.stop.assert_called_once_with()
+
     def test_teardown_runs_once_even_if_engine_stop_fails(self):
         engine, tray = _Stop(raises=RuntimeError("stop failed")), _Stop()
         app = _bare_app(engine, tray)
