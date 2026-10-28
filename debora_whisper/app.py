@@ -25,6 +25,7 @@ from debora_whisper.ui.overlay import OverlayWindow
 from debora_whisper.ui.settings import SettingsWindow
 from debora_whisper.ui.history import HistoryWindow
 from debora_whisper.ui.onboarding import OnboardingWindow
+from debora_whisper.version import UpdateChecker, UPDATE_AVAILABLE, display_version
 
 
 class GUIApp:
@@ -32,6 +33,8 @@ class GUIApp:
 
     def __init__(self, config: dict):
         self._config = config
+        self._version_checker = UpdateChecker(lambda: self._config.get("update_check", True), log)
+        self._shown_version = None
 
         # Hidden root drives the customtkinter mainloop
         ctk.set_appearance_mode("dark")
@@ -83,6 +86,7 @@ class GUIApp:
 
     def run(self):
         """Start the application."""
+        self._version_checker.start()
         # Check if model exists on disk — show onboarding if not
         needs_setup = not is_model_downloaded(self._config["model_size"])
 
@@ -112,6 +116,10 @@ class GUIApp:
             # Python handles a signal (Ctrl+C, SIGTERM on Linux) only when
             # its main thread runs; an idle Tk would hold it indefinitely.
             self._root.after(250, wake)
+            try:
+                self._refresh_version()
+            except Exception:
+                pass  # a display refresh must never stop signal handling
         self._root.after(250, wake)
         try:
             self._root.mainloop()
@@ -129,6 +137,17 @@ class GUIApp:
         engine.add_callback(self._on_state_change)
         engine.on_voice_chat_toggle = self._toggle_voice_chat
         return engine
+
+    def _refresh_version(self):
+        """Apply worker results on the Tk thread."""
+        result = self._version_checker.result
+        if result == self._shown_version:
+            return
+        self._shown_version = result
+        text = display_version(*result)
+        self._tray.update_version(text, result[1] == UPDATE_AVAILABLE)
+        if self._settings_win:
+            self._settings_win.update_version(text)
 
     def _start_engine(self):
         """Start the engine in non-blocking mode."""
@@ -417,6 +436,7 @@ class GUIApp:
         devices = DictationApp.list_input_devices()
         self._settings_win = SettingsWindow(
             self._root, self._config, devices, on_apply=self._on_settings_apply,
+            version_text=display_version(*self._version_checker.result),
         )
         self._root.after(0, self._settings_win.show)
 
@@ -578,6 +598,8 @@ class GUIApp:
         if self._torn_down:
             return
         self._torn_down = True
+        if getattr(self, "_version_checker", None) is not None:
+            self._version_checker.stop()
         for name, stop in (("engine", self._engine.stop), ("tray", self._tray.stop)):
             try:
                 stop()

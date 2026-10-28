@@ -214,6 +214,7 @@ Stored at `~/.debora/config.json`:
   "voice_chat_hotkey": "right alt",
   "tap_action": "continuous",
   "auto_enter": false,
+  "update_check": true,
   "inline_drafts": false,
   "inline_drafts_require_verification": false,
   "beep_on_start": true,
@@ -223,6 +224,15 @@ Stored at `~/.debora/config.json`:
 ```
 
 When unset, `language` follows the system UI language (falling back to `"en"`); a fixed language can make Whisper translate speech in another language.
+
+The tray and Settings show the running package version and update status.
+Editable Git installs also show the startup commit, date and `+dirty` for
+local changes. Update checks run in the background at startup and every six
+hours: Git installs compare against `main` on the branch's upstream remote
+(or `origin`); regular installs compare against PyPI. Checks never fetch,
+pull or install anything. Set `update_check: false` to disable remote checks;
+the local build identity remains visible. Offline checks show an unknown
+status. `app.log` records the build and each check's result.
 
 `device_priority` is the order devices are tried in. At startup the app uses
 the first one present on the machine that can run the model (`CUDA` = NVIDIA

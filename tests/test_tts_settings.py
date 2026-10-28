@@ -13,6 +13,20 @@ from debora_whisper.ui.settings import (
 )
 
 
+def test_version_label_follows_background_results():
+    window = SettingsWindow.__new__(SettingsWindow)
+    window._win = MagicMock()
+    window._version_label = MagicMock()
+    text = "Débora Whisper 0.1.0 · ⬆ atualização disponível"
+    window.update_version(text)
+    assert window._version_text == text
+    window._version_label.configure.assert_called_once_with(text=text)
+    window._version_label.reset_mock()
+    window._win.winfo_exists.return_value = False
+    window.update_version("closed")
+    window._version_label.configure.assert_not_called()
+
+
 @pytest.mark.parametrize("backend,label", [
     ("chatterbox", "Chatterbox (clones the voice)"),
     ("qwen3", "Qwen3-TTS (experimental, clones the voice)"),

@@ -125,7 +125,7 @@ class SettingsWindow:
     """Modal-ish settings dialog with language-first model selection."""
 
     def __init__(self, root: ctk.CTk, config: dict, input_devices: list[dict],
-                 on_apply=None):
+                 on_apply=None, version_text=""):
         """
         Args:
             root: Parent CTk window.
@@ -137,6 +137,8 @@ class SettingsWindow:
         self._config = dict(config)
         self._input_devices = input_devices
         self._on_apply = on_apply
+        self._version_text = version_text
+        self._version_label = None
         self._win: ctk.CTkToplevel | None = None
         self._model_radio_var = ctk.StringVar(value=config.get("model_size", "turbo"))
         self._model_rows_frame: ctk.CTkFrame | None = None
@@ -206,6 +208,12 @@ class SettingsWindow:
         # --- Bottom bar (packed first to reserve space) ---
         bottom = ctk.CTkFrame(self._win, fg_color=_CONTENT_BG)
         bottom.pack(side="bottom", fill="x")
+
+        self._version_label = ctk.CTkLabel(
+            bottom, text=self._version_text, font=ctk.CTkFont(size=11),
+            text_color=_DESC_TEXT, fg_color="transparent", wraplength=500,
+        )
+        self._version_label.pack(padx=20, pady=(4, 0), anchor="w")
 
         self._status_label = ctk.CTkLabel(
             bottom, text="", font=ctk.CTkFont(size=12),
@@ -476,6 +484,12 @@ class SettingsWindow:
         """Update the status label (called from app.py on state changes)."""
         if self._status_label and self._win and self._win.winfo_exists():
             self._status_label.configure(text=text, text_color=color)
+
+    def update_version(self, text: str):
+        """Follow update checks while the window is open."""
+        self._version_text = text
+        if self._version_label and self.is_open:
+            self._version_label.configure(text=text)
 
     def set_voice_chat(self, enabled: bool):
         """Follow a switch made from the tray, so Apply does not undo it."""

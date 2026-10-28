@@ -75,7 +75,52 @@ def test_updates_do_not_touch_pystray_on_caller_thread():
     tray.update_audio_level(0.8)
     tray.update_state("ready", "Débora Whisper — Ready")
     tray.refresh()
+    tray.update_version("Débora Whisper 0.1.0 · ⬆ atualização disponível", True)
     assert tray._icon.calls == []
+
+
+def test_first_menu_item_is_read_only_version():
+    from types import SimpleNamespace
+
+    tray = _tray()
+    text = "Débora Whisper 0.1.0 · a6d8864 (2026-10-26) · ✓ atualizada"
+    tray.update_version(text)
+    pystray = MagicMock()
+    pystray.Menu.side_effect = lambda *items: items
+    pystray.MenuItem.side_effect = lambda text, action, **kwargs: SimpleNamespace(
+        text=text, action=action, **kwargs)
+    with patch.dict(tray._build_menu.__globals__, {"pystray": pystray}):
+        first = tray._build_menu()[0]
+    assert first.text == text
+    assert first.action is None
+    assert first.enabled is False
+
+
+@pytest.mark.parametrize("notifications", [True, False])
+def test_version_changes_refresh_menu_and_notify_once_on_renderer(notifications):
+    tray = _tray()
+    tray._icon.HAS_NOTIFICATION = notifications
+    tray._icon.notify = lambda *args: tray._icon.calls.append(
+        ("notify", threading.current_thread().name))
+    tray._icon.calls.clear()
+    tray.update_state("ready")
+    t = _run_renderer(tray)
+    try:
+        _settle(tray._icon)
+        tray._icon.calls.clear()
+        for text, available in (("new version", True), ("unknown", False), ("new version", True)):
+            tray.update_version(text, available)
+            _settle(tray._icon)
+        assert tray._icon.calls.count(("update_menu", "tray-render")) == 3
+        assert tray._icon.calls.count(("notify", "tray-render")) == int(notifications)
+        assert {thread for _, thread in tray._icon.calls} == {"tray-render"}
+        tray._icon.calls.clear()
+        tray.update_version("new version", True)
+        _settle(tray._icon)
+        assert tray._icon.calls == []
+    finally:
+        tray.stop()
+        t.join(1)
 
 
 def test_renderer_applies_state_on_its_own_thread():

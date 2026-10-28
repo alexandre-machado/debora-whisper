@@ -3,6 +3,7 @@
 import threading
 import pystray
 from debora_whisper.ui.icons import get_icon, get_volume_icon
+from debora_whisper.version import BuildInfo, display_version, package_version
 
 
 def backend_title(title: str, icon_class=None) -> str:
@@ -34,6 +35,8 @@ class TrayManager:
         self._hotkey = hotkey
         self._state = "loading"
         self._tooltip = "Débora Whisper — Loading..."
+        self._version = (display_version(BuildInfo(package_version())), False)
+        self._update_notified = False
         self._icon: pystray.Icon | None = None
         self._thread: threading.Thread | None = None
         
@@ -51,6 +54,8 @@ class TrayManager:
     def _build_menu(self):
         """Build the right-click context menu with dynamic state text."""
         items = [
+            pystray.MenuItem(self._version[0], None, enabled=False),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 lambda _: "Stop Recording" if self._state == "recording" else "Start Recording",
                 self._on_toggle_click,
@@ -145,10 +150,12 @@ class TrayManager:
         nothing."""
         shown_image = shown_title = shown_state = None
         shown_voice_chat = None
+        shown_version = None
         while self._running:
             self._wake.clear()
             state, title = self._state, self._tooltip
             voice_chat = self._voice_chat_on()
+            version = self._version
             if state == "recording":
                 image = get_volume_icon(self._level, voice_chat=voice_chat)
                 interval = 0.1
@@ -169,12 +176,18 @@ class TrayManager:
                     if title != shown_title:
                         icon.title = backend_title(title, type(icon))
                         shown_title = title
-                    if state != shown_state or voice_chat != shown_voice_chat:
+                    if (state != shown_state or voice_chat != shown_voice_chat
+                            or version != shown_version):
                         # Rebuild so the dynamic menu text follows the state.
                         icon.menu = self._build_menu()
                         icon.update_menu()
                         shown_state = state
                         shown_voice_chat = voice_chat
+                        shown_version = version
+                    if version[1] and not self._update_notified:
+                        self._update_notified = True
+                        if getattr(icon, "HAS_NOTIFICATION", False):
+                            icon.notify("Atualização disponível", "Débora Whisper")
                 except Exception:
                     pass  # icon torn down underneath us during shutdown
             else:
@@ -184,6 +197,11 @@ class TrayManager:
 
     def refresh(self):
         """Wake the renderer after a mode change."""
+        self._wake.set()
+
+    def update_version(self, text: str, update_available: bool = False):
+        """Schedule version text and an optional one-time notification."""
+        self._version = (text, update_available)
         self._wake.set()
 
     def update_state(self, state_name: str, tooltip: str | None = None):
