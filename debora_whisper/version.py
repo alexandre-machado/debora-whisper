@@ -15,6 +15,7 @@ from debora_whisper import __version__, platforms
 
 TIMEOUT = 5
 CHECK_INTERVAL = 6 * 60 * 60
+MAX_PYPI_BYTES = 4 * 1024 * 1024
 PYPI_URL = "https://pypi.org/pypi/debora-whisper/json"
 UP_TO_DATE = "up to date"
 UPDATE_AVAILABLE = "update available"
@@ -60,10 +61,12 @@ def display_version(build: BuildInfo, status: str = UNKNOWN) -> str:
 def _git(directory: Path, *args: str, allowed=(0,)):
     result = subprocess.run(
         ["git", *args], cwd=directory, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL,
         encoding="utf-8", errors="replace", timeout=TIMEOUT,
         creationflags=platforms.current().no_window,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never",
-             "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1"},
+             "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1",
+             "SSH_ASKPASS_REQUIRE": "never"},
     )
     if result.returncode not in allowed:
         raise RuntimeError(f"git {args[0]} failed (exit {result.returncode})")
@@ -93,7 +96,7 @@ def _git_status(build: BuildInfo) -> str:
     if branch.returncode == 0:
         configured = _git(root, "config", "--get", f"branch.{branch.stdout.strip()}.remote",
                           allowed=(0, 1)).stdout.strip()
-        if configured and configured != ".":
+        if configured and configured != "." and not configured.startswith("-"):
             remote = configured
     output = _git(root, "ls-remote", "--exit-code", remote, "refs/heads/main").stdout.split()
     if (len(output) != 2 or output[1] != "refs/heads/main"
@@ -132,10 +135,11 @@ def check_update(build: BuildInfo, log) -> str:
             status = _git_status(build)
         else:
             with urlopen(PYPI_URL, timeout=TIMEOUT) as response:
-                latest = json.load(response)["info"]["version"]
+                latest = json.loads(response.read(MAX_PYPI_BYTES))["info"]["version"]
             status = UPDATE_AVAILABLE if _newer(latest, build.version) else UP_TO_DATE
     except Exception as exc:
-        log(f"Update check: {UNKNOWN} ({exc})")
+        # The type only: git and URL errors can carry a remote URL with a token.
+        log(f"Update check: {UNKNOWN} ({type(exc).__name__})")
         return UNKNOWN
     log(f"Update check: {status}")
     return status

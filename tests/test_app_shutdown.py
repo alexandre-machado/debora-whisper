@@ -67,7 +67,8 @@ def test_update_result_reaches_tray_and_open_settings_once():
     app._shown_version = None
     app._tray = MagicMock()
     app._settings_win = MagicMock()
-    app._settings_win.is_open = True
+    # Created but not shown yet: the text must still reach it.
+    app._settings_win.is_open = False
     app._refresh_version()
     app._refresh_version()
     text = display_version(*result)

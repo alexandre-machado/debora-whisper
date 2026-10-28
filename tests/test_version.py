@@ -126,7 +126,7 @@ def test_git_update_status(git, http, tmp_path, remote, dirty, present, ancestor
     http.assert_not_called()
 
 
-@pytest.mark.parametrize("configured", ["upstream", ".", ""])
+@pytest.mark.parametrize("configured", ["upstream", ".", "", "--upload-pack=x"])
 def test_upstream_remote_or_origin(git, tmp_path, configured):
     replies, run = git
     replies[("config", "--get", "branch.feature.remote")] = (0, configured)
@@ -155,6 +155,23 @@ def test_remote_errors_are_unknown_with_one_log_line(git, tmp_path, failure):
     assert v.check_update(v.BuildInfo("0.1.0", tmp_path, HEAD), log) == v.UNKNOWN
     assert log.call_count == 1
     assert log.call_args.args[0].startswith("Update check: unknown (")
+
+
+def test_remote_error_log_omits_a_token_in_the_message(git, tmp_path):
+    replies, _ = git
+    replies[("ls-remote", "--exit-code", "origin", "refs/heads/main")] = (
+        subprocess.TimeoutExpired(["git", "ls-remote", "https://user:tok3n@host/r"], 5))
+    log = MagicMock()
+    v.check_update(v.BuildInfo("0.1.0", tmp_path, HEAD), log)
+    assert "tok3n" not in log.call_args.args[0]
+
+
+def test_git_runs_without_stdin_or_ssh_prompts(git, tmp_path):
+    _, run = git
+    v.check_update(v.BuildInfo("0.1.0", tmp_path, HEAD), MagicMock())
+    kwargs = run.call_args.kwargs
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["env"]["SSH_ASKPASS_REQUIRE"] == "never"
 
 
 def test_ancestry_error_is_not_an_available_update(git, tmp_path):

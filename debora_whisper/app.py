@@ -115,8 +115,11 @@ class GUIApp:
         def wake():
             # Python handles a signal (Ctrl+C, SIGTERM on Linux) only when
             # its main thread runs; an idle Tk would hold it indefinitely.
-            self._refresh_version()
             self._root.after(250, wake)
+            try:
+                self._refresh_version()
+            except Exception:
+                pass  # a display refresh must never stop signal handling
         self._root.after(250, wake)
         try:
             self._root.mainloop()
@@ -143,7 +146,7 @@ class GUIApp:
         self._shown_version = result
         text = display_version(*result)
         self._tray.update_version(text, result[1] == UPDATE_AVAILABLE)
-        if self._settings_win and self._settings_win.is_open:
+        if self._settings_win:
             self._settings_win.update_version(text)
 
     def _start_engine(self):
