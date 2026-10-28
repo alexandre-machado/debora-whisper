@@ -265,6 +265,10 @@ class WindowsHotkeys:
     def _handle_key(self, key, message_time=None, device=None):
         if self._stopping.is_set() or key.VKey == 0xff or key.MakeCode == 0xff:
             return
+        if key.VKey == 0x11 and key.MakeCode == 0x38:
+            # Some keyboards report AltGr's synthetic Ctrl with AltGr's own
+            # scan code (E0 38); no physical Ctrl has it.
+            return
         vk = key.VKey
         extended = bool(key.Flags & RI_KEY_E0)
         if vk == 0x10:
